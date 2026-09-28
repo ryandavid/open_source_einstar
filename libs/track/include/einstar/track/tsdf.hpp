@@ -68,6 +68,10 @@ struct SurfacePoint {
     float weight;
 };
 
+// Orders points by position so results that depend on order (voxel averaging, RANSAC sampling) do not
+// depend on how they were produced (GPU extraction appends in a varying order).
+void sort_canonical(std::vector<SurfacePoint>& points);
+
 // Fused surface model. Implemented on the CPU (TsdfVolume, the reference) and in Metal.
 class Volume {
 public:
@@ -82,8 +86,11 @@ public:
     // Renders the model from a camera (vertex + normal maps in world coordinates).
     [[nodiscard]] virtual RaycastResult raycast(const SE3& T_world_camera, const Intrinsics& k) const = 0;
 
-    // Zero-crossing surface points of bricks touched since `since_frame` (0 = everything).
-    [[nodiscard]] virtual std::vector<SurfacePoint> extract_points(std::uint32_t since_frame = 0, float min_weight = 0.5f) const = 0;
+    // Zero-crossing surface points of bricks touched since `since_frame` (0 = everything), in a
+    // canonical order unless `canonical` is false (then sort_canonical() them before any use that
+    // depends on order, e.g. off the calling thread).
+    [[nodiscard]] virtual std::vector<SurfacePoint> extract_points(std::uint32_t since_frame = 0, float min_weight = 0.5f,
+                                                                   bool canonical = true) const = 0;
     [[nodiscard]] virtual std::vector<BrickCoord> bricks_updated_since(std::uint32_t frame) const = 0;
     [[nodiscard]] virtual std::vector<SurfacePoint> extract_points(const std::vector<BrickCoord>& bricks, float min_weight = 0.5f) const = 0;
     // True when extracting the whole surface is cheap enough to do for every display refresh.
@@ -107,7 +114,8 @@ public:
 
     void integrate(const DepthFrame& frame, const SE3& T_world_camera, float weight_scale = 1.0f, bool extend_only = false) override;
     [[nodiscard]] RaycastResult raycast(const SE3& T_world_camera, const Intrinsics& k) const override;
-    [[nodiscard]] std::vector<SurfacePoint> extract_points(std::uint32_t since_frame = 0, float min_weight = 0.5f) const override;
+    [[nodiscard]] std::vector<SurfacePoint> extract_points(std::uint32_t since_frame = 0, float min_weight = 0.5f,
+                                                           bool canonical = true) const override;
     [[nodiscard]] std::vector<BrickCoord> bricks_updated_since(std::uint32_t frame) const override;
     [[nodiscard]] std::vector<SurfacePoint> extract_points(const std::vector<BrickCoord>& bricks, float min_weight = 0.5f) const override;
 

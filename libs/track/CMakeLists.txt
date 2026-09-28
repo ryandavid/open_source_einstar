@@ -1,4 +1,4 @@
-add_library(einstar_track src/frame.cpp src/tsdf.cpp src/icp.cpp src/tracker.cpp src/global_registration.cpp)
+add_library(einstar_track src/frame.cpp src/tsdf.cpp src/icp.cpp src/tracker.cpp src/global_registration.cpp src/relocaliser.cpp)
 add_library(einstar::track ALIAS einstar_track)
 target_include_directories(einstar_track PUBLIC include)
 target_link_libraries(einstar_track PUBLIC einstar::core einstar::markers PRIVATE TBB::tbb nanoflann_headers)

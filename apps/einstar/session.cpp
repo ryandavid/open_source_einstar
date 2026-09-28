@@ -117,6 +117,7 @@ Result<std::unique_ptr<Session>> Session::open(bool force_emulator, UpdateSink u
 
     pipeline::ScanPipelineParams pp;
     pp.block_when_full = s->emulated_;  // the emulator can wait; a real scanner cannot
+    pp.tracker.deterministic_relocalisation = s->emulated_;  // live: never wait for the relocalisation worker
     s->pipeline_ = std::make_unique<pipeline::ScanPipeline>(std::make_unique<pipeline::StereoFrontend>(rig), pp, std::move(updates));
     // Every scan is recorded so the process step can use every frame.
     if (const char* dir = std::getenv("EINSTAR_SCAN_DIR")) s->pipeline_->set_recording_directory(dir);

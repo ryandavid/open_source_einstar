@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <charconv>
+#include <thread>
+#include <chrono>
 #include <fstream>
 #include <map>
 #include <cstring>
@@ -226,6 +228,8 @@ int track_fixture(const char* path, std::span<char*> args) {
     const long count = arg_int(args, "--count", static_cast<long>((*proj)->frame_count()));
     const long skip = std::max(1L, arg_int(args, "--skip", 1));
     const bool quiet = has_flag(args, "--quiet");
+    const bool realtime = has_flag(args, "--realtime");
+    const auto replay_start = std::chrono::steady_clock::now();
     const double frame_dt = 0.068;  // EXStar scan trigger period
 
     // Optional geometric check: distance of each (sampled) tracked frame to a reference mesh.
@@ -262,6 +266,7 @@ int track_fixture(const char* path, std::span<char*> args) {
     tp.icp.degenerate_direction_ratio = arg_double(args, "--degen-ratio", tp.icp.degenerate_direction_ratio);
     tp.degenerate_weight = static_cast<float>(arg_double(args, "--degen-weight", tp.degenerate_weight));
     tp.degenerate_eigen_ratio = arg_double(args, "--degen-flag", tp.degenerate_eigen_ratio);
+    tp.deterministic_relocalisation = !has_flag(args, "--live-reloc");  // live: results used whenever ready
     std::println("volume: {}, icp: {}, mode: {}", volume ? "Metal" : "CPU", gpu_icp ? "Metal" : "CPU", mode);
     track::Tracker tracker(tp, std::move(volume));
     if (gpu_icp) tracker.set_icp_solver(gpu_icp->as_function());
@@ -278,6 +283,7 @@ int track_fixture(const char* path, std::span<char*> args) {
     const char* record_path = arg_str(args, "--record");
     std::vector<double> t_err, r_err, ms, rpe_t, rpe_r, eigs;
     std::vector<int> episodes;  // lengths of runs of frames without an accepted pose
+    double reloc_wait_ms = 0;
     // Recovery after the recording's large jumps (EXStar lost the scanner there too): frames until the
     // next accepted pose, and whether that pose agrees with EXStar's.
     long kidnap_from = -1;
@@ -325,6 +331,11 @@ int track_fixture(const char* path, std::span<char*> args) {
             }
             tracker.volume().integrate(frame, f->T_world_camera);
             continue;
+        }
+        if (realtime) {
+            // Frames at the scanner's rate, so background work sees live timing.
+            const auto due = replay_start + std::chrono::microseconds(static_cast<long long>(frame.timestamp_s * 1e6));
+            std::this_thread::sleep_until(due);
         }
         const auto r = tracker.process(frame);
         ++processed;
@@ -379,7 +390,8 @@ int track_fixture(const char* path, std::span<char*> args) {
                              r.icp.coverage);
             }
         }
-        ms.push_back(r.ms);
+        ms.push_back(r.ms - r.wait_ms);  // tracking-thread time; waits only exist to keep replays deterministic
+        reloc_wait_ms += r.wait_ms;
         if (kidnap_from >= 0 && r.accepted) {
             recover_frames.push_back(static_cast<double>(i - kidnap_from));
             if (translation_norm(f->T_world_camera.inverse() * r.T_world_camera) > 20.0) ++recover_wrong;
@@ -450,9 +462,9 @@ int track_fixture(const char* path, std::span<char*> args) {
                          r.icp.min_eigenvalue_ratio, r.markers_matched, r.markers_seen, r.icp.marker_rms_mm, r.marker_pose, r.reason);
         }
         if (!quiet && (!r.accepted || r.relocalized || processed % 100 == 0)) {
-            std::println("frame {:5} {:6} rms {:.3f} inl {:.2f} cov {:.2f} eig {:.1e}  {:5.1f} ms  bricks {}  markers {}/{}  {}", i,
+            std::println("frame {:5} {:6} rms {:.3f} inl {:.2f} cov {:.2f} eig {:.1e}  {:5.1f} ms (+{:.0f} waiting)  bricks {}  markers {}/{}  {}", i,
                          r.accepted ? (r.relocalized ? "reloc" : "ok") : "LOST", r.icp.rms_mm, r.icp.inlier_ratio,
-                         r.icp.coverage, r.icp.min_eigenvalue_ratio, r.ms, tracker.volume().brick_count(), r.markers_matched,
+                         r.icp.coverage, r.icp.min_eigenvalue_ratio, r.ms - r.wait_ms, r.wait_ms, tracker.volume().brick_count(), r.markers_matched,
                          r.markers_seen, r.reason);
         }
     }
@@ -470,8 +482,8 @@ int track_fixture(const char* path, std::span<char*> args) {
                      fit_checked, pct(fit_median, 0.5), fit_bad, 100.0 * fit_bad / std::max(1, fit_checked));
     std::println("icp eigen ratio percentiles: p1 {:.1e} p5 {:.1e} p10 {:.1e} p25 {:.1e} p50 {:.1e}", pct(eigs, 0.01), pct(eigs, 0.05),
                  pct(eigs, 0.10), pct(eigs, 0.25), pct(eigs, 0.5));
-    std::println("time per frame: median {:.1f} ms p95 {:.1f} ms max {:.1f} ms; model bricks {}", pct(ms, 0.5), pct(ms, 0.95),
-                 ms.empty() ? 0.0 : std::ranges::max(ms), tracker.volume().brick_count());
+    std::println("time per frame: median {:.1f} ms p95 {:.1f} ms max {:.1f} ms; model bricks {}; waited {:.0f} ms for the relocaliser",
+                 pct(ms, 0.5), pct(ms, 0.95), ms.empty() ? 0.0 : std::ranges::max(ms), tracker.volume().brick_count(), reloc_wait_ms);
     if (run_lost > 0) episodes.push_back(run_lost);
     std::ranges::sort(episodes, std::greater{});
     std::print("lost episodes: {}, longest:", episodes.size());

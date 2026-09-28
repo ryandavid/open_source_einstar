@@ -13,6 +13,7 @@
 #include "einstar/markers/marker_map.hpp"
 #include "einstar/track/global_registration.hpp"
 #include "einstar/track/icp.hpp"
+#include "einstar/track/relocaliser.hpp"
 #include "einstar/track/tsdf.hpp"
 
 namespace einstar::track {
@@ -49,7 +50,6 @@ struct TrackerParams {
     // fuses these frames at its optimised poses.
     double degenerate_eigen_ratio = 5e-3;  // (centred, unit-scaled Hessian; ~7% of frames on real scans)
     float degenerate_weight = 0.0f;        // > 0: fuse degenerate frames at this weight, into unobserved space only
-    int relocalize_attempts_per_frame = 2;
     // A relocalisation is only trusted after this many consecutive frames track consistently from
     // it, under stricter thresholds; nothing is fused into the model until then.
     int confirm_frames = 3;
@@ -59,12 +59,19 @@ struct TrackerParams {
     // Global (pose-independent) relocalisation while lost.
     bool global_relocalization = true;
     bool fuse_surface = true;              // false: track only (e.g. global-marker capture)
-    int global_reloc_every = 3;            // attempt on every Nth lost frame (it costs ~50-150 ms)
+    // Global relocalisation runs on a worker (see GlobalRelocaliser): a query's result is used this many
+    // frames after the lost frame it was made from (verified by ICP on the frame at hand), and a
+    // descriptor model rebuild is used this many frames after its surface snapshot.
+    int global_reloc_latency_frames = 2;
+    int feature_model_latency_frames = 10;
+    // Wait for the worker at the due frame so results do not depend on timing (replays, tests). Live
+    // capture sets false: the tracker then never waits and uses results as soon as they are ready.
+    bool deterministic_relocalisation = true;
     GlobalRegistrationParams global;
     // An ambiguous global match (several poses fit, e.g. a symmetric part) is only accepted for the
     // candidate within this distance of where tracking was lost.
     double ambiguous_reloc_max_mm = 150.0;
-    double feature_model_rebuild_growth = 0.15;  // rebuild descriptors when the model grew by 15%
+    double feature_model_rebuild_growth = 0.15;  // rebuild descriptors (in the background) when the model grew by 15%
 };
 
 struct TrackResult {
@@ -81,6 +88,7 @@ struct TrackResult {
     std::vector<std::pair<int, int>> marker_ids;  // (frame marker index, map id) at the final pose
     std::string reason;  // why a frame was rejected
     double ms = 0;
+    double wait_ms = 0;  // part of `ms` spent waiting for the relocalisation worker (deterministic mode)
 };
 
 class Tracker {
@@ -121,14 +129,16 @@ private:
     [[nodiscard]] std::optional<markers::PoseEstimate> marker_pose(const FrameMarkers& fm, const SE3& predicted);
     [[nodiscard]] std::optional<IcpResult> align(const DepthFrame& frame, const std::vector<SE3>& seeds,
                                                  const std::optional<markers::PoseEstimate>& mpose, TrackResult& out, std::string& reason);
-    [[nodiscard]] std::optional<IcpResult> global_relocalise(const DepthFrame& frame, std::string& reason);
+    [[nodiscard]] std::optional<IcpResult> global_relocalise(const DepthFrame& frame, std::string& reason, double& wait_ms);
+    void refresh_feature_model(double& wait_ms);
     void mark_lost(TrackResult& out, const std::string& reason);
     bool still_confirming(bool marker_pose, double t, TrackResult& out);  // true: result is final (not fused)
     void fuse(const DepthFrame& frame, const FrameMarkers& fm, TrackResult& out);
     void report_marker_ids(const FrameMarkers& fm, const SE3& T, TrackResult& out) const;
 
     [[nodiscard]] SE3 predict(double t) const;
-    [[nodiscard]] std::optional<SE3> global_candidate(const DepthFrame& frame, std::string& why);
+    [[nodiscard]] std::optional<SE3> pick_candidate(const GlobalRegistrationResult& r, std::string& why) const;
+    [[nodiscard]] GlobalRelocaliser& relocaliser();
     [[nodiscard]] std::optional<std::string> check(const IcpResult& r, const SE3& from, double dt, bool strict) const;
 
     TrackerParams params_;
@@ -146,8 +156,9 @@ private:
     Vec3 degenerate_center_ = Vec3::Zero();
     int confirm_count_ = 0;
     int lost_frames_ = 0;
-    FeatureModel feature_model_;
-    std::size_t feature_model_bricks_ = 0;
+    std::unique_ptr<GlobalRelocaliser> reloc_;  // created on first use
+    std::size_t feature_model_bricks_ = 0;      // model size at the last descriptor snapshot
+    std::int64_t frame_no_ = 0;                 // frames processed (the relocaliser's clock)
     std::uint32_t reloc_seed_ = 1;
     SE3 lost_pose_ = SE3::Identity();  // last trusted pose before the loss
 };

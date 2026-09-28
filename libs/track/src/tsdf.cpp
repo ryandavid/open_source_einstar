@@ -292,7 +292,15 @@ std::vector<BrickCoord> TsdfVolume::bricks_updated_since(std::uint32_t frame) co
     return out;
 }
 
-std::vector<SurfacePoint> TsdfVolume::extract_points(std::uint32_t since_frame, float min_weight) const {
+void sort_canonical(std::vector<SurfacePoint>& points) {
+    std::ranges::sort(points, [](const SurfacePoint& a, const SurfacePoint& b) {
+        if (a.position.x() != b.position.x()) return a.position.x() < b.position.x();
+        if (a.position.y() != b.position.y()) return a.position.y() < b.position.y();
+        return a.position.z() < b.position.z();
+    });
+}
+
+std::vector<SurfacePoint> TsdfVolume::extract_points(std::uint32_t since_frame, float min_weight, bool /*canonical: always*/) const {
     return extract_points(bricks_updated_since(since_frame), min_weight);
 }
 

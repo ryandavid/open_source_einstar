@@ -24,7 +24,8 @@ public:
     void integrate(const track::DepthFrame& frame, const SE3& T_world_camera, float weight_scale = 1.0f,
                    bool extend_only = false) override;
     [[nodiscard]] track::RaycastResult raycast(const SE3& T_world_camera, const track::Intrinsics& k) const override;
-    [[nodiscard]] std::vector<track::SurfacePoint> extract_points(std::uint32_t since_frame = 0, float min_weight = 0.5f) const override;
+    [[nodiscard]] std::vector<track::SurfacePoint> extract_points(std::uint32_t since_frame = 0, float min_weight = 0.5f,
+                                                                  bool canonical = true) const override;
     [[nodiscard]] std::vector<track::BrickCoord> bricks_updated_since(std::uint32_t frame) const override;
     [[nodiscard]] std::vector<track::SurfacePoint> extract_points(const std::vector<track::BrickCoord>& bricks,
                                                                   float min_weight = 0.5f) const override;

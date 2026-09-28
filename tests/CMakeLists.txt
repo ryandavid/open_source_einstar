@@ -28,7 +28,7 @@ target_link_libraries(test_device PRIVATE einstar::device einstar::sim)
 einstar_add_test(test_fixtures fixtures/test_exstar_project.cpp fixtures/test_fixture_tracking.cpp fixtures/test_global_registration.cpp fixtures/test_symmetry_probe.cpp)
 target_link_libraries(test_fixtures PRIVATE einstar::fixtures einstar::track)
 
-einstar_add_test(test_track track/test_tsdf.cpp track/test_metal_tsdf.cpp)
+einstar_add_test(test_track track/test_tsdf.cpp track/test_metal_tsdf.cpp track/test_relocaliser.cpp)
 target_link_libraries(test_track PRIVATE einstar::track einstar::track_metal)
 
 einstar_add_test(test_pipeline pipeline/test_end_to_end.cpp pipeline/test_global_markers.cpp pipeline/test_marker_holes.cpp)

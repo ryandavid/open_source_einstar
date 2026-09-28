@@ -12,6 +12,8 @@ Tracker::Tracker(TrackerParams params, std::unique_ptr<Volume> volume)
 
 void Tracker::reset(bool keep_fixed_markers) {
     volume_->clear();
+    if (reloc_) reloc_->clear();
+    feature_model_bricks_ = 0;
     if (keep_fixed_markers) {
         std::vector<markers::MapMarker> fixed;
         for (const auto& m : map_.markers())
@@ -74,43 +76,39 @@ std::optional<std::string> Tracker::check(const IcpResult& r, const SE3& from, d
     return std::nullopt;
 }
 
-std::optional<SE3> Tracker::global_candidate(const DepthFrame& frame, std::string& why) {
+GlobalRelocaliser& Tracker::relocaliser() {
+    if (!reloc_) reloc_ = std::make_unique<GlobalRelocaliser>(params_.global, params_.deterministic_relocalisation);
+    return *reloc_;
+}
+
+void Tracker::refresh_feature_model(double& wait_ms) {
+    // While tracking, keep a descriptor model of the surface current in the background so a loss can
+    // query it immediately.
+    if (!params_.global_relocalization || !params_.fuse_surface || frame_no_ % 10 != 0) return;
+    auto& rl = relocaliser();
+    (void)rl.model(frame_no_, wait_ms);  // adopt a finished rebuild
+    if (rl.model_pending()) return;
     const std::size_t bricks = volume_->brick_count();
-    if (feature_model_.empty() ||
-        static_cast<double>(bricks) > static_cast<double>(feature_model_bricks_) * (1.0 + params_.feature_model_rebuild_growth)) {
-        OrientedCloud model;
-        for (const auto& sp : volume_->extract_points(0, 1.0f)) {
-            model.points.push_back(sp.position);
-            model.normals.push_back(sp.normal);
-        }
-        feature_model_ = FeatureModel(voxel_downsample(model, params_.global.voxel_mm), params_.global.feature_radius_mm);
-        feature_model_bricks_ = bricks;
-    }
-    frame.ensure_cpu();
-    OrientedCloud cloud;
-    for (int v = 0; v < frame.points.height(); v += 2)
-        for (int u = 0; u < frame.points.width(); u += 2) {
-            const Vec3f& n = frame.normals(u, v);
-            if (n.squaredNorm() == 0) continue;
-            cloud.points.push_back(frame.points(u, v));
-            cloud.normals.push_back(n);
-        }
-    const auto r = register_global(cloud, feature_model_, params_.global, reloc_seed_++);
-    if (!r) {
-        why = "global reloc found no match";
-        return std::nullopt;
-    }
-    if (!r->ambiguous) return r->T_model_frame;
+    if (bricks == 0 ||
+        (feature_model_bricks_ > 0 &&
+         static_cast<double>(bricks) <= static_cast<double>(feature_model_bricks_) * (1.0 + params_.feature_model_rebuild_growth)))
+        return;
+    feature_model_bricks_ = bricks;
+    rl.submit_model(volume_->extract_points(0, 1.0f, false), frame_no_ + params_.feature_model_latency_frames);
+}
+
+std::optional<SE3> Tracker::pick_candidate(const GlobalRegistrationResult& r, std::string& why) const {
+    if (!r.ambiguous) return r.T_model_frame;
     // Several distinct poses fit (symmetric part): the scanner is most likely still near where
     // tracking was lost; otherwise wait for a more distinctive view.
     const SE3* nearest = nullptr;
     double best = params_.ambiguous_reloc_max_mm;
-    for (const auto& c : r->candidates) {
+    for (const auto& c : r.candidates) {
         const double d = (c.T_model_frame.translation() - lost_pose_.translation()).norm();
         if (d < best) best = d, nearest = &c.T_model_frame;
     }
     if (!nearest) {
-        why = std::format("global reloc ambiguous ({} poses fit, none near the loss)", r->candidates.size());
+        why = std::format("global reloc ambiguous ({} poses fit, none near the loss)", r.candidates.size());
         return std::nullopt;
     }
     return *nearest;
@@ -235,20 +233,46 @@ std::optional<IcpResult> Tracker::align(const DepthFrame& frame, const std::vect
     return best;
 }
 
-std::optional<IcpResult> Tracker::global_relocalise(const DepthFrame& frame, std::string& reason) {
-    std::string why;
-    const auto seed = global_candidate(frame, why);
-    if (!seed) {
-        reason = why;
-        return std::nullopt;
+std::optional<IcpResult> Tracker::global_relocalise(const DepthFrame& frame, std::string& reason, double& wait_ms) {
+    auto& rl = relocaliser();
+    std::optional<IcpResult> found;
+    if (auto res = rl.take_result(frame_no_, wait_ms)) {
+        std::string why = "global reloc found no match";
+        const auto seed = *res ? pick_candidate(**res, why) : std::nullopt;
+        if (seed) {
+            // The candidate places the frame the query was made from; the scanner has moved on since,
+            // so verify on this frame from there with the wider lost-frame gates.
+            IcpParams icp = params_.icp;
+            icp.max_distance_mm *= 3.0f;
+            icp.iterations = {20, 10, 6};
+            const RaycastResult model = volume_->raycast(*seed, frame.intrinsics.scaled(params_.model_scale));
+            const IcpResult r = icp_(frame, model, *seed, *seed, icp);
+            if (const auto verdict = check(r, *seed, 0.1, true)) why = "global reloc rejected: " + *verdict;  // motion gate is meaningless here
+            else found = r;
+        }
+        if (!found) reason = why;
     }
-    const RaycastResult model = volume_->raycast(*seed, frame.intrinsics.scaled(params_.model_scale));
-    const IcpResult r = icp_(frame, model, *seed, *seed, params_.icp);
-    if (const auto verdict = check(r, *seed, 0.1, true)) {  // motion gate is meaningless here
-        reason = "global reloc rejected: " + *verdict;
-        return std::nullopt;
+    if (!found && !rl.query_pending()) {
+        auto model = rl.model(frame_no_, wait_ms);
+        if (!model && !rl.model_pending()) {
+            // Lost before the first background rebuild: start one now.
+            feature_model_bricks_ = volume_->brick_count();
+            rl.submit_model(volume_->extract_points(0, 1.0f, false), frame_no_ + params_.feature_model_latency_frames);
+        }
+        if (model && !model->empty()) {
+            frame.ensure_cpu();
+            OrientedCloud cloud;
+            for (int v = 0; v < frame.points.height(); v += 2)
+                for (int u = 0; u < frame.points.width(); u += 2) {
+                    const Vec3f& n = frame.normals(u, v);
+                    if (n.squaredNorm() == 0) continue;
+                    cloud.points.push_back(frame.points(u, v));
+                    cloud.normals.push_back(n);
+                }
+            rl.submit_query(std::move(model), std::move(cloud), reloc_seed_++, frame_no_ + params_.global_reloc_latency_frames);
+        }
     }
-    return r;
+    return found;
 }
 
 void Tracker::mark_lost(TrackResult& out, const std::string& reason) {
@@ -314,6 +338,7 @@ void Tracker::fuse(const DepthFrame& frame, const FrameMarkers& fm, TrackResult&
 TrackResult Tracker::process(const DepthFrame& frame) {
     Stopwatch sw;
     TrackResult out;
+    ++frame_no_;
     const double t = frame.timestamp_s;
     const FrameMarkers fm = usable_markers(frame);
     out.markers_seen = static_cast<int>(frame.markers.size());
@@ -332,9 +357,8 @@ TrackResult Tracker::process(const DepthFrame& frame) {
 
     std::string reason = "no seed";
     auto best = align(frame, seeds, mpose, out, reason);
-    // Local relocalisation failed: try registering the frame against the whole model.
-    if (!best && state_ == TrackState::lost && params_.global_relocalization && (lost_frames_ % std::max(1, params_.global_reloc_every)) == 0)
-        best = global_relocalise(frame, reason);
+    // Local relocalisation failed: register the frame against the whole model (in the background).
+    if (!best && state_ == TrackState::lost && params_.global_relocalization) best = global_relocalise(frame, reason, out.wait_ms);
     if (!best) {
         mark_lost(out, reason);
         return finish();
@@ -359,6 +383,7 @@ TrackResult Tracker::process(const DepthFrame& frame) {
     last_time_ = t;
     state_ = TrackState::tracking;
     out.state = state_;
+    refresh_feature_model(out.wait_ms);
     return finish();
 }
 

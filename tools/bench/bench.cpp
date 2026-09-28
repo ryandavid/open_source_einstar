@@ -244,7 +244,9 @@ int main(int argc, char** argv) {
     time_it("raycast 320x256", 20, [&] { model = (*mv)->raycast(pose, k.scaled(0.5)); });
     time_it("icp (3 levels)", 20, [&] { (void)track::icp_point_to_plane(df, model, pose, pose, {}); });
     time_it("integrate", 20, [&] { (*mv)->integrate(df, pose); });
+    gpu::profile::reset();
     time_it("extract all", 10, [&] { (void)(*mv)->extract_points(0); });
+    if (gpu::profile::enabled()) std::print("{}", gpu::profile::report(11));
     auto gicp = track_metal::MetalIcp::create(*ctx);
     if (gicp) {
         for (const auto iters : {std::array<int, 3>{1, 1, 1}, std::array<int, 3>{5, 5, 5}, std::array<int, 3>{15, 10, 8}}) {
