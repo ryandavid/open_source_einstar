@@ -9,7 +9,6 @@
 #include <map>
 #include <mutex>
 #include <print>
-#include <random>
 #include <thread>
 
 #include "einstar/pipeline/scan_pipeline.hpp"
@@ -21,20 +20,6 @@ using namespace einstar;
 using e2e::truth_pose;
 
 namespace {
-
-std::vector<synth::Marker> scatter_markers(int count, std::uint32_t seed) {
-    // Irregular placement on the ground plane (y = 70), like stickers applied by hand.
-    std::mt19937 rng(seed);
-    std::uniform_real_distribution<double> ux(-260, 120), uz(-120, 170);
-    std::vector<synth::Marker> out;
-    for (int tries = 0; tries < 20000 && static_cast<int>(out.size()) < count; ++tries) {
-        const Vec3 c(ux(rng), 70.0, uz(rng));
-        bool ok = true;
-        for (const auto& m : out) ok = ok && (m.center - c).norm() > 24.0;
-        if (ok) out.push_back({c, Vec3(0, -1, 0), 6.0, 10.0});
-    }
-    return out;
-}
 
 usb::FrameGroup render_group(const e2e::SyntheticSetup& s, const RigCalibration& rig, std::uint32_t id, std::uint64_t t_us) {
     usb::FrameGroup g;
@@ -56,7 +41,7 @@ usb::FrameGroup render_group(const e2e::SyntheticSetup& s, const RigCalibration&
 TEST_CASE("global markers: capture, bundle adjustment and a surface scan locked to the map") {
     const RigCalibration rig = e2e::einstar_like_rig();
     auto setup = e2e::make_scene();
-    setup.scene.markers = scatter_markers(45, 5);
+    setup.scene.markers = synth::scatter_markers(45, 5);
 
     auto frontend = std::make_unique<pipeline::StereoFrontend>(rig);
     const SE3 T_left_rect = frontend->rectification().T_left_rectified();

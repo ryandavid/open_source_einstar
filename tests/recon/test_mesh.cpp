@@ -8,6 +8,7 @@
 #include "einstar/core/timing.hpp"
 #include "einstar/fixtures/exstar_project.hpp"
 #include "einstar/recon/mesh.hpp"
+#include "einstar/synth/demo.hpp"
 #include "einstar/track/tsdf.hpp"
 
 using namespace einstar;
@@ -30,19 +31,6 @@ ImageF32 sphere_depth(const Vec3& center, double radius, const SE3& T_wc, const 
     return d;
 }
 
-SE3 look_at(const Vec3& eye, const Vec3& target) {
-    const Vec3 f = (target - eye).normalized();
-    Vec3 r = Vec3::UnitY().cross(f);
-    if (r.norm() < 1e-6) r = Vec3::UnitX().cross(f);
-    r.normalize();
-    SE3 T = SE3::Identity();
-    T.linear().col(0) = r;
-    T.linear().col(1) = f.cross(r);
-    T.linear().col(2) = f;
-    T.translation() = eye;
-    return T;
-}
-
 }  // namespace
 
 TEST_CASE("surface nets on a fused sphere: accurate, (nearly) closed, outward normals, exports") {
@@ -57,11 +45,11 @@ TEST_CASE("surface nets on a fused sphere: accurate, (nearly) closed, outward no
         for (int j = -1; j <= 1; ++j) {
             const double a = i * M_PI / 3, e = j * 0.9;
             const Vec3 eye = 250.0 * Vec3(std::cos(a) * std::cos(e), std::sin(e), std::sin(a) * std::cos(e));
-            const SE3 T = look_at(eye, center);
+            const SE3 T = synth::look_at(eye, center);
             vol.integrate(track::make_depth_frame(sphere_depth(center, radius, T, k), k), T);
         }
-    vol.integrate(track::make_depth_frame(sphere_depth(center, radius, look_at(Vec3(0, 250, 1), center), k), k), look_at(Vec3(0, 250, 1), center));
-    vol.integrate(track::make_depth_frame(sphere_depth(center, radius, look_at(Vec3(0, -250, 1), center), k), k), look_at(Vec3(0, -250, 1), center));
+    vol.integrate(track::make_depth_frame(sphere_depth(center, radius, synth::look_at(Vec3(0, 250, 1), center), k), k), synth::look_at(Vec3(0, 250, 1), center));
+    vol.integrate(track::make_depth_frame(sphere_depth(center, radius, synth::look_at(Vec3(0, -250, 1), center), k), k), synth::look_at(Vec3(0, -250, 1), center));
 
     Stopwatch sw;
     auto mesh = recon::extract_mesh(vol);
@@ -149,11 +137,11 @@ TEST_CASE("simplification keeps the shape, manifoldness and orientation") {
     for (int i = 0; i < 6; ++i)
         for (int j = -1; j <= 1; ++j) {
             const double a = i * M_PI / 3, e = j * 0.9;
-            const SE3 T = look_at(250.0 * Vec3(std::cos(a) * std::cos(e), std::sin(e), std::sin(a) * std::cos(e)), Vec3::Zero());
+            const SE3 T = synth::look_at(250.0 * Vec3(std::cos(a) * std::cos(e), std::sin(e), std::sin(a) * std::cos(e)), Vec3::Zero());
             vol.integrate(track::make_depth_frame(sphere_depth(Vec3::Zero(), radius, T, k), k), T);
         }
     for (const double y : {250.0, -250.0}) {
-        const SE3 T = look_at(Vec3(0, y, 1), Vec3::Zero());
+        const SE3 T = synth::look_at(Vec3(0, y, 1), Vec3::Zero());
         vol.integrate(track::make_depth_frame(sphere_depth(Vec3::Zero(), radius, T, k), k), T);
     }
     auto mesh = recon::extract_mesh(vol);

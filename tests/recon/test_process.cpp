@@ -11,46 +11,18 @@
 
 #include "einstar/recon/process.hpp"
 #include "einstar/session/session.hpp"
-#include "einstar/synth/speckle_scene.hpp"
+#include "einstar/synth/demo.hpp"
 
 using namespace einstar;
 
 namespace {
-
-SE3 look_at(const Vec3& eye, const Vec3& target) {
-    const Vec3 f = (target - eye).normalized();
-    const Vec3 r = Vec3(0, 1, 0).cross(f).normalized() * -1.0;
-    SE3 T = SE3::Identity();
-    T.linear().col(0) = r;
-    T.linear().col(1) = f.cross(r);
-    T.linear().col(2) = f;
-    T.translation() = eye;
-    return T;
-}
 
 // Closed orbit above the table, looking at the objects.
 SE3 truth_pose(int i, int n) {
     const double a = 2 * M_PI * i / n;
     const Vec3 center(-60, 40, 0);
     const Vec3 eye = center + Vec3(170 * std::cos(a), -230, 170 * std::sin(a));
-    return look_at(eye, center + Vec3(20 * std::cos(a), 0, 20 * std::sin(a)));
-}
-
-synth::Scene make_scene() {
-    synth::Scene scene;
-    scene.primitives.push_back(synth::Plane{Vec3(0, 70, 0), Vec3(0, -1, 0)});
-    auto box = [&](Vec3 c, Vec3 half, double yaw_deg) {
-        SE3 T = SE3::Identity();
-        T.linear() = Eigen::AngleAxisd(yaw_deg * M_PI / 180, Vec3::UnitY()).toRotationMatrix();
-        T.translation() = c;
-        scene.primitives.push_back(synth::Box{T, half});
-    };
-    scene.primitives.push_back(synth::Sphere{Vec3(-80, 25, 20), 45.0});
-    box(Vec3(-10, 45, 40), Vec3(25, 25, 18), 30);
-    box(Vec3(-150, 50, -10), Vec3(20, 20, 30), -20);
-    box(Vec3(-60, 55, -70), Vec3(35, 15, 12), 55);
-    box(Vec3(-120, 40, 70), Vec3(12, 30, 12), 10);
-    return scene;
+    return synth::look_at(eye, center + Vec3(20 * std::cos(a), 0, 20 * std::sin(a)));
 }
 
 CameraModel small_camera() {
@@ -99,7 +71,7 @@ std::string write_session(const std::string& name, const synth::Scene& scene, co
 
 TEST_CASE("process: loop closure removes drift and the mesh matches the scene") {
     const int n = 72;
-    const auto scene = make_scene();
+    const auto scene = synth::table_scene();
     // Live poses drift: a small rotation and translation per frame, accumulated.
     SE3 drift_step = SE3::Identity();
     // ~0.02 deg and ~0.03 mm per frame, all in one direction: 1.4 deg / 3.5 mm around the loop (worse
@@ -181,7 +153,7 @@ TEST_CASE("process: a segment placed by a wrong relocalisation is left out") {
     // Live tracking "relocalised" frames 36-47 onto a wrong pose (rotated 90 degrees about the scene)
     // and back at 48. Nothing verifies that segment against the rest, and it contradicts the model.
     const int n = 72;
-    const auto scene = make_scene();
+    const auto scene = synth::table_scene();
     std::vector<SE3> truth(n), live(n);
     std::vector<std::uint32_t> flags(n, session::frame_accepted | session::frame_integrated);
     SE3 wrong = SE3::Identity();

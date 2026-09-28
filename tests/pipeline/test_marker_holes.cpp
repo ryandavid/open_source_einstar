@@ -5,7 +5,6 @@
 
 #include <cmath>
 #include <print>
-#include <random>
 
 #include "einstar/pipeline/stereo_frontend.hpp"
 #include "synthetic_setup.hpp"
@@ -15,14 +14,7 @@ using namespace einstar;
 TEST_CASE("marker depth holes are filled on the surface") {
     const auto rig = e2e::einstar_like_rig();
     auto setup = e2e::make_scene();
-    std::mt19937 rng(5);
-    std::uniform_real_distribution<double> ux(-260, 120), uz(-120, 170);
-    for (int tries = 0; tries < 20000 && setup.scene.markers.size() < 45; ++tries) {
-        const Vec3 c(ux(rng), 70.0, uz(rng));
-        bool ok = true;
-        for (const auto& m : setup.scene.markers) ok = ok && (m.center - c).norm() > 24.0;
-        if (ok) setup.scene.markers.push_back({c, Vec3(0, -1, 0), 6.0, 10.0});
-    }
+    setup.scene.markers = synth::scatter_markers(45, 5);
     const std::uint32_t id = 30;
     ImageU8 l, r;
     e2e::render_sensor(setup, rig, e2e::truth_pose(id), 0, 1, l);

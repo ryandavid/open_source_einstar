@@ -4,12 +4,11 @@
 #include <cstdlib>
 #include <filesystem>
 #include <format>
-#include <random>
 
 #include "einstar/calib/device_calibration.hpp"
 #include "einstar/core/log.hpp"
 #include "einstar/sim/sim_transport.hpp"
-#include "einstar/synth/speckle_scene.hpp"
+#include "einstar/synth/demo.hpp"
 
 namespace einstar::app {
 namespace {
@@ -27,14 +26,7 @@ struct EmulatorScene {
         const double a = 0.35 * t;
         const Vec3 eye(-90 + 120 * std::sin(a), -150 - 20 * std::sin(2 * a), -230 + 40 * std::cos(a));
         const Vec3 target(-80 + 40 * std::sin(a + 0.5), 30, 10 + 20 * std::cos(a));
-        const Vec3 fwd = (target - eye).normalized();
-        const Vec3 right = -Vec3(0, 1, 0).cross(fwd).normalized();
-        const Vec3 down = fwd.cross(right);
-        SE3 T = SE3::Identity();
-        T.linear().col(0) = right;
-        T.linear().col(1) = down;
-        T.linear().col(2) = fwd;
-        T.translation() = eye;
+        SE3 T = synth::look_at(eye, target);
         const double half_toe = 0.5 * rotation_angle(rig.T_right_left);
         T.linear() = T.linear() * Eigen::AngleAxisd(half_toe, Vec3::UnitY()).toRotationMatrix();
         return T;
@@ -44,53 +36,10 @@ struct EmulatorScene {
 std::shared_ptr<EmulatorScene> make_scene(const RigCalibration& rig) {
     auto e = std::make_shared<EmulatorScene>();
     e->rig = rig;
-    auto box = [&](Vec3 c, Vec3 half, double yaw_deg, double tilt_deg) {
-        SE3 T = SE3::Identity();
-        T.linear() = (Eigen::AngleAxisd(yaw_deg * M_PI / 180, Vec3::UnitY()) *
-                      Eigen::AngleAxisd(tilt_deg * M_PI / 180, Vec3::UnitX())).toRotationMatrix();
-        T.translation() = c;
-        e->scene.primitives.push_back(synth::Box{T, half});
-    };
-    e->scene.primitives.push_back(synth::Plane{Vec3(0, 70, 0), Vec3(0, -1, 0)});
-    e->scene.primitives.push_back(synth::Sphere{Vec3(-80, 20, 20), 45.0});
-    box(Vec3(-10, 45, 40), Vec3(25, 25, 18), 30, 0);
-    box(Vec3(-150, 50, -10), Vec3(20, 20, 30), -20, 0);
-    box(Vec3(-60, 55, -70), Vec3(35, 15, 12), 55, 0);
-    box(Vec3(-120, 30, 70), Vec3(12, 40, 12), 10, 15);
-    e->scene.primitives.push_back(synth::Sphere{Vec3(20, 55, -40), 15.0});
-    e->projector.model.fx = e->projector.model.fy = 800;
-    e->projector.model.cx = 640;
-    e->projector.model.cy = 400;
-    e->projector.pattern = synth::DotPattern::random(1280, 800, 9000, 3.5, 11);
-    // Marker stickers scattered over the table (irregular, >= 24 mm apart).
-    std::mt19937 rng(5);
-    std::uniform_real_distribution<double> ux(-260, 120), uz(-150, 170);
-    for (int tries = 0; tries < 20000 && e->scene.markers.size() < 60; ++tries) {
-        const Vec3 c(ux(rng), 70.0, uz(rng));
-        bool ok = true;
-        for (const auto& m : e->scene.markers) ok = ok && (m.center - c).norm() > 24.0;
-        if (ok) e->scene.markers.push_back({c, Vec3(0, -1, 0), 6.0, 10.0});
-    }
+    e->scene = synth::table_scene();
+    e->scene.markers = synth::scatter_markers(60, 5, -260, 120, -150, 170);
+    e->projector = synth::speckle_projector();
     return e;
-}
-
-// Synthetic rig with the Einstar's geometry when no real calibration is available.
-RigCalibration synthetic_rig() {
-    RigCalibration rig;
-    rig.left.width = rig.right.width = 1280;
-    rig.left.height = rig.right.height = 1024;
-    rig.left.fx = rig.left.fy = 1157.3;
-    rig.left.cx = 625.4;
-    rig.left.cy = 522.4;
-    rig.left.dist = {-0.156, 0.158, 0, 0.0003, 0.039};
-    rig.right = rig.left;
-    rig.right.cx = 633.8;
-    rig.right.cy = 506.0;
-    SE3 T = SE3::Identity();
-    T.linear() = Eigen::AngleAxisd(-22.15 * M_PI / 180, Vec3::UnitY()).toRotationMatrix();
-    T.translation() = -T.linear() * Vec3(156.9, 0.2, -30.7);
-    rig.T_right_left = T;
-    return rig;
 }
 
 }  // namespace
@@ -116,7 +65,7 @@ Result<std::unique_ptr<Session>> Session::open(bool force_emulator, UpdateSink u
         // Emulator: put the real calibration into its flash when EXStar's cache is available, so the
         // app goes through exactly the same calibration path as with hardware.
         auto sim = std::make_unique<sim::SimTransport>();
-        RigCalibration rig = synthetic_rig();
+        RigCalibration rig = synth::synthetic_einstar_rig();
         if (auto blob = calib::encode_quick_flash_blob_from_directory(kExstarCalibrationCache)) {
             sim->set_flash(0, *blob);
             if (auto cal = calib::decode_flash_blob(*blob)) rig = cal->rig();
