@@ -10,10 +10,28 @@ frame record holds:
 - the live pose and tracking flags: accepted, degenerate, relocalised, marker pose, fused, global-marker capture;
 - its markers: camera-frame position, normal, diameter, live map id, and rectified left/right centres.
 
-Around 170 KB per frame, about 2.5 MB/s at the scan rate.
+Around 170-250 KB per frame, about 2.5-3.7 MB/s at the scan rate.
 
-A `GMRK` record stores the global-marker map in use. Records are length-prefixed, so a file truncated
-by a crash still loads up to its last complete frame.
+Alongside the frames:
+- `DEVC` (once per file): the scanner's vendor, product, serial and firmware, its calibration block
+  as read from flash (6568 bytes), the decoded rig, and the rectification used live. Enough to
+  re-rectify raw images and to tie a scan to a unit.
+- `FXTR` (after each frame): which stream sensor is the left camera, the capture settings last sent
+  (exposure and gain read back per sensor, laser, strobe, trigger period, last temperature reading)
+  and the tracker's view of the frame (state, ICP rms / inlier ratio / coverage / eigen ratio,
+  correspondences, degenerate directions, markers seen, stereo and tracking time, rejection reason).
+- `DROP`: every frame that reached the host but has no frame record, with the reason (the live
+  queue overflowed, or the image group was incomplete), so the timeline is complete.
+- `RAWI` (optional, the app's "Keep raw IR images", off by default): both raw 1280x1024 IR images
+  of every frame that reaches the host, recorded on arrival (so dropped frames keep theirs), each
+  row delta-coded and zstd-compressed: 1.5-1.9x, about 20-25 MB/s. With these, future stereo and
+  marker algorithms can be re-run on the scan. The writer drops raw frames rather than growing
+  memory if the disk falls behind, and the HUD counts them.
+- `GMRK`: the global-marker map in use.
+
+Readers skip record types they do not know, so new kinds can be added without breaking old files or
+old readers. Records are length-prefixed, so a file truncated by a crash still loads up to its last
+complete record. `einstar-cli inspect <file>` summarises a session file.
 
 A new file starts whenever the tracker's world frame restarts: Clear model (which also deletes the
 discarded recording), a new marker capture, or loading or discarding a global-marker map. Pausing

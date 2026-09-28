@@ -7,23 +7,32 @@
 //
 // File layout (little endian): "ESTR" u32 version, then records [u32 tag][u32 reserved][u64 size][payload].
 //   HEAD  session header (depth intrinsics, rectified stereo geometry)
+//   DEVC  the scanner: identity, calibration blob as read from flash, decoded rig, rectification
 //   FRAM  one frame (metadata + zstd-compressed u16 depth in 1/50 mm + u8 confidence)
+//   FXTR  the preceding frame's capture settings and tracking diagnostics
+//   DROP  a frame that reached the host but has no FRAM (live queue overflow, no depth)
+//   RAWI  optional raw IR images of one trigger (row delta-coded 8-bit, zstd)
 //   GMRK  a global-marker map in use from that point on
-// A reader tolerates a truncated last record (e.g. after a crash).
+// Readers skip record types they do not know, so new kinds can be added without breaking old
+// files or old readers. A reader tolerates a truncated last record (e.g. after a crash).
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <fstream>
 #include <functional>
-#include <span>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "einstar/core/camera.hpp"
 #include "einstar/core/error.hpp"
 #include "einstar/core/image.hpp"
 #include "einstar/core/se3.hpp"
@@ -31,6 +40,56 @@
 #include "einstar/track/frame.hpp"
 
 namespace einstar::session {
+
+// The scanner a session was recorded with: enough to re-rectify raw images and tie results to a unit.
+struct DeviceRecord {
+    std::string vendor, product, serial, firmware;
+    std::vector<std::uint8_t> calibration_blob;  // as read from the scanner's flash (empty for replays)
+    RigCalibration rig;                          // decoded from the blob
+    Mat3 R_rect_left = Mat3::Identity();         // rectifying rotations used live (original -> rectified)
+    Mat3 R_rect_right = Mat3::Identity();
+    CameraModel rectified;                       // full-resolution rectified camera (no distortion)
+};
+
+// Settings the frame was captured with (as last sent to the scanner).
+struct CaptureSettings {
+    std::array<std::uint32_t, 2> exposure{};  // per IR sensor (device units, assumed us)
+    std::array<std::uint16_t, 2> gain{};
+    int laser_percent = 0;
+    int strobe = 0;
+    std::uint32_t trigger_period_us = 0;
+    float temperature_c = std::numeric_limits<float>::quiet_NaN();  // last reading
+};
+
+// How the live tracker saw the frame (the process step recomputes what it needs; this is for tuning
+// and diagnosis without re-running tracking).
+struct TrackingDiagnostics {
+    std::uint8_t state = 0;  // track::TrackState
+    float icp_rms_mm = 0, inlier_ratio = 0, coverage = 0, eigen_ratio = 0, marker_rms_mm = 0;
+    std::int32_t correspondences = 0, degenerate_directions = 0, markers_seen = 0;
+    float stereo_ms = 0, track_ms = 0;
+    std::string reason;  // why the frame was rejected, if it was
+};
+
+struct FrameExtras {
+    std::int32_t left_sensor = -1;  // which stream sensor is the left IR camera
+    CaptureSettings capture;
+    TrackingDiagnostics tracking;
+};
+
+// A frame that reached the host without a FRAM record.
+struct DroppedFrame {
+    std::uint64_t index = 0;
+    double timestamp_s = 0;
+    std::string reason;
+};
+
+// Raw IR images of one trigger, as streamed (sensor index as delivered; see FrameExtras::left_sensor).
+struct RawFrame {
+    std::uint64_t index = 0;
+    double timestamp_s = 0;
+    std::vector<std::pair<int, ImageU8>> images;
+};
 
 struct SessionHeader {
     track::Intrinsics depth_intrinsics;  // of the stored depth images (rectified left camera)
@@ -75,6 +134,7 @@ struct FrameRecord {
     ImageF32 depth;       // mm, 0 = none
     ImageF32 confidence;  // 0..1 (empty = unknown)
     std::shared_ptr<PackedImages> packed;  // writing only: used instead of depth/confidence when set
+    std::optional<FrameExtras> extras;     // FXTR (absent in older files)
 
     [[nodiscard]] bool accepted() const { return (flags & frame_accepted) != 0; }
     // Points, normals and weights for fusion / registration.
@@ -92,11 +152,17 @@ public:
 
     void write(FrameRecord frame);
     void write_global_markers(const std::vector<markers::MapMarker>& map);
+    void write_device(const DeviceRecord& device);
+    void write_dropped(const DroppedFrame& frame);
+    // Raw images are compressed on the writer thread. Returns false (and drops the frame) when more
+    // than `max_raw_backlog` are waiting, so a slow disk cannot grow memory without bound.
+    bool write_raw(RawFrame frame, std::size_t max_raw_backlog = 48);
     void flush();  // waits until everything submitted so far is on disk (the file stays open)
     void close();  // flushes; idempotent
 
     [[nodiscard]] const std::string& path() const { return path_; }
     [[nodiscard]] std::uint64_t frames_written() const { return frames_written_; }
+    [[nodiscard]] std::uint64_t raw_frames_written() const { return raw_written_; }
     [[nodiscard]] std::uint64_t bytes_written() const { return bytes_written_; }
     [[nodiscard]] std::size_t backlog() const;
 
@@ -112,8 +178,9 @@ private:
     std::size_t in_flight_ = 0;  // records taken by the writer thread but not yet written
     std::deque<std::vector<std::uint8_t>> queue_;  // serialised records (tag first)
     std::deque<FrameRecord> frames_;
+    std::deque<RawFrame> raws_;
     bool closing_ = false;
-    std::atomic<std::uint64_t> frames_written_{0}, bytes_written_{0};
+    std::atomic<std::uint64_t> frames_written_{0}, bytes_written_{0}, raw_written_{0};
     std::thread thread_;
 };
 
@@ -129,6 +196,14 @@ public:
     [[nodiscard]] Result<FrameRecord> read(std::size_t i) const;
     // The last global-marker map recorded (empty if none).
     [[nodiscard]] const std::vector<markers::MapMarker>& global_markers() const { return global_markers_; }
+    [[nodiscard]] const std::optional<DeviceRecord>& device() const { return device_; }
+    [[nodiscard]] const std::vector<DroppedFrame>& dropped() const { return dropped_; }
+    // Raw IR frames (optional): index / timestamp without decoding, and the full images on demand.
+    [[nodiscard]] std::size_t raw_count() const { return raws_.size(); }
+    [[nodiscard]] std::uint64_t raw_index(std::size_t i) const { return raws_[i].index; }
+    [[nodiscard]] double raw_timestamp(std::size_t i) const { return raws_[i].timestamp_s; }
+    [[nodiscard]] std::uint64_t raw_bytes() const;  // on disk, all raw frames
+    [[nodiscard]] Result<RawFrame> read_raw(std::size_t i) const;
 
 private:
     SessionHeader header_;
@@ -141,6 +216,14 @@ private:
     std::vector<FrameRecord> frames_;  // metadata (no images)
     std::vector<ImageBlock> blocks_;
     std::vector<markers::MapMarker> global_markers_;
+    std::optional<DeviceRecord> device_;
+    std::vector<DroppedFrame> dropped_;
+    struct RawBlock {
+        std::uint64_t index = 0;
+        double timestamp_s = 0;
+        std::uint64_t offset = 0, size = 0;  // the RAWI payload in the file
+    };
+    std::vector<RawBlock> raws_;
     mutable std::mutex file_mutex_;
     mutable std::ifstream in_;
 };

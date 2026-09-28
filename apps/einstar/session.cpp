@@ -1,5 +1,6 @@
 #include "session.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -118,13 +119,26 @@ Result<std::unique_ptr<Session>> Session::open(bool force_emulator, UpdateSink u
     pipeline::ScanPipelineParams pp;
     pp.block_when_full = s->emulated_;  // the emulator can wait; a real scanner cannot
     pp.tracker.deterministic_relocalisation = s->emulated_;  // live: never wait for the relocalisation worker
-    s->pipeline_ = std::make_unique<pipeline::ScanPipeline>(std::make_unique<pipeline::StereoFrontend>(rig), pp, std::move(updates));
+    auto frontend = std::make_unique<pipeline::StereoFrontend>(rig);
+    // Everything needed to re-rectify raw images and tie the scan to this unit, in every session file.
+    session::DeviceRecord record;
+    const auto& info = s->device_->info();
+    record.vendor = info.vendor_name;
+    record.product = info.product_name;
+    record.serial = info.serial;
+    record.firmware = info.firmware;
+    record.calibration_blob = *blob;
+    record.rig = rig;
+    record.R_rect_left = frontend->rectification().R_left;
+    record.R_rect_right = frontend->rectification().R_right;
+    record.rectified = frontend->rectification().rectified;
+    s->pipeline_ = std::make_unique<pipeline::ScanPipeline>(std::move(frontend), pp, std::move(updates));
+    s->pipeline_->set_device_record(std::move(record));
     // Every scan is recorded so the process step can use every frame.
     if (const char* dir = std::getenv("EINSTAR_SCAN_DIR")) s->pipeline_->set_recording_directory(dir);
     else if (const char* home = std::getenv("HOME")) s->pipeline_->set_recording_directory(std::string(home) + "/Documents/Einstar/Scans");
     s->pipeline_->start();
 
-    const auto& info = s->device_->info();
     s->description_ = std::format("{} {} (serial {}, firmware {})", s->emulated_ ? "Emulated" : "Scanner", info.product_name,
                                   info.serial, info.firmware);
     return s;
@@ -136,7 +150,20 @@ Result<void> Session::apply(const ScanSettings& st) {
         if (auto r = device_->set_gain(sensor, static_cast<std::uint16_t>(st.gain)); !r) return r;
     }
     if (auto r = device_->set_laser_percent(st.laser_percent); !r) return r;
-    return device_->set_strobe(0, st.strobe);
+    if (auto r = device_->set_strobe(0, st.strobe); !r) return r;
+    // Recorded with every frame. The device clamps to the sensors' ranges; read the values back.
+    session::CaptureSettings cs;
+    for (int sensor = 0; sensor < 2; ++sensor) {
+        const auto e = device_->exposure(sensor);
+        const auto g = device_->gain(sensor);
+        cs.exposure[static_cast<std::size_t>(sensor)] = e ? *e : static_cast<std::uint32_t>(st.exposure);
+        cs.gain[static_cast<std::size_t>(sensor)] = g ? *g : static_cast<std::uint16_t>(st.gain);
+    }
+    cs.laser_percent = std::clamp(st.laser_percent, 0, 100);
+    cs.strobe = std::clamp(st.strobe, 0, device::kMaxStrobeLuminance);
+    cs.trigger_period_us = st.trigger_period_us;
+    pipeline_->set_capture_settings(cs);
+    return {};
 }
 
 Result<void> Session::start_scan(const ScanSettings& st) {

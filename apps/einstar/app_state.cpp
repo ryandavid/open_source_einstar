@@ -161,6 +161,12 @@ void AppState::clear_model() {
     process_ = {};
 }
 
+void AppState::set_record_raw_ir(bool on) {
+    if (session_) session_->pipeline().set_record_raw_ir(on);
+}
+
+bool AppState::record_raw_ir() const { return session_ && session_->pipeline().record_raw_ir(); }
+
 void AppState::apply_settings() {
     if (session_ && session_->scanning()) (void)session_->apply(settings);
 }
@@ -251,6 +257,7 @@ void AppState::update() {
     static int ticks = 0;
     if (++ticks % 4 == 0)
         if (auto t = session_->temperature()) {
+            session_->pipeline().set_temperature(static_cast<float>(*t));
             std::lock_guard lock(mutex_);
             hud_.temperature_c = static_cast<float>(*t);
         }
@@ -309,6 +316,8 @@ void AppState::on_live_update(pipeline::LiveUpdate&& u) {
     hud_.distance_mm = st.mean_depth_mm;
     hud_.model_points = st.model_points;
     hud_.recorded_frames = st.recorded_frames;
+    hud_.raw_frames = st.raw_frames;
+    hud_.raw_dropped = st.raw_dropped;
     hud_.markers = st.markers_in_frame;
     hud_.markers_matched = st.markers_matched;
     hud_.map_markers = st.map_markers;

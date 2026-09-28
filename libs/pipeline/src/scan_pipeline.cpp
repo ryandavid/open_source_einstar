@@ -88,7 +88,7 @@ std::unique_ptr<track::Volume> make_volume(const ScanPipelineParams& p) {
 
 ScanPipeline::ScanPipeline(std::unique_ptr<StereoFrontend> frontend, ScanPipelineParams params, Sink sink)
     : frontend_(std::move(frontend)), params_(params), sink_(std::move(sink)), tracker_(params.tracker, make_volume(params)),
-      surface_mode_(params.tracker.mode) {
+      surface_mode_(params.tracker.mode), record_raw_ir_(params.record_raw_ir) {
     bundle_.geometry = frontend_->rectification().geometry;
     if (params_.gpu_volume) {
         if (auto ctx = gpu::Context::create())
@@ -300,8 +300,12 @@ void ScanPipeline::set_global_markers(std::vector<markers::MapMarker> map) {
 
 void ScanPipeline::set_recording_directory(std::string directory) {
     post([this, directory = std::move(directory)] {
-        if (directory == record_dir_) return;
+        {
+            std::lock_guard lock(recorder_mutex_);
+            if (directory == record_dir_) return;
+        }
         restart_recording(false);
+        std::lock_guard lock(recorder_mutex_);  // push() reads it on the device thread
         record_dir_ = directory;
     });
 }
@@ -333,35 +337,65 @@ void ScanPipeline::restart_recording(bool delete_current) {
         log::info("recording: closed {} ({} frames)", path, frames);
     }
     stats_.recorded_frames = 0;
+    stats_.raw_frames = 0;
+    raw_dropped_ = 0;
+}
+
+session::SessionWriter* ScanPipeline::ensure_recorder() {
+    if (record_dir_.empty()) return nullptr;
+    if (recorder_) return recorder_.get();
+    const auto now = std::chrono::system_clock::now();
+    const auto path = (std::filesystem::path(record_dir_) /
+                       std::format("scan-{:%Y%m%d-%H%M%S}.estr", std::chrono::floor<std::chrono::seconds>(now)))
+                          .string();
+    session::SessionHeader h;
+    h.depth_intrinsics = frontend_->depth_intrinsics();
+    const auto& g = frontend_->rectification().geometry;
+    h.rect_f = g.f;
+    h.rect_cx = g.cx;
+    h.rect_cy = g.cy;
+    h.baseline_mm = g.baseline;
+    h.description = "live scan";
+    auto w = session::SessionWriter::create(path, h);
+    if (!w) {
+        log::error("recording disabled: {}", w.error().message);
+        record_dir_.clear();
+        return nullptr;
+    }
+    recorder_ = std::move(*w);
+    if (device_record_) recorder_->write_device(*device_record_);
+    std::lock_guard glock(global_mutex_);
+    if (!global_map_.empty()) recorder_->write_global_markers(global_map_);
+    log::info("recording: {}", path);
+    return recorder_.get();
+}
+
+void ScanPipeline::set_device_record(session::DeviceRecord device) {
+    std::lock_guard lock(recorder_mutex_);
+    if (recorder_) recorder_->write_device(device);
+    device_record_ = std::move(device);
+}
+
+void ScanPipeline::set_capture_settings(const session::CaptureSettings& settings) {
+    std::lock_guard lock(recorder_mutex_);
+    const float t = capture_.temperature_c;
+    capture_ = settings;
+    capture_.temperature_c = t;
+}
+
+void ScanPipeline::set_temperature(float celsius) {
+    std::lock_guard lock(recorder_mutex_);
+    capture_.temperature_c = celsius;
+}
+
+void ScanPipeline::record_dropped(const usb::FrameGroup& group, std::string reason) {
+    std::lock_guard lock(recorder_mutex_);
+    if (auto* w = ensure_recorder()) w->write_dropped({group.frame_id, static_cast<double>(group.timestamp) * 1e-6, std::move(reason)});
 }
 
 void ScanPipeline::record(const track::TrackResult& r, const DepthOutput& depth) {
-    if (record_dir_.empty()) return;
     std::lock_guard lock(recorder_mutex_);
-    if (!recorder_) {
-        const auto now = std::chrono::system_clock::now();
-        const auto path = (std::filesystem::path(record_dir_) /
-                           std::format("scan-{:%Y%m%d-%H%M%S}.estr", std::chrono::floor<std::chrono::seconds>(now)))
-                              .string();
-        session::SessionHeader h;
-        h.depth_intrinsics = frontend_->depth_intrinsics();
-        const auto& g = frontend_->rectification().geometry;
-        h.rect_f = g.f;
-        h.rect_cx = g.cx;
-        h.rect_cy = g.cy;
-        h.baseline_mm = g.baseline;
-        h.description = "live scan";
-        auto w = session::SessionWriter::create(path, h);
-        if (!w) {
-            log::error("recording disabled: {}", w.error().message);
-            record_dir_.clear();
-            return;
-        }
-        recorder_ = std::move(*w);
-        std::lock_guard glock(global_mutex_);
-        if (!global_map_.empty()) recorder_->write_global_markers(global_map_);
-        log::info("recording: {}", path);
-    }
+    if (!ensure_recorder()) return;
     session::FrameRecord rec;
     rec.index = depth.frame.index;
     rec.timestamp_s = depth.frame.timestamp_s;
@@ -393,8 +427,27 @@ void ScanPipeline::record(const track::TrackResult& r, const DepthOutput& depth)
     } else {
         session::capture_depth(depth.frame, rec.depth, rec.confidence);
     }
+    session::FrameExtras ex;
+    ex.left_sensor = frontend_->left_sensor();
+    ex.capture = capture_;
+    auto& d = ex.tracking;
+    d.state = static_cast<std::uint8_t>(r.state);
+    d.icp_rms_mm = static_cast<float>(r.icp.rms_mm);
+    d.inlier_ratio = static_cast<float>(r.icp.inlier_ratio);
+    d.coverage = static_cast<float>(r.icp.coverage);
+    d.eigen_ratio = static_cast<float>(r.icp.min_eigenvalue_ratio);
+    d.marker_rms_mm = static_cast<float>(r.icp.marker_rms_mm);
+    d.correspondences = r.icp.correspondences;
+    d.degenerate_directions = r.icp.degenerate_directions;
+    d.markers_seen = r.markers_seen;
+    d.stereo_ms = static_cast<float>(depth.stereo_ms);
+    d.track_ms = static_cast<float>(r.ms);
+    d.reason = r.reason;
+    rec.extras = std::move(ex);
     recorder_->write(std::move(rec));
     stats_.recorded_frames = recorder_->frames_written() + recorder_->backlog();
+    stats_.raw_frames = recorder_->raw_frames_written();
+    stats_.raw_dropped = raw_dropped_;
 }
 
 void ScanPipeline::set_surface_mode(track::AlignMode mode) {
@@ -443,11 +496,25 @@ void ScanPipeline::fill_marker_overlays(const track::TrackResult& r, const Depth
 
 void ScanPipeline::push(usb::FrameGroup&& group) {
     ++frames_in_;
+    if (record_raw_ir_) {
+        // Raw IR is recorded on arrival, so frames the live pipeline drops are still kept.
+        session::RawFrame raw;
+        raw.index = group.frame_id;
+        raw.timestamp_s = static_cast<double>(group.timestamp) * 1e-6;
+        for (int sensor = 0; sensor < 2; ++sensor)
+            if (const auto& sf = group.sensors[static_cast<std::size_t>(sensor)]) raw.images.emplace_back(sensor, sf->pixels);
+        std::lock_guard lock(recorder_mutex_);
+        if (auto* w = ensure_recorder(); w && !w->write_raw(std::move(raw))) {
+            if (raw_dropped_++ % 50 == 0) log::warn("recording: disk too slow for raw IR, {} raw frames not written", raw_dropped_.load());
+        }
+    }
+    std::optional<usb::FrameGroup> overflow;
     {
         std::unique_lock lock(mutex_);
         if (params_.block_when_full) {
             space_cv_.wait(lock, [&] { return queue_.size() < params_.queue_capacity || !worker_.joinable(); });
         } else if (queue_.size() >= params_.queue_capacity) {
+            overflow = std::move(queue_.front());
             queue_.pop_front();
             ++dropped_;
             ++frames_taken_;
@@ -455,6 +522,7 @@ void ScanPipeline::push(usb::FrameGroup&& group) {
         queue_.push_back(std::move(group));
     }
     cv_.notify_one();
+    if (overflow) record_dropped(*overflow, "live queue full");
 }
 
 std::vector<SE3> ScanPipeline::trajectory() const {
@@ -506,7 +574,10 @@ void ScanPipeline::process(usb::FrameGroup&& group) {
         order_detected_ = true;
     }
     auto depth = frontend_->process(group);
-    if (!depth) return;
+    if (!depth) {
+        record_dropped(group, "no depth (incomplete image group)");
+        return;
+    }
     stereo_times_.add(depth->stereo_ms);
     marker_times_.add(depth->marker_ms);
 

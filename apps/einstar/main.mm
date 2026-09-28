@@ -113,17 +113,20 @@ static bool write_png(id<MTLTexture> tex, const char* path) {
 }
 
 int main(int argc, char** argv) {
-    // --snapshot <out.png> [seconds] [--process]: run the emulator scan headless and save one frame of
-    // the UI; with --process the scan is stopped after `seconds`, processed, and the snapshot shows the mesh.
+    // --snapshot <out.png> [seconds] [--process] [--raw]: run the emulator scan headless and save one frame
+    // of the UI; with --process the scan is stopped after `seconds`, processed, and the snapshot shows the
+    // mesh; --raw also records raw IR.
     const char* snapshot_path = nullptr;
     double snapshot_seconds = 8.0;
     bool snapshot_process = false;
+    bool snapshot_raw = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string_view(argv[i]) == "--snapshot" && i + 1 < argc) {
             snapshot_path = argv[i + 1];
             if (i + 2 < argc && argv[i + 2][0] != '-') snapshot_seconds = std::atof(argv[i + 2]);
         }
         if (std::string_view(argv[i]) == "--process") snapshot_process = true;
+        if (std::string_view(argv[i]) == "--raw") snapshot_raw = true;
     }
     bool snapshot_processing = false;
     if (!glfwInit()) {
@@ -195,6 +198,7 @@ int main(int argc, char** argv) {
         setenv("EINSTAR_SCAN_DIR", tmp.c_str(), 1);
         state.connect(true);
         state.follow_scanner = true;
+        state.set_record_raw_ir(snapshot_raw);
         state.start_scan();
     }
     while (!glfwWindowShouldClose(window)) {
@@ -308,6 +312,13 @@ int main(int argc, char** argv) {
                 if (ImGui::Button("Pause scan", ImVec2(-1, 0))) state.stop_scan();
             }
             if (ImGui::Button("Clear model", ImVec2(-1, 0))) state.clear_model();
+            {
+                bool raw = state.record_raw_ir();
+                if (ImGui::Checkbox("Keep raw IR images (~25 MB/s)", &raw)) state.set_record_raw_ir(raw);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Records the cameras' raw images too, so future depth and marker algorithms can re-run "
+                                      "on this scan. Needs a lot of disk space.");
+            }
             ImGui::EndDisabled();
             ImGui::Separator();
             ImGui::TextUnformatted("Alignment");
@@ -425,6 +436,9 @@ int main(int argc, char** argv) {
             ImGui::Text("Depth / track  %5.1f / %5.1f ms", hud.depth_ms, hud.track_ms);
             ImGui::Text("Queue / drops  %d / %d", hud.queue_depth, hud.dropped);
             if (hud.recorded_frames > 0) ImGui::Text("Recorded       %llu frames", static_cast<unsigned long long>(hud.recorded_frames));
+            if (hud.raw_frames > 0 || hud.raw_dropped > 0)
+                ImGui::Text("Raw IR         %llu frames%s", static_cast<unsigned long long>(hud.raw_frames),
+                            hud.raw_dropped > 0 ? std::format(" ({} not written)", hud.raw_dropped).c_str() : "");
             if (hud.temperature_c > -100) ImGui::Text("Temperature    %4.1f C", hud.temperature_c);
             ImGui::Separator();
             ImGui::Text("Distance %s", hud.distance_mm > 0 ? std::format("{:.0f} mm", hud.distance_mm).c_str() : "--");

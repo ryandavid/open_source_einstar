@@ -62,6 +62,7 @@ struct Hud {
     int distance_step = -1;  // 0..9, -1 = out of range
     std::size_t model_points = 0;
     std::uint64_t recorded_frames = 0;
+    std::uint64_t raw_frames = 0, raw_dropped = 0;
     std::string notice;  // short-lived message (e.g. a brightness change from the scanner's buttons)
 };
 
@@ -89,6 +90,9 @@ public:
     [[nodiscard]] bool scanning() const { return session_ && session_->scanning(); }
     void apply_settings();
     void set_brightness(int level);  // exposure and gain from the brightness ladder
+    // Also record raw IR images (for re-running future depth / marker algorithms on the scan).
+    void set_record_raw_ir(bool on);
+    [[nodiscard]] bool record_raw_ir() const;
 
     void update();  // periodic housekeeping from the UI thread (temperature, LEDs)
     [[nodiscard]] std::optional<RenderUpdate> take_render_update();

@@ -62,6 +62,8 @@ struct LiveStats {
     int keyframes = 0;           // global-marker keyframes collected
     double marker_ms = 0;        // median
     std::uint64_t recorded_frames = 0;  // in the current session file
+    std::uint64_t raw_frames = 0;       // raw IR frames in the current session file
+    std::uint64_t raw_dropped = 0;      // raw frames not written (disk too slow)
 };
 
 struct LiveUpdate {
@@ -111,7 +113,7 @@ private:
 
 struct ScanPipelineParams {
     track::TrackerParams tracker;
-    std::size_t queue_capacity = 6;
+    std::size_t queue_capacity = 16;  // ~1 s at 14.7 Hz: rides out stalls without dropping frames
     // Live USB input must never stall, so overflow drops the oldest group (and counts it). Replays,
     // the emulator and tests can instead block the producer so every frame is processed.
     bool block_when_full = false;
@@ -125,6 +127,9 @@ struct ScanPipelineParams {
     int max_keyframes = 2000;
     int global_marker_min_keyframes = 2;  // a marker must be seen from this many keyframes to be kept
     optim::BundleParams bundle;
+    // Also record the raw IR images of every frame that reaches the host (~20-25 MB/s on disk), so
+    // future depth / marker algorithms can be re-run on the scan. Off by default.
+    bool record_raw_ir = false;
 };
 
 class ScanPipeline {
@@ -155,6 +160,14 @@ public:
     [[nodiscard]] std::string flush_recording();
     [[nodiscard]] std::vector<markers::MapMarker> global_markers() const;
 
+    // Scanner identity and calibration, written at the start of every session file.
+    void set_device_record(session::DeviceRecord device);
+    // Settings the scanner is running with (stamped on each recorded frame; thread-safe).
+    void set_capture_settings(const session::CaptureSettings& settings);
+    void set_temperature(float celsius);
+    void set_record_raw_ir(bool on) { record_raw_ir_ = on; }
+    [[nodiscard]] bool record_raw_ir() const { return record_raw_ir_; }
+
     // Called from the device thread; never blocks.
     void push(usb::FrameGroup&& group);
 
@@ -172,6 +185,8 @@ private:
     void fill_marker_overlays(const track::TrackResult& r, const DepthOutput& depth, LiveUpdate& up) const;
     void record(const track::TrackResult& r, const DepthOutput& depth);
     void restart_recording(bool delete_current);  // world frame restarted
+    session::SessionWriter* ensure_recorder();    // creates the session file on first use (recorder_mutex_ held)
+    void record_dropped(const usb::FrameGroup& group, std::string reason);
 
     std::unique_ptr<StereoFrontend> frontend_;
     ScanPipelineParams params_;
@@ -196,10 +211,14 @@ private:
     std::vector<Command> commands_;
     std::atomic<std::uint64_t> frames_taken_{0};
     TimingStats marker_times_{64};
-    std::string record_dir_;
+    std::string record_dir_;  // guarded by recorder_mutex_
     std::unique_ptr<depth_metal::DepthPacker> packer_;  // GPU frames are packed for recording on the GPU
     std::unique_ptr<session::SessionWriter> recorder_;
     mutable std::mutex recorder_mutex_;
+    std::optional<session::DeviceRecord> device_record_;  // guarded by recorder_mutex_
+    session::CaptureSettings capture_;                     // guarded by recorder_mutex_
+    std::atomic<bool> record_raw_ir_{false};
+    std::atomic<std::uint64_t> raw_dropped_{0};
 
     std::mutex mutex_;
     std::condition_variable cv_;

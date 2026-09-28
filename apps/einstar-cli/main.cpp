@@ -45,7 +45,8 @@ int usage() {
     std::println(stderr,
                  "usage: einstar-cli probe [--verbose] | sim-probe | calib <dir> |\n"
                  "       track-fixture <project.ir_E10_prj> [--start N] [--count N] [--skip K] [--stl ref.stl] [--cpu] [--mode geometry|hybrid|markers] [--global-markers] [--marker-confirm N] [--record out.estr] [--quiet] |\n"
-                 "       process <session.estr> [-o mesh.stl|ply|obj] [--voxel MM] [--no-optimize] [--smooth N] [--stl reference.stl] [--reference-poses file]");
+                 "       process <session.estr> [-o mesh.stl|ply|obj] [--voxel MM] [--no-optimize] [--smooth N] [--stl reference.stl] [--reference-poses file] |\n"
+                 "       inspect <session.estr>");
     return 2;
 }
 
@@ -267,6 +268,7 @@ int track_fixture(const char* path, std::span<char*> args) {
     tp.degenerate_weight = static_cast<float>(arg_double(args, "--degen-weight", tp.degenerate_weight));
     tp.degenerate_eigen_ratio = arg_double(args, "--degen-flag", tp.degenerate_eigen_ratio);
     tp.deterministic_relocalisation = !has_flag(args, "--live-reloc");  // live: results used whenever ready
+    tp.feature_model_min_interval_frames = static_cast<int>(arg_int(args, "--rebuild-interval", tp.feature_model_min_interval_frames));
     std::println("volume: {}, icp: {}, mode: {}", volume ? "Metal" : "CPU", gpu_icp ? "Metal" : "CPU", mode);
     track::Tracker tracker(tp, std::move(volume));
     if (gpu_icp) tracker.set_icp_solver(gpu_icp->as_function());
@@ -521,6 +523,58 @@ int track_fixture(const char* path, std::span<char*> args) {
     return 0;
 }
 
+// What a session file holds: the scanner, frames and their extras, drops, raw IR (first frame decoded).
+int inspect_cmd(const char* path) {
+    auto r = session::SessionReader::open(path);
+    if (!r) {
+        std::println(stderr, "{}", r.error().message);
+        return 1;
+    }
+    const auto& s = **r;
+    const auto& k = s.header().depth_intrinsics;
+    std::println("{}: \"{}\", depth {}x{} f {:.1f}, rectified f {:.1f} baseline {:.2f} mm", path, s.header().description, k.width,
+                 k.height, k.fx, s.header().rect_f, s.header().baseline_mm);
+    if (const auto& d = s.device())
+        std::println("scanner: {} {} serial {} firmware {}; calibration blob {} bytes; left fx {:.2f}", d->vendor, d->product, d->serial,
+                     d->firmware, d->calibration_blob.size(), d->rig.left.fx);
+    else
+        std::println("scanner: not recorded");
+    std::size_t accepted = 0, with_extras = 0;
+    std::uint32_t exp_lo = ~0u, exp_hi = 0;
+    for (std::size_t i = 0; i < s.frame_count(); ++i) {
+        const auto& m = s.meta(i);
+        if (m.accepted()) ++accepted;
+        if (!m.extras) continue;
+        ++with_extras;
+        exp_lo = std::min(exp_lo, m.extras->capture.exposure[0]);
+        exp_hi = std::max(exp_hi, m.extras->capture.exposure[0]);
+    }
+    const double span_s = s.frame_count() > 1 ? s.meta(s.frame_count() - 1).timestamp_s - s.meta(0).timestamp_s : 0.0;
+    std::println("frames: {} ({} accepted) over {:.1f} s; {} with capture settings / tracking diagnostics{}", s.frame_count(), accepted, span_s,
+                 with_extras, with_extras ? std::format(" (exposure {}..{})", exp_lo, exp_hi) : std::string{});
+    std::map<std::string, int> reasons;
+    for (const auto& d : s.dropped()) ++reasons[d.reason];
+    std::print("not processed: {}", s.dropped().size());
+    for (const auto& [why, n] : reasons) std::print(" | {} x{}", why, n);
+    std::println("");
+    if (s.raw_count() == 0) {
+        std::println("raw IR: none");
+        return 0;
+    }
+    auto first = s.read_raw(0);
+    if (!first) {
+        std::println(stderr, "raw IR: {}", first.error().message);
+        return 1;
+    }
+    std::uint64_t pixels = 0;
+    for (const auto& [sensor, img] : first->images) pixels += img.pixels().size();
+    const double per_frame = static_cast<double>(s.raw_bytes()) / static_cast<double>(s.raw_count());
+    std::println("raw IR: {} frames, {:.1f} MB ({:.2f}x compression, {:.1f} MB/s at 14.7 Hz); first: {} images",
+                 s.raw_count(), static_cast<double>(s.raw_bytes()) / 1e6, static_cast<double>(pixels) / per_frame, per_frame * 14.7 / 1e6,
+                 first->images.size());
+    return 0;
+}
+
 int process_cmd(const char* path, std::span<char*> args) {
     auto s = session::SessionReader::open(path);
     if (!s) {
@@ -636,6 +690,7 @@ int main(int argc, char** argv) {
     if (cmd == "sim-probe") return sim_probe();
     if (cmd == "calib" && argc >= 3) return calib_cmd(argv[2]);
     if (cmd == "track-fixture" && argc >= 3) return track_fixture(argv[2], rest);
+    if (cmd == "inspect" && argc >= 3) return inspect_cmd(argv[2]);
     if (cmd == "process" && argc >= 3) return process_cmd(argv[2], std::span<char*>(argv + 3, static_cast<std::size_t>(argc - 3)));
     return usage();
 }

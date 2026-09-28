@@ -31,7 +31,7 @@ target_link_libraries(test_fixtures PRIVATE einstar::fixtures einstar::track)
 einstar_add_test(test_track track/test_tsdf.cpp track/test_metal_tsdf.cpp track/test_relocaliser.cpp)
 target_link_libraries(test_track PRIVATE einstar::track einstar::track_metal)
 
-einstar_add_test(test_pipeline pipeline/test_end_to_end.cpp pipeline/test_global_markers.cpp pipeline/test_marker_holes.cpp)
+einstar_add_test(test_pipeline pipeline/test_end_to_end.cpp pipeline/test_global_markers.cpp pipeline/test_marker_holes.cpp pipeline/test_recording.cpp)
 target_link_libraries(test_pipeline PRIVATE einstar::pipeline einstar::device einstar::sim einstar::synth einstar::recon)
 add_executable(debug_dump pipeline/debug_dump.cpp)
 target_link_libraries(debug_dump PRIVATE einstar::pipeline einstar::synth)
