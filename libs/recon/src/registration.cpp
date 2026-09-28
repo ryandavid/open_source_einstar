@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <atomic>
 #include <unordered_map>
 
 #include <Eigen/Cholesky>
@@ -197,6 +198,23 @@ RegistrationResult register_point_to_plane(const Cloud& source, const CloudIndex
         J.head<3>() = (source.points[sel[k]].cast<double>() - centroid).cross(m) / 100.0;
         J.tail<3>() = m;
         Hc += J * J.transpose();
+    }
+    // Conflict: nearby geometry that disagrees.
+    {
+        const Eigen::Matrix3f R = T.linear().cast<float>();
+        const Vec3f t = T.translation().cast<float>();
+        std::atomic<int> near{0}, bad{0};
+        tbb::parallel_for(std::size_t{0}, sel.size(), [&](std::size_t k) {
+            const Vec3f p = R * source.points[sel[k]] + t;
+            const int j = target.nearest(p, params.conflict_radius_mm);
+            if (j < 0) return;
+            ++near;
+            const Vec3f& n = tc.normals[static_cast<std::size_t>(j)];
+            if (std::abs(n.dot(p - tc.points[static_cast<std::size_t>(j)])) > params.conflict_distance_mm ||
+                n.dot(R * source.normals[sel[k]]) < params.conflict_normal_dot)
+                ++bad;
+        });
+        res.conflict = near > 0 ? static_cast<double>(bad) / near : 0.0;
     }
     const Eigen::SelfAdjointEigenSolver<Mat6> es(Hc);
     res.min_eigen_ratio = es.eigenvalues()(5) > 0 ? es.eigenvalues()(0) / es.eigenvalues()(5) : 0.0;

@@ -53,22 +53,53 @@ synth::Scene make_scene() {
     return scene;
 }
 
-}  // namespace
-
-TEST_CASE("process: loop closure removes drift and the mesh matches the scene") {
-    const int n = 72;
-    const auto scene = make_scene();
+CameraModel small_camera() {
     CameraModel cam;
     cam.width = 320;
     cam.height = 256;
     cam.fx = cam.fy = 290;
     cam.cx = 160;
     cam.cy = 128;
+    return cam;
+}
+
+// Writes a session of exact (noisy) depth rendered at `truth`, recorded with the given live poses.
+std::string write_session(const std::string& name, const synth::Scene& scene, const std::vector<SE3>& truth, const std::vector<SE3>& live,
+                          const std::vector<std::uint32_t>& flags) {
+    const CameraModel cam = small_camera();
     synth::Projector proj;  // depth only: the projector pattern is irrelevant
     proj.model = cam;
     proj.pattern = synth::DotPattern::random(64, 64, 10, 2.0, 1);
-    const track::Intrinsics k{cam.width, cam.height, cam.fx, cam.fy, cam.cx, cam.cy};
+    const auto path = (std::filesystem::temp_directory_path() / name).string();
+    session::SessionHeader h;
+    h.depth_intrinsics = {cam.width, cam.height, cam.fx, cam.fy, cam.cx, cam.cy};
+    auto w = session::SessionWriter::create(path, h);
+    REQUIRE(w.has_value());
+    std::mt19937 rng(9);
+    std::normal_distribution<float> noise(0.0f, 0.04f);
+    for (std::size_t i = 0; i < truth.size(); ++i) {
+        synth::RenderParams rp;
+        rp.supersample = 1;
+        const auto view = synth::render_view(scene, proj, cam, truth[i], rp);
+        session::FrameRecord f;
+        f.index = i;
+        f.timestamp_s = 0.068 * static_cast<double>(i);
+        f.flags = flags[i];
+        f.T_world_camera = live[i];
+        f.depth = view.depth;
+        for (auto& z : f.depth.pixels())
+            if (z > 0) z += noise(rng);
+        (*w)->write(std::move(f));
+    }
+    (*w)->close();
+    return path;
+}
 
+}  // namespace
+
+TEST_CASE("process: loop closure removes drift and the mesh matches the scene") {
+    const int n = 72;
+    const auto scene = make_scene();
     // Live poses drift: a small rotation and translation per frame, accumulated.
     SE3 drift_step = SE3::Identity();
     // ~0.02 deg and ~0.03 mm per frame, all in one direction: 1.4 deg / 3.5 mm around the loop (worse
@@ -77,35 +108,15 @@ TEST_CASE("process: loop closure removes drift and the mesh matches the scene") 
     drift_step.linear() = Eigen::AngleAxisd(drift_scale * 0.06 * M_PI / 180, Vec3(0.3, 1, 0.2).normalized()).toRotationMatrix();
     drift_step.translation() = drift_scale * Vec3(0.08, -0.05, 0.06);
 
-    const auto path = (std::filesystem::temp_directory_path() / "einstar_process_test.estr").string();
     std::vector<SE3> truth(n), live(n);
-    {
-        session::SessionHeader h;
-        h.depth_intrinsics = k;
-        auto w = session::SessionWriter::create(path, h);
-        REQUIRE(w.has_value());
-        std::mt19937 rng(9);
-        std::normal_distribution<float> noise(0.0f, 0.04f);
-        SE3 drift = SE3::Identity();
-        for (int i = 0; i < n; ++i) {
-            truth[static_cast<std::size_t>(i)] = truth_pose(i, n);
-            live[static_cast<std::size_t>(i)] = drift * truth[static_cast<std::size_t>(i)];
-            drift = drift_step * drift;
-            synth::RenderParams rp;
-            rp.supersample = 1;
-            const auto view = synth::render_view(scene, proj, cam, truth[static_cast<std::size_t>(i)], rp);
-            session::FrameRecord f;
-            f.index = static_cast<std::uint64_t>(i);
-            f.timestamp_s = 0.068 * i;
-            f.flags = session::frame_accepted | session::frame_integrated;
-            f.T_world_camera = live[static_cast<std::size_t>(i)];
-            f.depth = view.depth;
-            for (auto& z : f.depth.pixels())
-                if (z > 0) z += noise(rng);
-            (*w)->write(std::move(f));
-        }
-        (*w)->close();
+    SE3 drift = SE3::Identity();
+    for (int i = 0; i < n; ++i) {
+        truth[static_cast<std::size_t>(i)] = truth_pose(i, n);
+        live[static_cast<std::size_t>(i)] = drift * truth[static_cast<std::size_t>(i)];
+        drift = drift_step * drift;
     }
+    const auto path = write_session("einstar_process_test.estr", scene, truth, live,
+                                    std::vector<std::uint32_t>(static_cast<std::size_t>(n), session::frame_accepted | session::frame_integrated));
     auto s = session::SessionReader::open(path);
     REQUIRE(s.has_value());
 
@@ -163,5 +174,37 @@ TEST_CASE("process: loop closure removes drift and the mesh matches the scene") 
     CHECK(rep.triangles > 10000);
     CHECK(sum / cnt < 0.08);
     CHECK(far < (cnt + far) / 100);
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("process: a segment placed by a wrong relocalisation is left out") {
+    // Live tracking "relocalised" frames 36-47 onto a wrong pose (rotated 90 degrees about the scene)
+    // and back at 48. Nothing verifies that segment against the rest, and it contradicts the model.
+    const int n = 72;
+    const auto scene = make_scene();
+    std::vector<SE3> truth(n), live(n);
+    std::vector<std::uint32_t> flags(n, session::frame_accepted | session::frame_integrated);
+    SE3 wrong = SE3::Identity();
+    wrong.linear() = Eigen::AngleAxisd(M_PI / 2, Vec3::UnitY()).toRotationMatrix();
+    wrong.translation() = Vec3(-60, 40, 0) - wrong.linear() * Vec3(-60, 40, 0);  // about the scene centre
+    for (int i = 0; i < n; ++i) {
+        truth[static_cast<std::size_t>(i)] = truth_pose(i, n);
+        live[static_cast<std::size_t>(i)] = (i >= 36 && i < 48) ? wrong * truth[static_cast<std::size_t>(i)] : truth[static_cast<std::size_t>(i)];
+    }
+    flags[36] |= session::frame_relocalized;
+    flags[48] |= session::frame_relocalized;
+    const auto path = write_session("einstar_island_test.estr", scene, truth, live, flags);
+    auto s = session::SessionReader::open(path);
+    REQUIRE(s.has_value());
+    recon::ProcessParams pp;
+    pp.fragment_frames = 6;
+    pp.simplify = false;
+    pp.recover_lost_frames = false;
+    auto r = recon::process_session(**s, pp);
+    REQUIRE(r.has_value());
+    std::println("island: {} islands, {} excluded, {} frames left out", r->report.islands, r->report.islands_excluded, r->report.frames_excluded);
+    CHECK(r->report.islands_excluded == 1);
+    CHECK(r->report.frames_excluded == 12);
+    for (int i = 36; i < 48; ++i) CHECK(!r->frame_poses.contains(static_cast<std::size_t>(i)));
     std::filesystem::remove(path);
 }

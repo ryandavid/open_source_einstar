@@ -408,7 +408,6 @@ int process_cmd(const char* path, std::span<char*> args) {
     pp.smooth_iterations = static_cast<int>(arg_int(args, "--smooth", 0));
     // Tuning knobs (see recon::ProcessParams).
     pp.graph_iterations = static_cast<int>(arg_int(args, "--graph-iterations", pp.graph_iterations));
-    pp.refine_rounds = static_cast<int>(arg_int(args, "--refine", pp.refine_rounds));
     pp.loop_min_eigen_ratio = arg_double(args, "--loop-eig", pp.loop_min_eigen_ratio);
     pp.chain_sigma_deg = arg_double(args, "--chain-deg", pp.chain_sigma_deg);
     pp.chain_sigma_mm = arg_double(args, "--chain-mm", pp.chain_sigma_mm);
@@ -436,8 +435,8 @@ int process_cmd(const char* path, std::span<char*> args) {
                  "{} marker landmarks ({} observations)",
                  rep.frames_used, rep.fragments, rep.odometry_edges, rep.loop_edges, rep.loop_candidates, rep.loop_edges_pruned,
                  rep.graph_iterations, rep.marker_landmarks, rep.marker_observations);
-    std::println("pose corrections: median {:.2f} mm, max {:.2f} mm / {:.2f} deg; {} frames refined against the model",
-                 rep.median_correction_mm, rep.max_correction_mm, rep.max_correction_deg, rep.frames_refined);
+    std::println("pose corrections: median {:.2f} mm, max {:.2f} mm / {:.2f} deg", rep.median_correction_mm, rep.max_correction_mm,
+                 rep.max_correction_deg);
     std::println("islands: {} unverified segments, {} excluded ({} frames); {} lost frames recovered", rep.islands, rep.islands_excluded,
                  rep.frames_excluded, rep.frames_recovered);
     std::println("mesh: {} vertices, {} triangles ({} small pieces removed; simplified from {} triangles, max error {:.3f} mm)", rep.vertices,

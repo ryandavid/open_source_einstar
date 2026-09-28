@@ -54,28 +54,6 @@ struct EdgeCost {
     }
 };
 
-struct PriorCost {
-    Eigen::Quaterniond q_prior;
-    Vec3 t_prior;
-    Mat6 sqrt_info;
-
-    template <typename T>
-    bool operator()(const T* q_p, const T* t_p, T* r) const {
-        const Eigen::Map<const Eigen::Quaternion<T>> q(q_p);
-        const Eigen::Map<const Eigen::Matrix<T, 3, 1>> t(t_p);
-        const Eigen::Quaternion<T> qp = q_prior.cast<T>();
-        Eigen::Quaternion<T> q_err = qp.conjugate() * q;
-        const Eigen::Matrix<T, 3, 1> t_err = qp.conjugate() * (t - t_prior.cast<T>());
-        if (q_err.w() < T(0)) q_err.coeffs() = -q_err.coeffs();
-        Eigen::Matrix<T, 6, 1> e;
-        e.template head<3>() = T(2) * q_err.vec();
-        e.template tail<3>() = t_err;
-        Eigen::Map<Eigen::Matrix<T, 6, 1>> res(r);
-        res = sqrt_info.cast<T>() * e;
-        return true;
-    }
-};
-
 struct LandmarkCost {
     Vec3 p;
     double inv_sigma;
@@ -112,13 +90,6 @@ double solve(PoseGraph& g, const PoseGraphParams& params, double& cost_before) {
         auto& a = np[e.i];
         auto& b = np[e.j];
         problem.AddResidualBlock(cost, nullptr, a.q.data(), a.t.data(), b.q.data(), b.t.data());
-    }
-    for (const auto& p : g.priors) {
-        if (!np.contains(p.node)) continue;
-        auto* cost = new ceres::AutoDiffCostFunction<PriorCost, 6, 4, 3>(
-            new PriorCost{Eigen::Quaterniond(p.T_prior.linear()), p.T_prior.translation(), sqrt_information(p.information)});
-        auto& n = np[p.node];
-        problem.AddResidualBlock(cost, nullptr, n.q.data(), n.t.data());
     }
     bool have_fixed_landmark = false;
     for (const auto& o : g.observations) {

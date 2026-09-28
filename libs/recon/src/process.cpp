@@ -24,7 +24,47 @@ struct Fragment {
     Cloud cloud;                           // anchor frame
     Vec3 center = Vec3::Zero();            // anchor frame
     double radius = 0;
+    ImageF32 anchor_depth;                 // the anchor frame's depth at half resolution (free-space checks)
+    track::Intrinsics anchor_k;
 };
+
+// Fraction of `pts` (in fragment b's anchor frame) that lie in space b's anchor camera saw as empty
+// (in front of its observed surface), among those it saw at all. Wrong alignments that a dominant
+// plane makes look good put the rest of the geometry into observed free space.
+double free_space_violation(const std::vector<Vec3f>& pts, const Fragment& b, float tol_mm, int& tested) {
+    const auto& k = b.anchor_k;
+    const auto& D = b.anchor_depth;
+    int viol = 0, seen = 0;
+    const std::size_t step = std::max<std::size_t>(1, pts.size() / 3000);
+    for (std::size_t i = 0; i < pts.size(); i += step) {
+        const Vec3f& p = pts[i];
+        if (p.z() <= 1.0f) continue;
+        const int u = static_cast<int>(std::lround(k.fx * p.x() / p.z() + k.cx));
+        const int v = static_cast<int>(std::lround(k.fy * p.y() / p.z() + k.cy));
+        if (u < 0 || v < 0 || u >= D.width() || v >= D.height()) continue;
+        const float d = D(u, v);
+        if (d <= 0) continue;
+        if (p.z() < d - tol_mm) ++viol;
+        else if (p.z() < d + tol_mm) ++seen;
+    }
+    tested = viol + seen;
+    return tested > 0 ? static_cast<double>(viol) / tested : 0.0;
+}
+
+// Symmetric free-space check of fragments a and b under the relative pose T_a_b (b -> a).
+double pair_violation(const Fragment& a, const Fragment& b, const SE3& T_a_b, float tol_mm) {
+    const Eigen::Matrix3f R = T_a_b.linear().cast<float>();
+    const Vec3f t = T_a_b.translation().cast<float>();
+    std::vector<Vec3f> b_in_a, a_in_b;
+    b_in_a.reserve(b.cloud.size());
+    for (const auto& p : b.cloud.points) b_in_a.push_back(R * p + t);
+    const Eigen::Matrix3f Ri = R.transpose();
+    for (const auto& p : a.cloud.points) a_in_b.push_back(Ri * (p - t));
+    int n1 = 0, n2 = 0;
+    const double v1 = free_space_violation(b_in_a, a, tol_mm, n1);
+    const double v2 = free_space_violation(a_in_b, b, tol_mm, n2);
+    return std::max(n1 >= 50 ? v1 : 0.0, n2 >= 50 ? v2 : 0.0);
+}
 
 struct FrameMarkers {
     std::vector<std::pair<int, Vec3>> markers;  // (live map id, camera-frame position)
@@ -107,6 +147,12 @@ Result<ProcessResult> process_session(const session::SessionReader& s, const Pro
                     read_error = rec.error().message;
                     return;
                 }
+                if (i == fr.anchor && fr.anchor_depth.empty()) {
+                    fr.anchor_depth = ImageF32(rec->depth.width() / 2, rec->depth.height() / 2, 0.0f);
+                    for (int y = 0; y < fr.anchor_depth.height(); ++y)
+                        for (int x = 0; x < fr.anchor_depth.width(); ++x) fr.anchor_depth(x, y) = rec->depth(2 * x, 2 * y);
+                    fr.anchor_k = k.scaled(0.5);
+                }
                 auto c = frame_cloud(rec->depth_frame(k), T_anchor_world * out.frame_poses.at(i), params.cloud_stride_px);
                 acc.points.insert(acc.points.end(), c.points.begin(), c.points.end());
                 acc.normals.insert(acc.normals.end(), c.normals.begin(), c.normals.end());
@@ -151,10 +197,6 @@ Result<ProcessResult> process_session(const session::SessionReader& s, const Pro
 
         optim::PoseGraph graph;
         for (const auto i : tracked) graph.nodes[static_cast<int>(i)] = out.frame_poses[i];
-        if (params.prior_sigma_mm > 0) {
-            const Mat6 prior_info = diagonal_information(params.prior_sigma_deg, params.prior_sigma_mm, 1.0);
-            for (const auto i : tracked) graph.priors.push_back({static_cast<int>(i), s.meta(i).T_world_camera, prior_info});
-        }
         // Chain: consecutive tracked frames keep their live relative pose, loosely.
         const Mat6 chain_info = diagonal_information(params.chain_sigma_deg, params.chain_sigma_mm, 1.0);
         for (std::size_t n = 1; n < tracked.size(); ++n) {
@@ -169,11 +211,12 @@ Result<ProcessResult> process_session(const session::SessionReader& s, const Pro
             graph.edges.push_back(e);
         }
 
-        auto accept = [&](const RegistrationResult& r, const SE3& guess, double max_mm, double max_deg) {
+        auto accept = [&](const RegistrationResult& r, const SE3& guess, double max_mm, double max_deg, std::size_t fi, std::size_t fj) {
             const SE3 d = guess.inverse() * r.T_target_source;
             return r.converged && r.fitness >= params.loop_min_fitness && r.rms_mm <= params.loop_max_rms_mm &&
                    r.min_eigen_ratio >= params.loop_min_eigen_ratio && translation_norm(d) <= max_mm &&
-                   rotation_angle(d) * 180.0 / M_PI <= max_deg;
+                   rotation_angle(d) * 180.0 / M_PI <= max_deg &&
+                   pair_violation(frags[fi], frags[fj], r.T_target_source, params.free_space_tolerance_mm) <= params.max_free_space_violation;
         };
         auto fragment_edge = [&](std::size_t i, std::size_t j, const RegistrationResult& r, bool loop) {
             optim::PoseEdge e;
@@ -192,7 +235,7 @@ Result<ProcessResult> process_session(const session::SessionReader& s, const Pro
         tbb::parallel_for(std::size_t{0}, odo.size(), [&](std::size_t i) {
             const SE3 guess = frags[i].T_world_anchor.inverse() * frags[i + 1].T_world_anchor;
             const auto r = register_point_to_plane(frags[i + 1].cloud, index[i], guess, params.registration);
-            if (accept(r, guess, 5.0, 3.0)) odo[i] = fragment_edge(i, i + 1, r, false);
+            if (accept(r, guess, 5.0, 3.0, i, i + 1)) odo[i] = fragment_edge(i, i + 1, r, false);
         });
         for (auto& e : odo)
             if (e) {
@@ -286,9 +329,9 @@ Result<ProcessResult> process_session(const session::SessionReader& s, const Pro
                 for (std::size_t p = 0; p < src.size(); p += step, ++tot) hit += index[i].nearest(R * src.points[p] + t, 3.0f) >= 0;
                 if (tot > 0 && static_cast<double>(hit) / tot >= params.loop_min_overlap) {
                     const auto r = register_point_to_plane(src, index[i], guess, params.registration);
-                    if (accept(r, guess, params.loop_max_correction_mm, params.loop_max_correction_deg)) found[c] = fragment_edge(i, j, r, true);
-                    log::debug("loop {}-{} (anchors {}-{}): overlap {:.2f} conv {} fit {:.2f} rms {:.3f} eig {:.1e} corr {:.2f} mm {:.2f} deg -> {}", i, j,
-                               frags[i].anchor, frags[j].anchor, static_cast<double>(hit) / tot, r.converged, r.fitness, r.rms_mm, r.min_eigen_ratio,
+                    if (accept(r, guess, params.loop_max_correction_mm, params.loop_max_correction_deg, i, j)) found[c] = fragment_edge(i, j, r, true);
+                    log::debug("loop {}-{} (anchors {}-{}): overlap {:.2f} conv {} fit {:.2f} rms {:.3f} eig {:.1e} conflict {:.2f} corr {:.2f} mm {:.2f} deg -> {}", i, j,
+                               frags[i].anchor, frags[j].anchor, static_cast<double>(hit) / tot, r.converged, r.fitness, r.rms_mm, r.min_eigen_ratio, r.conflict,
                                translation_norm(guess.inverse() * r.T_target_source), rotation_angle(guess.inverse() * r.T_target_source) * 180 / M_PI,
                                found[c].has_value());
                 }
@@ -379,39 +422,23 @@ Result<ProcessResult> process_session(const session::SessionReader& s, const Pro
         }
         rep.islands = static_cast<int>(comps.size()) - 1;
         if (rep.islands > 0) {
-            Cloud main_cloud;
-            for (const auto f : comps[main]) {
-                const auto c = transformed(frags[f].cloud, out.frame_poses.at(frags[f].anchor));
-                main_cloud.points.insert(main_cloud.points.end(), c.points.begin(), c.points.end());
-                main_cloud.normals.insert(main_cloud.normals.end(), c.normals.begin(), c.normals.end());
-            }
-            main_cloud = voxel_downsample(main_cloud, 2.0f * params.cloud_voxel_mm);
-            const CloudIndex main_index(main_cloud);
             for (const auto& [root, fs] : comps) {
                 if (root == main) continue;
-                int overlap = 0, agree = 0, total_pts = 0;
+                // Free-space test against every main fragment it overlaps.
+                double worst = 0;
                 std::size_t n_frames = 0;
                 for (const auto f : fs) {
                     n_frames += frags[f].frames.size();
-                    const SE3& T = out.frame_poses.at(frags[f].anchor);
-                    const Eigen::Matrix3f R = T.linear().cast<float>();
-                    const Vec3f t = T.translation().cast<float>();
-                    const auto& c = frags[f].cloud;
-                    for (std::size_t p = 0; p < c.size(); p += 7, ++total_pts) {
-                        const Vec3f q = R * c.points[p] + t;
-                        const int j = main_index.nearest(q, 4.0f);
-                        if (j < 0) continue;
-                        ++overlap;
-                        const auto& mp = main_cloud.points[static_cast<std::size_t>(j)];
-                        const auto& mn = main_cloud.normals[static_cast<std::size_t>(j)];
-                        if (std::abs(mn.dot(q - mp)) < 1.0f && mn.dot(R * c.normals[p]) > 0.7f) ++agree;
+                    const SE3& Tf = out.frame_poses.at(frags[f].anchor);
+                    for (const auto m : comps[main]) {
+                        const SE3& Tm = out.frame_poses.at(frags[m].anchor);
+                        if ((Tf * frags[f].center - Tm * frags[m].center).norm() > frags[f].radius + frags[m].radius) continue;
+                        worst = std::max(worst, pair_violation(frags[m], frags[f], Tm.inverse() * Tf, params.free_space_tolerance_mm));
                     }
                 }
-                const double overlap_frac = total_pts ? static_cast<double>(overlap) / total_pts : 0.0;
-                const double agree_frac = overlap ? static_cast<double>(agree) / overlap : 1.0;
-                const bool contradicts = overlap_frac >= params.island_min_overlap && agree_frac < params.island_min_agreement;
-                log::info("process: island of {} frames ({} fragments): {:.0f}% overlaps the main model, {:.0f}% of that agrees -> {}", n_frames,
-                          fs.size(), 100 * overlap_frac, 100 * agree_frac, contradicts ? "excluded" : "kept");
+                const bool contradicts = worst > params.max_free_space_violation;
+                log::info("process: island of {} frames ({} fragments): free-space violation {:.0f}% -> {}", n_frames, fs.size(), 100 * worst,
+                          contradicts ? "excluded" : "kept");
                 if (!contradicts) continue;
                 ++rep.islands_excluded;
                 rep.frames_excluded += static_cast<int>(n_frames);
@@ -423,47 +450,6 @@ Result<ProcessResult> process_session(const session::SessionReader& s, const Pro
     tracked.clear();
     for (const auto& [i, T] : out.frame_poses) tracked.push_back(i);
 
-    // Frame refinement against the model assembled from every frame at the current poses (reduces
-    // per-frame jitter of the live poses; frames whose geometry is ambiguous are left alone).
-    if (params.optimize_poses && params.refine_rounds > 0) {
-        sw.reset();
-        std::vector<Cloud> clouds(tracked.size());
-        tbb::parallel_for(std::size_t{0}, tracked.size(), [&](std::size_t n) {
-            if (auto rec = s.read(tracked[n]))
-                clouds[n] = voxel_downsample(frame_cloud(rec->depth_frame(k), SE3::Identity(), params.refine_stride_px), params.cloud_voxel_mm);
-        });
-        RegistrationParams rp = params.registration;
-        rp.start_distance_mm = 2.0f;
-        rp.iterations = 20;
-        for (int round = 0; round < params.refine_rounds; ++round) {
-            if (cancelled(params)) return make_error(Errc::busy, "cancelled");
-            Cloud model;
-            for (std::size_t n = 0; n < tracked.size(); ++n) {
-                const auto c = transformed(clouds[n], out.frame_poses[tracked[n]]);
-                model.points.insert(model.points.end(), c.points.begin(), c.points.end());
-                model.normals.insert(model.normals.end(), c.normals.begin(), c.normals.end());
-            }
-            model = voxel_downsample(model, params.cloud_voxel_mm);
-            const CloudIndex model_index(model);
-            std::vector<SE3> refined(tracked.size());
-            std::atomic<int> accepted{0}, done{0};
-            tbb::parallel_for(std::size_t{0}, tracked.size(), [&](std::size_t n) {
-                const SE3 T0 = out.frame_poses[tracked[n]];
-                refined[n] = T0;
-                const auto r = register_point_to_plane(clouds[n], model_index, T0, rp);
-                const SE3 d = T0.inverse() * r.T_target_source;
-                if (r.converged && r.fitness >= params.refine_min_fitness && r.rms_mm <= params.refine_max_rms_mm &&
-                    r.min_eigen_ratio >= params.refine_min_eigen_ratio && translation_norm(d) <= params.refine_max_correction_mm) {
-                    refined[n] = r.T_target_source;
-                    ++accepted;
-                }
-                if (++done % 64 == 0) progress(params, "Refining frames", static_cast<double>(done) / static_cast<double>(tracked.size()));
-            });
-            for (std::size_t n = 0; n < tracked.size(); ++n) out.frame_poses[tracked[n]] = refined[n];
-            rep.frames_refined = accepted;
-        }
-        rep.stage_ms["refine"] = sw.elapsed_ms();
-    }
 
     std::vector<double> corr;
     for (const auto& [i, T] : out.frame_poses) {
@@ -514,7 +500,7 @@ Result<ProcessResult> process_session(const session::SessionReader& s, const Pro
             auto try_frame = [&](std::size_t i, const SE3& guess) -> bool {
                 auto rec = s.read(i);
                 if (!rec) return false;
-                const auto cloud = voxel_downsample(frame_cloud(rec->depth_frame(k), SE3::Identity(), params.refine_stride_px), params.cloud_voxel_mm);
+                const auto cloud = voxel_downsample(frame_cloud(rec->depth_frame(k), SE3::Identity(), params.recover_stride_px), params.cloud_voxel_mm);
                 if (cloud.size() < 200) return false;
                 const auto r = register_point_to_plane(cloud, model_index, guess, rp);
                 const SE3 d = guess.inverse() * r.T_target_source;

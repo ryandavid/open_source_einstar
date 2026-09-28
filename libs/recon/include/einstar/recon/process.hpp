@@ -35,10 +35,6 @@ struct ProcessParams {
     double chain_sigma_deg = 0.15;   // live frame-to-frame accuracy (per frame; generous: drift is systematic)
     double chain_sigma_mm = 0.3;
     double chain_gap_weight = 1e-2;  // chain edges across a tracking gap (relocalisation) are weaker
-    // Optional prior of every frame towards its live pose (0 = off). It anchors directions the
-    // geometry cannot constrain, but also resists genuine drift correction.
-    double prior_sigma_deg = 1.0;
-    double prior_sigma_mm = 0.0;
     // Fragments are rebuilt from the optimised poses and the graph re-solved until poses settle.
     int graph_iterations = 2;
     double graph_tolerance_mm = 0.05;
@@ -49,24 +45,16 @@ struct ProcessParams {
     double loop_max_correction_mm = 25.0;   // a loop closure far from the live estimate is not trusted
     double loop_max_correction_deg = 10.0;
     double loop_min_overlap = 0.25;         // quick overlap test before registration
+    // Registrations are rejected when either fragment's points lie in space the other's camera saw
+    // as empty (a dominant plane can make a wrong alignment fit well).
+    double max_free_space_violation = 0.1;
+    float free_space_tolerance_mm = 3.0f;
     int loop_rounds = 4;                    // search again after each solve (poses improve)
     int loop_max_partners = 10;             // nearest overlapping fragments tried per fragment
     double prune_chi = 25.0;               // whitened loop-closure error (~0.5 mm with the default information scale)
-    // Frame refinement: after the pose graph, every frame is registered against the model built from
-    // all fragments (removes drift inside fragments). Skipped for frames whose geometry does not
-    // constrain the pose.
-    int refine_rounds = 0;  // measured neutral on real scans; costs ~2 ms per frame
-    int refine_stride_px = 4;
-    double refine_min_fitness = 0.6;
-    double refine_max_rms_mm = 0.35;
-    double refine_min_eigen_ratio = 4e-3;
-    double refine_max_correction_mm = 5.0;
-    // Islands (segments with no verified link to the main model): excluded from fusion when this much
-    // of them overlaps the main model and less than this fraction of the overlap agrees with it.
-    double island_min_overlap = 0.2;
-    double island_min_agreement = 0.6;
     // Lost-frame recovery: frames live tracking rejected are registered against the final model.
     bool recover_lost_frames = true;
+    int recover_stride_px = 4;
     float recover_start_distance_mm = 8.0f;  // wide initial gate: lost frames are often fast motion
     double recover_min_fitness = 0.7;
     double recover_max_rms_mm = 0.3;
@@ -101,7 +89,6 @@ struct ProcessReport {
     int marker_observations = 0;
     double max_correction_mm = 0, max_correction_deg = 0;  // largest change of a frame pose
     double median_correction_mm = 0;
-    int frames_refined = 0;       // by frame-to-model registration (last round)
     int frames_recovered = 0;     // untracked live, registered against the final model
     int graph_iterations = 0;
     int islands = 0;              // segments with no verified link to the main model

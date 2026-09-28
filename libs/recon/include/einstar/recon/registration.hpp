@@ -52,6 +52,9 @@ struct RegistrationParams {
     // count as independent (neighbouring points share calibration / fusion errors).
     double sigma_mm = 0.15;
     double max_independent = 100;
+    float conflict_radius_mm = 4.0f;
+    float conflict_distance_mm = 1.5f;
+    float conflict_normal_dot = 0.5f;
 };
 
 struct RegistrationResult {
@@ -60,6 +63,10 @@ struct RegistrationResult {
     double rms_mm = 0;     // of inlier point-to-plane distances
     int correspondences = 0;
     double min_eigen_ratio = 0;  // conditioning of the (centred, unit-scaled) Hessian
+    // Of the source points with target geometry nearby (within conflict_radius_mm), the fraction that
+    // contradicts it (off the surface or facing another way). A dominant plane can make a wrong
+    // alignment fit well; the rest of the geometry then conflicts.
+    double conflict = 0;
     // Information of the right perturbation [rotation; translation] of T_target_source (see
     // optim::PoseEdge).
     Mat6 information = Mat6::Zero();

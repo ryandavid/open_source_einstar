@@ -30,17 +30,9 @@ struct LandmarkObservation {
     double sigma_mm = 0.05;
 };
 
-// Unary prior on a node: error exp([w; v]) = T_prior^-1 * T_world_node (right perturbation).
-struct PosePrior {
-    int node = -1;
-    SE3 T_prior = SE3::Identity();
-    Mat6 information = Mat6::Identity();
-};
-
 struct PoseGraph {
     std::map<int, SE3> nodes;   // T_world_node
     std::vector<PoseEdge> edges;
-    std::vector<PosePrior> priors;
     std::map<int, Vec3> landmarks;
     std::set<int> fixed_landmarks;
     std::vector<LandmarkObservation> observations;

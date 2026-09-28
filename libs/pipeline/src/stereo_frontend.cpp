@@ -2,7 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
-#include <future>
+#include <tbb/parallel_invoke.h>
 
 #include <Eigen/Eigenvalues>
 
@@ -170,9 +170,9 @@ void fill_marker_hole(const FrameAccess& fa, const track::Intrinsics& k, const S
 
 void StereoFrontend::add_markers(const ImageU8& raw_left, const ImageU8& raw_right, DepthOutput& out) const {
     Stopwatch sw;
-    auto right_future = std::async(std::launch::async, [&] { return markers::detect_markers(raw_right.view(), params_.marker_detect); });
-    const auto left = markers::detect_markers(raw_left.view(), params_.marker_detect);
-    const auto right = right_future.get();
+    std::vector<markers::Ellipse> left, right;
+    tbb::parallel_invoke([&] { left = markers::detect_markers(raw_left.view(), params_.marker_detect); },
+                         [&] { right = markers::detect_markers(raw_right.view(), params_.marker_detect); });
     if (left.empty() || right.empty()) {
         for (const auto& e : left) out.unmatched_left.push_back(marker_stereo_->rectify_left(e.center));
         out.marker_ms = sw.elapsed_ms();
