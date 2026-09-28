@@ -173,9 +173,11 @@ TEST_CASE("global markers: capture, bundle adjustment and a surface scan locked 
         };
         recon::ProcessParams live_only;
         live_only.optimize_poses = false;
+        live_only.simplify = false;
         auto base = recon::process_session(**ses, live_only);
         recon::ProcessParams full;
         full.fragment_frames = 10;
+        full.simplify = false;
         auto res = recon::process_session(**ses, full);
         REQUIRE(base.has_value());
         REQUIRE(res.has_value());

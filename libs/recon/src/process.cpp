@@ -591,6 +591,10 @@ Result<ProcessResult> process_session(const session::SessionReader& s, const Pro
     out.mesh = extract_mesh(*volume, params.extract);
     rep.cleanup = remove_small_components(out.mesh, params.cleanup);
     if (params.smooth_iterations > 0) taubin_smooth(out.mesh, params.smooth_iterations);
+    if (params.simplify) {
+        progress(params, "Simplifying", 0.0);
+        rep.simplified = recon::simplify(out.mesh, params.simplify_params);
+    }
     rep.vertices = out.mesh.vertices.size();
     rep.triangles = out.mesh.triangles.size();
     rep.stage_ms["mesh"] = sw.elapsed_ms();

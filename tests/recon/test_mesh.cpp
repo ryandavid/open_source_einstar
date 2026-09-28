@@ -139,3 +139,60 @@ TEST_CASE("small disconnected pieces are removed") {
     CHECK(m.triangles.size() == 2u * 30u * 30u);
     CHECK(m.vertices.size() == static_cast<std::size_t>(n * n));
 }
+
+TEST_CASE("simplification keeps the shape, manifoldness and orientation") {
+    track::TsdfParams tp;
+    tp.voxel_mm = 0.5f;
+    track::TsdfVolume vol(tp);
+    const track::Intrinsics k{320, 256, 290.0, 290.0, 160.0, 128.0};
+    const double radius = 30.0;
+    for (int i = 0; i < 6; ++i)
+        for (int j = -1; j <= 1; ++j) {
+            const double a = i * M_PI / 3, e = j * 0.9;
+            const SE3 T = look_at(250.0 * Vec3(std::cos(a) * std::cos(e), std::sin(e), std::sin(a) * std::cos(e)), Vec3::Zero());
+            vol.integrate(track::make_depth_frame(sphere_depth(Vec3::Zero(), radius, T, k), k), T);
+        }
+    for (const double y : {250.0, -250.0}) {
+        const SE3 T = look_at(Vec3(0, y, 1), Vec3::Zero());
+        vol.integrate(track::make_depth_frame(sphere_depth(Vec3::Zero(), radius, T, k), k), T);
+    }
+    auto mesh = recon::extract_mesh(vol);
+    auto count_bad_edges = [](const recon::TriangleMesh& m) {
+        std::map<std::pair<std::uint32_t, std::uint32_t>, int> edges;
+        for (const auto& t : m.triangles)
+            for (int e = 0; e < 3; ++e) {
+                auto a = t[static_cast<std::size_t>(e)], b = t[static_cast<std::size_t>((e + 1) % 3)];
+                ++edges[{std::min(a, b), std::max(a, b)}];
+            }
+        return std::ranges::count_if(edges, [](const auto& kv) { return kv.second != 2; });
+    };
+    const auto bad_before = count_bad_edges(mesh);
+    recon::SimplifyParams sp;
+    sp.target_ratio = 0.1;
+    sp.max_error_mm = 0.05;
+    SECTION("single block") {}
+    SECTION("parallel blocks") {
+        sp.parallel_min_triangles = 0;  // force the block path with small blocks: many seams
+        sp.block_mm = 15.0;
+    }
+    Stopwatch sw;
+    const auto rep = recon::simplify(mesh, sp);
+    const double ms = sw.elapsed_ms();
+    double max_err = 0, sum = 0;
+    for (const auto& v : mesh.vertices) {
+        const double e = std::abs(v.cast<double>().norm() - radius);
+        max_err = std::max(max_err, e);
+        sum += e;
+    }
+    int outward = 0;
+    for (const auto& t : mesh.triangles) outward += (mesh.vertices[t[1]] - mesh.vertices[t[0]]).cross(mesh.vertices[t[2]] - mesh.vertices[t[0]]).dot(mesh.vertices[t[0]]) > 0;
+    const auto bad_after = count_bad_edges(mesh);
+    std::println("simplify: {} -> {} triangles in {:.0f} ms (reported error {:.3f} mm); radial error mean {:.4f} max {:.4f} mm; "
+                 "non-manifold/boundary edges {} -> {}; {} of {} faces outward",
+                 rep.triangles_before, rep.triangles_after, ms, rep.max_error_mm, sum / static_cast<double>(mesh.vertices.size()), max_err,
+                 bad_before, bad_after, outward, mesh.triangles.size());
+    CHECK(rep.triangles_after <= rep.triangles_before / 5);
+    CHECK(max_err < 0.3);
+    CHECK(bad_after <= bad_before);
+    CHECK(outward >= static_cast<int>(0.999 * static_cast<double>(mesh.triangles.size())));
+}

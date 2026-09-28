@@ -122,6 +122,7 @@ TEST_CASE("process: loop closure removes drift and the mesh matches the scene") 
 
     recon::ProcessParams pp;
     pp.fragment_frames = 6;
+    pp.simplify = false;  // vertex-sampled accuracy below is biased by decimation (tested separately)
     pp.use_gpu = true;
     auto r = recon::process_session(**s, pp);
     REQUIRE(r.has_value());

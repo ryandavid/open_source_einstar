@@ -164,6 +164,7 @@ int main(int argc, char** argv) {
     int voxel_choice = 1;  // 0.3 / 0.5 / 1.0 mm
     bool optimise_poses = true;
     int smooth_iterations = 0;
+    bool simplify_mesh = true;
     char export_path[512] = {};
     if (const char* home = std::getenv("HOME")) std::snprintf(export_path, sizeof export_path, "%s/Documents/Einstar/scan.stl", home);
     char marker_path[512] = {};
@@ -334,12 +335,14 @@ int main(int argc, char** argv) {
                     ImGui::Combo("Resolution", &voxel_choice, "0.3 mm (fine)\0" "0.5 mm\0" "1.0 mm (fast)\0");
                     ImGui::Checkbox("Optimise poses (loop closure)", &optimise_poses);
                     ImGui::SliderInt("Smoothing", &smooth_iterations, 0, 10);
+                    ImGui::Checkbox("Simplify (within 0.02 mm)", &simplify_mesh);
                     if (ImGui::Button("Process scan", ImVec2(-1, 0))) {
                         recon::ProcessParams pp;
                         pp.tsdf.voxel_mm = voxel_choice == 0 ? 0.3f : voxel_choice == 2 ? 1.0f : 0.5f;
                         pp.tsdf.truncation_mm = 5.0f * pp.tsdf.voxel_mm;
                         pp.optimize_poses = optimise_poses;
                         pp.smooth_iterations = smooth_iterations;
+                        pp.simplify = simplify_mesh;
                         state.process_scan(pp);
                     }
                     ImGui::EndDisabled();

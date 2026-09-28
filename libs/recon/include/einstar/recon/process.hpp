@@ -83,6 +83,8 @@ struct ProcessParams {
     ExtractParams extract;
     CleanupParams cleanup;
     int smooth_iterations = 0;
+    bool simplify = true;          // error-bounded decimation: flat areas lose triangles, detail stays
+    SimplifyParams simplify_params;
 
     std::function<void(const std::string& stage, double fraction)> progress;
     const std::atomic<bool>* cancel = nullptr;
@@ -107,6 +109,7 @@ struct ProcessReport {
     int frames_excluded = 0;
     std::size_t vertices = 0, triangles = 0;
     CleanupReport cleanup;
+    SimplifyReport simplified;
     std::map<std::string, double> stage_ms;
 };
 

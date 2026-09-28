@@ -52,6 +52,23 @@ void remove_unreferenced_vertices(TriangleMesh& mesh);
 // Taubin (lambda/mu) smoothing: reduces voxel-scale noise without shrinking the surface.
 void taubin_smooth(TriangleMesh& mesh, int iterations = 5, float lambda = 0.5f, float mu = -0.53f);
 
+struct SimplifyParams {
+    double target_ratio = 0.2;            // of the input triangles (ignored when target_triangles > 0)
+    std::size_t target_triangles = 0;
+    double max_error_mm = 0.02;           // stop before the (area-averaged) deviation exceeds this
+    double boundary_weight = 100.0;       // keeps scan borders in place
+    double min_normal_dot = 0.2;          // collapses may not turn a face by more than ~78 degrees
+    // Meshes larger than this are simplified in parallel spatial blocks of this size.
+    std::size_t parallel_min_triangles = 400000;
+    double block_mm = 40.0;
+};
+struct SimplifyReport {
+    std::size_t triangles_before = 0, triangles_after = 0;
+    double max_error_mm = 0;
+};
+// Quadric-error edge collapse (Garland & Heckbert); keeps the surface manifold and borders fixed.
+SimplifyReport simplify(TriangleMesh& mesh, const SimplifyParams& params = {});
+
 enum class MeshFormat { stl, ply, obj };
 [[nodiscard]] std::optional<MeshFormat> format_from_extension(const std::filesystem::path& path);
 Result<void> save_mesh(const TriangleMesh& mesh, const std::filesystem::path& path);  // format from the extension

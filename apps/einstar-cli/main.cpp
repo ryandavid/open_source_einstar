@@ -415,6 +415,9 @@ int process_cmd(const char* path, std::span<char*> args) {
     pp.fragment_frames = static_cast<int>(arg_int(args, "--fragment-frames", pp.fragment_frames));
     pp.use_markers = !has_flag(args, "--no-markers");
     pp.recover_lost_frames = !has_flag(args, "--no-recover");
+    pp.simplify = !has_flag(args, "--no-simplify");
+    pp.simplify_params.max_error_mm = arg_double(args, "--simplify-error", pp.simplify_params.max_error_mm);
+    pp.simplify_params.target_ratio = arg_double(args, "--simplify-ratio", pp.simplify_params.target_ratio);
     pp.marker_sigma_mm = arg_double(args, "--marker-sigma", pp.marker_sigma_mm);
     std::string last_stage;
     pp.progress = [&](const std::string& stage, double) {
@@ -437,7 +440,8 @@ int process_cmd(const char* path, std::span<char*> args) {
                  rep.median_correction_mm, rep.max_correction_mm, rep.max_correction_deg, rep.frames_refined);
     std::println("islands: {} unverified segments, {} excluded ({} frames); {} lost frames recovered", rep.islands, rep.islands_excluded,
                  rep.frames_excluded, rep.frames_recovered);
-    std::println("mesh: {} vertices, {} triangles ({} small pieces removed)", rep.vertices, rep.triangles, rep.cleanup.removed_components);
+    std::println("mesh: {} vertices, {} triangles ({} small pieces removed; simplified from {} triangles, max error {:.3f} mm)", rep.vertices,
+                 rep.triangles, rep.cleanup.removed_components, rep.simplified.triangles_before, rep.simplified.max_error_mm);
     std::string times;
     for (const auto& [stage, ms] : rep.stage_ms) times += std::format(" {} {:.1f} s,", stage, ms / 1000.0);
     std::println("time:{}", times);
