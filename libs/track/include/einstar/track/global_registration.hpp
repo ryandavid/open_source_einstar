@@ -54,12 +54,26 @@ struct GlobalRegistrationParams {
     float inlier_distance_mm = 2.0f;
     float edge_ratio = 0.9f;
     int min_inliers = 60;
+    // Symmetric parts: a very different pose fitting nearly as well makes the match ambiguous.
+    int hypotheses = 4;                   // distinct RANSAC hypotheses scored against the whole model
+    double distinct_mm = 15.0;            // hypotheses farther apart than this (or...)
+    double distinct_deg = 8.0;            // ... rotated more than this are different poses
+    double ambiguity_ratio = 0.85;        // second-best fit / best fit above this = ambiguous
 };
 
-struct GlobalRegistrationResult {
+struct GlobalRegistrationCandidate {
     SE3 T_model_frame = SE3::Identity();  // frame coords -> model (world) coords
     int inliers = 0;
     double fitness = 0;                   // inliers / frame samples
+};
+
+struct GlobalRegistrationResult {
+    SE3 T_model_frame = SE3::Identity();  // best candidate
+    int inliers = 0;
+    double fitness = 0;
+    bool ambiguous = false;
+    // Every distinct candidate that fits nearly as well as the best (best first).
+    std::vector<GlobalRegistrationCandidate> candidates;
 };
 
 [[nodiscard]] std::optional<GlobalRegistrationResult> register_global(const OrientedCloud& frame_cloud,

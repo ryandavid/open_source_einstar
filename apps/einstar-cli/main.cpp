@@ -197,6 +197,7 @@ int track_fixture(const char* path, std::span<char*> args) {
         if (std::string_view(args[a]) == "--mode") mode = args[a + 1];
     tp.mode = mode == "geometry" ? track::AlignMode::geometry : mode == "markers" ? track::AlignMode::markers : track::AlignMode::hybrid;
     tp.marker_map.min_observations = static_cast<int>(arg_int(args, "--marker-confirm", tp.marker_map.min_observations));
+    tp.icp.degenerate_direction_ratio = arg_double(args, "--degen-ratio", tp.icp.degenerate_direction_ratio);
     std::println("volume: {}, icp: {}, mode: {}", volume ? "Metal" : "CPU", gpu_icp ? "Metal" : "CPU", mode);
     track::Tracker tracker(tp, std::move(volume));
     if (gpu_icp) tracker.set_icp_solver(gpu_icp->as_function());

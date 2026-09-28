@@ -74,7 +74,7 @@ std::optional<std::string> Tracker::check(const IcpResult& r, const SE3& from, d
     return std::nullopt;
 }
 
-std::optional<SE3> Tracker::global_candidate(const DepthFrame& frame) {
+std::optional<SE3> Tracker::global_candidate(const DepthFrame& frame, std::string& why) {
     const std::size_t bricks = volume_->brick_count();
     if (feature_model_.empty() ||
         static_cast<double>(bricks) > static_cast<double>(feature_model_bricks_) * (1.0 + params_.feature_model_rebuild_growth)) {
@@ -96,8 +96,24 @@ std::optional<SE3> Tracker::global_candidate(const DepthFrame& frame) {
             cloud.normals.push_back(n);
         }
     const auto r = register_global(cloud, feature_model_, params_.global, reloc_seed_++);
-    if (!r) return std::nullopt;
-    return r->T_model_frame;
+    if (!r) {
+        why = "global reloc found no match";
+        return std::nullopt;
+    }
+    if (!r->ambiguous) return r->T_model_frame;
+    // Several distinct poses fit (symmetric part): the scanner is most likely still near where
+    // tracking was lost; otherwise wait for a more distinctive view.
+    const SE3* nearest = nullptr;
+    double best = params_.ambiguous_reloc_max_mm;
+    for (const auto& c : r->candidates) {
+        const double d = (c.T_model_frame.translation() - lost_pose_.translation()).norm();
+        if (d < best) best = d, nearest = &c.T_model_frame;
+    }
+    if (!nearest) {
+        why = std::format("global reloc ambiguous ({} poses fit, none near the loss)", r->candidates.size());
+        return std::nullopt;
+    }
+    return *nearest;
 }
 
 TrackResult Tracker::process(const DepthFrame& frame) {
@@ -219,14 +235,15 @@ TrackResult Tracker::process(const DepthFrame& frame) {
     // Local relocalisation failed: try registering the frame against the whole model.
     if (!best && state_ == TrackState::lost && params_.global_relocalization &&
         (lost_frames_ % std::max(1, params_.global_reloc_every)) == 0) {
-        if (auto seed = global_candidate(frame)) {
+        std::string why;
+        if (auto seed = global_candidate(frame, why)) {
             const RaycastResult model = volume_->raycast(*seed, mk);
             const IcpResult r = icp_(frame, model, *seed, *seed, params_.icp);
             const auto verdict = check(r, *seed, 0.1, true);  // motion gate is meaningless here
             if (!verdict) best = r;
             else last_reason = "global reloc rejected: " + *verdict;
         } else {
-            last_reason = "global reloc found no match";
+            last_reason = why;
         }
     }
 

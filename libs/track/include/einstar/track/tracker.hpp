@@ -57,6 +57,9 @@ struct TrackerParams {
     bool fuse_surface = true;              // false: track only (e.g. global-marker capture)
     int global_reloc_every = 3;            // attempt on every Nth lost frame (it costs ~50-150 ms)
     GlobalRegistrationParams global;
+    // An ambiguous global match (several poses fit, e.g. a symmetric part) is only accepted for the
+    // candidate within this distance of where tracking was lost.
+    double ambiguous_reloc_max_mm = 150.0;
     double feature_model_rebuild_growth = 0.15;  // rebuild descriptors when the model grew by 15%
 };
 
@@ -103,7 +106,7 @@ public:
 
 private:
     [[nodiscard]] SE3 predict(double t) const;
-    [[nodiscard]] std::optional<SE3> global_candidate(const DepthFrame& frame);
+    [[nodiscard]] std::optional<SE3> global_candidate(const DepthFrame& frame, std::string& why);
     [[nodiscard]] std::optional<std::string> check(const IcpResult& r, const SE3& from, double dt, bool strict) const;
 
     TrackerParams params_;

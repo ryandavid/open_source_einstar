@@ -70,6 +70,16 @@ std::uint32_t hash_key(std::uint32_t key, std::uint32_t mask) {
     return h & mask;
 }
 
+// GPU extraction appends through an atomic counter, so the order differs between runs. Consumers
+// (voxel averaging, RANSAC sampling in relocalisation) depend on order, so hand out a canonical one.
+void canonical_order(std::vector<track::SurfacePoint>& pts) {
+    std::ranges::sort(pts, [](const track::SurfacePoint& a, const track::SurfacePoint& b) {
+        if (a.position.x() != b.position.x()) return a.position.x() < b.position.x();
+        if (a.position.y() != b.position.y()) return a.position.y() < b.position.y();
+        return a.position.z() < b.position.z();
+    });
+}
+
 }  // namespace
 
 struct MetalTsdfVolume::Impl {
@@ -339,6 +349,7 @@ std::vector<track::SurfacePoint> MetalTsdfVolume::extract_points(std::uint32_t s
         const auto* src = static_cast<const GpuSurfacePoint*>(im.ext_out->contents());
         for (std::uint32_t i = 0; i < found; ++i)
             out[i] = {Vec3f(src[i].p[0], src[i].p[1], src[i].p[2]), Vec3f(src[i].n[0], src[i].n[1], src[i].n[2]), src[i].w};
+        canonical_order(out);
         return out;
     }
     return {};
@@ -431,6 +442,7 @@ std::vector<track::SurfacePoint> MetalTsdfVolume::extract_points(const std::vect
     const auto* src = static_cast<const GpuSurfacePoint*>(im.ext_out->contents());
     for (std::uint32_t i = 0; i < found; ++i)
         out[i] = {Vec3f(src[i].p[0], src[i].p[1], src[i].p[2]), Vec3f(src[i].n[0], src[i].n[1], src[i].n[2]), src[i].w};
+    canonical_order(out);
     return out;
 }
 

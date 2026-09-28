@@ -246,8 +246,26 @@ std::optional<GlobalRegistrationResult> register_global(const OrientedCloud& fra
     std::mt19937 rng(seed);
     std::uniform_int_distribution<std::size_t> pick(0, corr.size() - 1);
     const float inl2 = p.inlier_distance_mm * p.inlier_distance_mm;
-    int best_inliers = 0;
-    SE3 best = SE3::Identity();
+    // Best few *distinct* hypotheses (a symmetric part has several good ones).
+    struct Hyp {
+        SE3 T;
+        int inliers;
+    };
+    std::vector<Hyp> hyps;
+    auto distinct = [&](const SE3& a, const SE3& b) {
+        const SE3 d = a.inverse() * b;
+        return translation_norm(d) > p.distinct_mm || rotation_angle(d) * 180.0 / M_PI > p.distinct_deg;
+    };
+    auto consider = [&](const SE3& T, int inliers) {
+        for (auto& h : hyps)
+            if (!distinct(h.T, T)) {
+                if (inliers > h.inliers) h = {T, inliers};
+                return;
+            }
+        hyps.push_back({T, inliers});
+        std::ranges::sort(hyps, [](const Hyp& a, const Hyp& b) { return a.inliers > b.inliers; });
+        if (static_cast<int>(hyps.size()) > 2 * p.hypotheses) hyps.pop_back();
+    };
     std::vector<Vec3f> a(3), b(3);
     for (int it = 0; it < p.ransac_iterations; ++it) {
         std::size_t idx[3] = {pick(rng), pick(rng), pick(rng)};
@@ -269,28 +287,42 @@ std::optional<GlobalRegistrationResult> register_global(const OrientedCloud& fra
         int inliers = 0;
         for (const auto& [s, d] : corr)
             if (((Tf * src.points[s].homogeneous()).head<3>() - dst[d]).squaredNorm() < inl2) ++inliers;
-        if (inliers > best_inliers) {
-            best_inliers = inliers;
-            best = T;
-        }
+        if (inliers >= 3) consider(T, inliers);
     }
-    if (best_inliers < 3) return std::nullopt;
+    if (hyps.empty()) return std::nullopt;
 
-    // Refit on all correspondence inliers, then score against the whole model.
-    std::vector<Vec3f> sa, sb;
-    const Eigen::Matrix4f Tb = best.matrix().cast<float>();
-    for (const auto& [s, d] : corr)
-        if (((Tb * src.points[s].homogeneous()).head<3>() - dst[d]).squaredNorm() < inl2) {
-            sa.push_back(src.points[s]);
-            sb.push_back(dst[d]);
-        }
-    if (sa.size() >= 3) best = kabsch(sa, sb);
-    const Eigen::Matrix4f Tr = best.matrix().cast<float>();
-    int fit = 0;
-    for (const auto& q : src.points)
-        if (model.nearest_point((Tr * q.homogeneous()).head<3>(), p.inlier_distance_mm)) ++fit;
-    if (fit < p.min_inliers) return std::nullopt;
-    return GlobalRegistrationResult{best, fit, static_cast<double>(fit) / static_cast<double>(src.points.size())};
+    // Refit each on its correspondence inliers, then score against the whole model.
+    std::vector<GlobalRegistrationCandidate> scored;
+    for (std::size_t h = 0; h < hyps.size() && static_cast<int>(h) < p.hypotheses; ++h) {
+        SE3 T = hyps[h].T;
+        std::vector<Vec3f> sa, sb;
+        const Eigen::Matrix4f Tb = T.matrix().cast<float>();
+        for (const auto& [s, d] : corr)
+            if (((Tb * src.points[s].homogeneous()).head<3>() - dst[d]).squaredNorm() < inl2) {
+                sa.push_back(src.points[s]);
+                sb.push_back(dst[d]);
+            }
+        if (sa.size() >= 3) T = kabsch(sa, sb);
+        const Eigen::Matrix4f Tr = T.matrix().cast<float>();
+        int fit = 0;
+        for (const auto& q : src.points)
+            if (model.nearest_point((Tr * q.homogeneous()).head<3>(), p.inlier_distance_mm)) ++fit;
+        scored.push_back({T, fit, static_cast<double>(fit) / static_cast<double>(src.points.size())});
+    }
+    std::ranges::sort(scored, [](const auto& x, const auto& y) { return x.inliers > y.inliers; });
+    // Refits can converge onto the same pose: keep distinct ones only.
+    std::vector<GlobalRegistrationCandidate> uniq;
+    for (const auto& c : scored)
+        if (std::ranges::all_of(uniq, [&](const auto& u) { return distinct(u.T_model_frame, c.T_model_frame); })) uniq.push_back(c);
+    if (uniq.empty() || uniq.front().inliers < p.min_inliers) return std::nullopt;
+    GlobalRegistrationResult out;
+    out.T_model_frame = uniq.front().T_model_frame;
+    out.inliers = uniq.front().inliers;
+    out.fitness = uniq.front().fitness;
+    for (const auto& c : uniq)
+        if (c.inliers >= p.ambiguity_ratio * uniq.front().inliers) out.candidates.push_back(c);
+    out.ambiguous = out.candidates.size() > 1;
+    return out;
 }
 
 }  // namespace einstar::track

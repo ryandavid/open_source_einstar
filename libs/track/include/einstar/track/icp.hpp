@@ -34,7 +34,7 @@ struct IcpParams {
     double data_sigma_mm = 0.2;
     // Degeneracy-aware update: eigen-directions of the (unit-scaled) Hessian weaker than this
     // fraction of the strongest are not updated from the data; they keep the prediction.
-    double degenerate_direction_ratio = 1e-4;
+    double degenerate_direction_ratio = 5e-4;  // chosen on mustang replays (full, skip 2, other starts)
     // Optional point-to-point marker terms solved jointly with the surface. Each marker counts like
     // `marker_weight` unit-weight surface correspondences, so markers pin the directions the surface
     // cannot (sliding on symmetric parts) without overriding well-constrained geometry.

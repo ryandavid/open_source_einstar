@@ -222,3 +222,27 @@ TEST_CASE("joint marker terms: Metal ICP matches the CPU solver") {
     CHECK(translation_norm(e) < 0.05);
     CHECK(std::abs(cpu.marker_rms_mm - gpu.marker_rms_mm) < 0.01);
 }
+
+TEST_CASE("Metal surface extraction is reproducible (canonical order)") {
+    // Relocalisation samples and averages extracted points, so their order must not depend on
+    // GPU scheduling; otherwise identical replays diverge.
+    auto ctx = gpu::Context::create();
+    if (!ctx) SKIP("no Metal device");
+    auto extract = [&] {
+        auto vol = track_metal::MetalTsdfVolume::create(*ctx);
+        REQUIRE(vol.has_value());
+        SE3 pose1 = SE3::Identity();
+        pose1.translation() = Vec3(4, -2, 1);
+        (*vol)->integrate(make_depth_frame(render_depth(SE3::Identity(), kK), kK), SE3::Identity());
+        (*vol)->integrate(make_depth_frame(render_depth(pose1, kK), kK), pose1);
+        return (*vol)->extract_points(0, 0.5f);
+    };
+    const auto a = extract();
+    const auto b = extract();
+    REQUIRE(a.size() == b.size());
+    REQUIRE(!a.empty());
+    bool identical = true;
+    for (std::size_t i = 0; i < a.size() && identical; ++i)
+        identical = a[i].position == b[i].position && a[i].normal == b[i].normal && a[i].weight == b[i].weight;
+    CHECK(identical);
+}
