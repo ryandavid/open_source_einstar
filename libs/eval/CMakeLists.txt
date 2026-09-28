@@ -1,0 +1,5 @@
+add_library(einstar_eval src/evaluation.cpp)
+add_library(einstar::eval ALIAS einstar_eval)
+target_include_directories(einstar_eval PUBLIC include)
+target_link_libraries(einstar_eval PUBLIC einstar::core einstar::fixtures einstar::recon einstar::session)
+einstar_target_defaults(einstar_eval)

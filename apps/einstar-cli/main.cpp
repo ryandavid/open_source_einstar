@@ -17,18 +17,16 @@
 #include <cmath>
 #include <optional>
 #include <format>
-#include <iomanip>
 #include <print>
 #include <span>
 #include <string_view>
 #include <vector>
 
-#include <Eigen/Geometry>
-
 #include "einstar/calib/device_calibration.hpp"
 #include "einstar/core/log.hpp"
 #include "einstar/core/timing.hpp"
 #include "einstar/device/einstar_device.hpp"
+#include "einstar/eval/evaluation.hpp"
 #include "einstar/fixtures/exstar_project.hpp"
 #include "einstar/recon/process.hpp"
 #include "einstar/session/session.hpp"
@@ -276,11 +274,7 @@ int track_fixture(const char* path, std::span<char*> args) {
             }
             session::capture_depth(frame, rec.depth, rec.confidence);
             recorder->write(std::move(rec));
-            const auto& M = f->T_world_camera.matrix();
-            exstar_poses << i;
-            for (int rr = 0; rr < 3; ++rr)
-                for (int cc = 0; cc < 4; ++cc) exstar_poses << ' ' << std::setprecision(12) << M(rr, cc);
-            exstar_poses << '\n';
+            eval::write_pose(exstar_poses, static_cast<std::size_t>(i), f->T_world_camera);
         }
         if (r.accepted && !diverged) {
             const SE3 d = f->T_world_camera.inverse() * r.T_world_camera;
@@ -359,11 +353,7 @@ int track_fixture(const char* path, std::span<char*> args) {
                          r.markers_seen, r.reason);
         }
     }
-    auto pct = [](std::vector<double> v, double p) {
-        if (v.empty()) return 0.0;
-        std::ranges::sort(v);
-        return v[static_cast<std::size_t>(p * static_cast<double>(v.size() - 1))];
-    };
+    const auto pct = [](const std::vector<double>& v, double p) { return eval::percentile(v, p); };
     std::println("\nframes {} (skip {}), accepted {} ({:.1f}%), lost {}, relocalised {}, degenerate {}, marker-posed {}", processed, skip,
                  accepted, 100.0 * accepted / std::max(1, processed), lost, reloc, degenerate, marker_frames);
     std::println("marker map: {} markers", tracker.marker_map().size());
@@ -385,12 +375,6 @@ int track_fixture(const char* path, std::span<char*> args) {
                      recorder->path());
     }
     return 0;
-}
-
-double percentile(std::vector<double> v, double p) {
-    if (v.empty()) return 0.0;
-    std::ranges::sort(v);
-    return v[static_cast<std::size_t>(p * static_cast<double>(v.size() - 1))];
 }
 
 int process_cmd(const char* path, std::span<char*> args) {
@@ -446,97 +430,34 @@ int process_cmd(const char* path, std::span<char*> args) {
     std::println("time:{}", times);
 
     if (const char* ref = arg_str(args, "--reference-poses")) {
-        std::ifstream f(ref);
-        std::map<std::size_t, SE3> exstar;
-        std::size_t idx;
-        while (f >> idx) {
-            SE3 T = SE3::Identity();
-            for (int rr = 0; rr < 3; ++rr)
-                for (int cc = 0; cc < 4; ++cc) f >> T.matrix()(rr, cc);
-            exstar[idx] = T;
-        }
-        std::vector<double> live_t, live_r, opt_t, opt_r;
-        int good_to_bad = 0, bad_to_good = 0, bad_both = 0;
-        for (const auto& [i, T] : r->frame_poses) {
-            const auto it = exstar.find((*s)->meta(i).index);
-            if (it == exstar.end()) continue;
-            const SE3 el = it->second.inverse() * (*s)->meta(i).T_world_camera;
-            const SE3 eo = it->second.inverse() * T;
-            const bool lb = translation_norm(el) > 3.0, ob = translation_norm(eo) > 3.0;
-            good_to_bad += !lb && ob;
-            if (has_flag(args, "--verbose") && translation_norm((*s)->meta(i).T_world_camera.inverse() * T) > 5.0 && (*s)->meta(i).index % 10 == 0)
-                std::println("  frame {}: live vs EXStar {:.1f} mm, processed vs EXStar {:.1f} mm, flags {:#x}", (*s)->meta(i).index,
-                             translation_norm(el), translation_norm(eo), (*s)->meta(i).flags);
-            bad_to_good += lb && !ob;
-            bad_both += lb && ob;
-            live_t.push_back(translation_norm(el));
-            live_r.push_back(rotation_angle(el) * 180 / M_PI);
-            opt_t.push_back(translation_norm(eo));
-            opt_r.push_back(rotation_angle(eo) * 180 / M_PI);
-        }
+        const auto reference = eval::read_poses(ref);
+        const auto c = eval::compare_poses(**s, r->frame_poses, reference);
         std::println("pose vs EXStar ({} frames): live median {:.2f} mm p95 {:.2f} mm ({:.3f} / {:.3f} deg) -> processed median {:.2f} mm "
                      "p95 {:.2f} mm ({:.3f} / {:.3f} deg)",
-                     opt_t.size(), percentile(live_t, 0.5), percentile(live_t, 0.95), percentile(live_r, 0.5), percentile(live_r, 0.95),
-                     percentile(opt_t, 0.5), percentile(opt_t, 0.95), percentile(opt_r, 0.5), percentile(opt_r, 0.95));
-        std::println("frames > 3 mm from EXStar: live only {}, processed only {}, both {}", bad_to_good, good_to_bad, bad_both);
-        std::vector<double> rec_err;
-        for (const auto& [i, T] : r->frame_poses) {
-            if ((*s)->meta(i).accepted()) continue;
-            const auto it = exstar.find((*s)->meta(i).index);
-            if (it != exstar.end()) rec_err.push_back(translation_norm(it->second.inverse() * T));
-        }
-        if (!rec_err.empty())
-            std::println("recovered frames vs EXStar ({}): median {:.2f} mm p95 {:.2f} mm, {} beyond 3 mm", rec_err.size(), percentile(rec_err, 0.5),
-                         percentile(rec_err, 0.95), std::ranges::count_if(rec_err, [](double e) { return e > 3.0; }));
-        // The process step fixes only the first frame, so the whole scan may differ from EXStar's by a
-        // rigid transform; compare after the best rigid alignment of the camera centres.
-        auto aligned = [&](bool processed) {
-            std::vector<Vec3> a, b;
-            std::vector<SE3> ours, theirs;
-            for (const auto& [i, T] : r->frame_poses) {
-                const auto it = exstar.find((*s)->meta(i).index);
-                if (it == exstar.end()) continue;
-                const SE3 P = processed ? T : (*s)->meta(i).T_world_camera;
-                if (translation_norm(it->second.inverse() * P) > 3.0) continue;  // gross (symmetric) cases
-                a.push_back(P.translation());
-                b.push_back(it->second.translation());
-                ours.push_back(P);
-                theirs.push_back(it->second);
-            }
-            if (a.size() < 3) return std::pair{0.0, 0.0};
-            Eigen::Matrix3Xd A(3, static_cast<Eigen::Index>(a.size())), B(3, static_cast<Eigen::Index>(b.size()));
-            for (std::size_t n = 0; n < a.size(); ++n) A.col(static_cast<Eigen::Index>(n)) = a[n], B.col(static_cast<Eigen::Index>(n)) = b[n];
-            SE3 G = SE3::Identity();
-            G.matrix() = Eigen::umeyama(A, B, false);
-            std::vector<double> et;
-            for (std::size_t n = 0; n < ours.size(); ++n) et.push_back(translation_norm(theirs[n].inverse() * G * ours[n]));
-            return std::pair{percentile(et, 0.5), percentile(et, 0.95)};
-        };
-        const auto [lm, l95] = aligned(false);
-        const auto [pm, p95] = aligned(true);
+                     c.frames, c.live_mm.median, c.live_mm.p95, c.live_deg.median, c.live_deg.p95, c.processed_mm.median, c.processed_mm.p95,
+                     c.processed_deg.median, c.processed_deg.p95);
+        std::println("frames > 3 mm from EXStar: live only {}, processed only {}, both {}", c.bad_live_only, c.bad_processed_only, c.bad_both);
+        if (c.recovered > 0)
+            std::println("recovered frames vs EXStar ({}): median {:.2f} mm p95 {:.2f} mm, {} beyond 3 mm", c.recovered, c.recovered_mm.median,
+                         c.recovered_mm.p95, c.recovered_bad);
         std::println("after rigid alignment to EXStar (frames within 3 mm): live median {:.2f} mm p95 {:.2f} mm -> processed median {:.2f} mm p95 {:.2f} mm",
-                     lm, l95, pm, p95);
+                     c.aligned_live_mm.median, c.aligned_live_mm.p95, c.aligned_processed_mm.median, c.aligned_processed_mm.p95);
         if (has_flag(args, "--verbose")) {
-            // Marker consistency: spread of each identified marker's world positions under each pose set.
-            for (const char* which : {"EXStar", "live", "processed"}) {
-                std::map<int, std::vector<Vec3>> pts;
-                for (const auto& [i, T] : r->frame_poses) {
-                    const auto it = exstar.find((*s)->meta(i).index);
-                    if (it == exstar.end()) continue;
-                    const SE3 P = std::string_view(which) == "EXStar" ? it->second : std::string_view(which) == "live" ? (*s)->meta(i).T_world_camera : T;
-                    for (const auto& m : (*s)->meta(i).markers)
-                        if (m.map_id >= 0) pts[m.map_id].push_back(P * m.position);
-                }
-                std::vector<double> spread;
-                for (const auto& [id, v] : pts) {
-                    if (v.size() < 5) continue;
-                    Vec3 c = Vec3::Zero();
-                    for (const auto& p : v) c += p;
-                    c /= static_cast<double>(v.size());
-                    for (const auto& p : v) spread.push_back((p - c).norm());
-                }
-                std::println("  marker spread under {} poses: median {:.3f} mm p95 {:.3f} mm", which, percentile(spread, 0.5), percentile(spread, 0.95));
-            }
+            auto show = [&](const char* name, const std::function<std::optional<SE3>(std::size_t)>& pose_of) {
+                const auto sp = eval::marker_spread(**s, pose_of);
+                std::println("  marker spread under {} poses: median {:.3f} mm p95 {:.3f} mm", name, sp.median, sp.p95);
+            };
+            show("EXStar", [&](std::size_t i) -> std::optional<SE3> {
+                const auto it = reference.find((*s)->meta(i).index);
+                return it == reference.end() || !r->frame_poses.contains(i) ? std::nullopt : std::optional<SE3>(it->second);
+            });
+            show("live", [&](std::size_t i) -> std::optional<SE3> {
+                return r->frame_poses.contains(i) && (*s)->meta(i).accepted() ? std::optional<SE3>((*s)->meta(i).T_world_camera) : std::nullopt;
+            });
+            show("processed", [&](std::size_t i) -> std::optional<SE3> {
+                const auto it = r->frame_poses.find(i);
+                return it == r->frame_poses.end() ? std::nullopt : std::optional<SE3>(it->second);
+            });
         }
     }
     if (const char* ref = arg_str(args, "--stl")) {
@@ -545,30 +466,11 @@ int process_cmd(const char* path, std::span<char*> args) {
             std::println(stderr, "{}", m.error().message);
             return 1;
         }
-        // Accuracy: our surface -> reference. Completeness: reference -> our surface.
-        const fixtures::MeshDistance to_ref(*m);
-        fixtures::Mesh ours;
-        ours.vertices.reserve(r->mesh.triangles.size() * 3);
-        for (const auto& t : r->mesh.triangles)
-            for (const auto v : t) ours.vertices.push_back(r->mesh.vertices[v]);
-        const fixtures::MeshDistance to_ours(ours);
-        std::vector<double> acc;
-        int far = 0;
-        const std::size_t step = std::max<std::size_t>(1, r->mesh.vertices.size() / 200000);
-        for (std::size_t v = 0; v < r->mesh.vertices.size(); v += step) {
-            if (auto d = to_ref.distance(r->mesh.vertices[v], 3.0f)) acc.push_back(*d);
-            else ++far;
-        }
-        std::vector<double> comp;
-        const std::size_t rstep = std::max<std::size_t>(1, m->vertices.size() / 200000);
-        for (std::size_t v = 0; v < m->vertices.size(); v += rstep) comp.push_back(to_ours.distance(m->vertices[v], 3.0f).value_or(3.0f));
-        const auto within = [](const std::vector<double>& d, double t) {
-            return 100.0 * static_cast<double>(std::ranges::count_if(d, [&](double x) { return x <= t; })) / static_cast<double>(std::max<std::size_t>(1, d.size()));
-        };
+        const auto c = eval::compare_mesh(r->mesh, *m);
         std::println("vs reference mesh: accuracy median {:.3f} mm p90 {:.3f} mm p95 {:.3f} mm ({:.1f}% of our surface beyond 3 mm: not in the reference); "
                      "completeness {:.1f}% of the reference within 0.5 mm, {:.1f}% within 1 mm",
-                     percentile(acc, 0.5), percentile(acc, 0.9), percentile(acc, 0.95), 100.0 * far / static_cast<double>(far + acc.size()),
-                     within(comp, 0.5), within(comp, 1.0));
+                     c.accuracy_mm.median, c.accuracy_p90_mm, c.accuracy_mm.p95, 100 * c.beyond_fraction, 100 * c.completeness_05,
+                     100 * c.completeness_1);
     }
     if (const char* outp = arg_str(args, "-o")) {
         if (auto w = recon::save_mesh(r->mesh, outp); !w) {
