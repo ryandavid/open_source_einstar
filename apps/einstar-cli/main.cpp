@@ -152,6 +152,70 @@ int calib_cmd(const char* dir) {
     return 0;
 }
 
+// Where a frame disagrees with the model: each source pixel (at `pose`) classified like the ICP
+// association, written as a BMP (green inlier, red in front of the model, blue behind it, yellow
+// normal mismatch, grey no model) with counts and a histogram of the signed misses.
+void diagnose_frame(const track::DepthFrame& frame, const track::Volume& volume, const SE3& pose, const track::IcpParams& ip,
+                    double model_scale, const std::string& out_bmp) {
+    frame.ensure_cpu();
+    const auto mk = frame.intrinsics.scaled(model_scale);
+    const auto model = volume.raycast(pose, mk);
+    model.ensure_cpu();
+    const int W = frame.points.width(), H = frame.points.height();
+    std::vector<std::uint8_t> rgb(static_cast<std::size_t>(W * H) * 3, 0);
+    const float cos_max = std::cos(ip.max_normal_angle_deg * static_cast<float>(M_PI) / 180.0f);
+    const Eigen::Matrix4f T = pose.matrix().cast<float>(), Tinv = pose.inverse().matrix().cast<float>();
+    int n_in = 0, n_front = 0, n_behind = 0, n_normal = 0, n_off = 0;
+    std::map<int, int> hist;  // signed depth difference (frame - model) in mm, outliers only
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            const Vec3f& pc = frame.points(x, y);
+            if (pc.z() <= 0) continue;
+            std::uint8_t* px = &rgb[(static_cast<std::size_t>(H - 1 - y) * static_cast<std::size_t>(W) + static_cast<std::size_t>(x)) * 3];
+            auto set = [&](std::uint8_t r, std::uint8_t g, std::uint8_t b) { px[0] = b; px[1] = g; px[2] = r; };  // BMP is BGR
+            const Vec3f pw = (T * pc.homogeneous()).head<3>();
+            const int u = static_cast<int>(std::lround(mk.fx * pc.x() / pc.z() + mk.cx));
+            const int v = static_cast<int>(std::lround(mk.fy * pc.y() / pc.z() + mk.cy));
+            if (u < 0 || v < 0 || u >= mk.width || v >= mk.height || !model.valid(u, v)) {
+                ++n_off;
+                set(90, 90, 90);
+                continue;
+            }
+            const Vec3f& q = model.points(u, v);
+            const Vec3f& nq = model.normals(u, v);
+            const float r = nq.dot(pw - q);
+            if (std::abs(r) > ip.max_distance_mm || (pw - q).norm() > 2 * ip.max_distance_mm) {
+                const float dz = pc.z() - (Tinv * q.homogeneous()).z();
+                ++hist[static_cast<int>(std::floor(std::clamp(dz, -20.0f, 20.0f) / 2.0f)) * 2];
+                if (dz < 0) ++n_front, set(230, 40, 40);
+                else ++n_behind, set(40, 80, 240);
+                continue;
+            }
+            const Vec3f ns = pose.linear().cast<float>() * frame.normals(x, y);
+            if (ns.squaredNorm() > 0 && ns.dot(nq) < cos_max) {
+                ++n_normal;
+                set(230, 210, 40);
+                continue;
+            }
+            ++n_in;
+            set(60, 200, 90);
+        }
+    const int on = n_in + n_front + n_behind + n_normal;
+    std::println("diagnose: inliers {} ({:.0f}% of on-model), in front of model {}, behind {}, normal mismatch {}, off model {}", n_in,
+                 100.0 * n_in / std::max(1, on), n_front, n_behind, n_normal, n_off);
+    std::print("diagnose: outlier depth difference (frame - model, mm):");
+    for (const auto& [b, c] : hist) std::print(" [{},{}):{}", b, b + 2, c);
+    std::println("");
+    std::ofstream f(out_bmp, std::ios::binary);
+    const std::uint32_t row = static_cast<std::uint32_t>(W) * 3, size = 54 + row * static_cast<std::uint32_t>(H);
+    auto u32 = [&](std::uint32_t v) { f.write(reinterpret_cast<const char*>(&v), 4); };
+    auto u16 = [&](std::uint16_t v) { f.write(reinterpret_cast<const char*>(&v), 2); };
+    f.write("BM", 2);
+    u32(size), u32(0), u32(54), u32(40), u32(static_cast<std::uint32_t>(W)), u32(static_cast<std::uint32_t>(H));
+    u16(1), u16(24), u32(0), u32(row * static_cast<std::uint32_t>(H)), u32(2835), u32(2835), u32(0), u32(0);
+    f.write(reinterpret_cast<const char*>(rgb.data()), static_cast<std::streamsize>(rgb.size()));  // W * 3 is a multiple of 4
+}
+
 int track_fixture(const char* path, std::span<char*> args) {
     auto proj = fixtures::ExstarProject::open(path);
     if (!proj) {
@@ -242,8 +306,28 @@ int track_fixture(const char* path, std::span<char*> args) {
                              translation_norm(step), rotation_angle(step) * 180.0 / M_PI);
         }
         prev_ref = f->T_world_camera;
+        if (has_flag(args, "--oracle")) {
+            // Model from EXStar's poses (no tracking): separates scene content from our registration errors.
+            if (i == arg_int(args, "--diagnose-frame", -1)) {
+                diagnose_frame(frame, tracker.volume(), f->T_world_camera, tp.icp, tp.model_scale,
+                               arg_str(args, "--diagnose-out") ? arg_str(args, "--diagnose-out") : "diagnose.bmp");
+                break;
+            }
+            tracker.volume().integrate(frame, f->T_world_camera);
+            continue;
+        }
         const auto r = tracker.process(frame);
         ++processed;
+        if (const long probe = arg_int(args, "--probe-frame", -1); probe >= 0 && i % arg_int(args, "--probe-every", 100) == 0) {
+            // How the model looks to a later frame (at EXStar's pose) as it grows: finds when a ghost appeared.
+            auto pf = (*proj)->read_frame(static_cast<std::size_t>(probe));
+            const auto pframe = track::make_depth_frame(pf->depth, k);
+            std::print("probe at frame {:5}: ", i);
+            diagnose_frame(pframe, tracker.volume(), pf->T_world_camera, tp.icp, tp.model_scale, "/dev/null");
+        }
+        if (i == arg_int(args, "--diagnose-frame", -1))
+            diagnose_frame(frame, tracker.volume(), r.icp.T_world_camera, tp.icp, tp.model_scale,
+                           arg_str(args, "--diagnose-out") ? arg_str(args, "--diagnose-out") : "diagnose.bmp");
         if (record_path && !recorder) {
             session::SessionHeader h;
             h.depth_intrinsics = k;
@@ -340,6 +424,8 @@ int track_fixture(const char* path, std::span<char*> args) {
         const long trace_from = arg_int(args, "--trace-from", -1), trace_to = arg_int(args, "--trace-to", -1);
         if (i >= trace_from && i <= trace_to) {
             const SE3 d = f->T_world_camera.inverse() * r.T_world_camera;
+            const SE3 di = f->T_world_camera.inverse() * r.icp.T_world_camera;  // the ICP answer, even when rejected
+            std::print("icp-err {:6.2f} mm ", translation_norm(di));
             std::println("trace {:5} {:10} err {:6.2f} mm {:5.2f} deg  rms {:.3f} inl {:.2f} cov {:.2f} eig {:.1e} markers {}/{} "
                          "mrms {:.3f} mpose {} {}", i,
                          r.accepted ? (r.degenerate ? "ok-degen" : "ok") : "not-acc", translation_norm(d),

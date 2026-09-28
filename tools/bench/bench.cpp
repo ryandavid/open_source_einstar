@@ -258,6 +258,15 @@ int main(int argc, char** argv) {
                 its = (*gicp)->last_iterations();
             });
             std::println("{:28} gpu-side median {:.2f} ms, {} iterations ran", "", gt.median(), its);
+            if (std::getenv("EINSTAR_ICP_DUMP")) {
+                // Exact result of repeated solves (determinism / kernel-change parity).
+                for (int rep = 0; rep < 3; ++rep) {
+                    const auto r = (*gicp)->solve(df, model, pose, pose, ip);
+                    std::print("  pose");
+                    for (int e = 0; e < 12; ++e) std::print(" {:a}", static_cast<float>(r.T_world_camera.matrix()(e % 3, e / 3)));
+                    std::println("  n {} rms {:a}", r.correspondences, static_cast<float>(r.rms_mm));
+                }
+            }
         }
     }
     return 0;

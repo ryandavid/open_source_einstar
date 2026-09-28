@@ -3,8 +3,8 @@ R"METAL(
 using namespace metal;
 
 // GPU point-to-plane ICP mirroring libs/track/src/icp.cpp. All Gauss-Newton iterations run in one
-// command buffer: an accumulate pass (per-threadgroup partial normal equations) followed by a
-// single-threadgroup solve pass that updates the pose in device memory.
+// command buffer, one dispatch each: per-threadgroup partial normal equations, then the last
+// threadgroup to finish sums them and updates the pose in device memory.
 
 struct IcpState {
     float T[16];       // current camera -> world pose (column-major)
@@ -62,94 +62,19 @@ inline void store4(device float* m, float4x4 t) {
         for (int r = 0; r < 4; ++r) m[c * 4 + r] = t[c][r];
 }
 
-// Indirect dispatch arguments of one level: the accumulate grid, then the solve (one threadgroup). Once
-// the level converges (or ICP fails) the solve zeroes them, so the remaining iterations launch nothing.
-struct LevelDispatch { uint acc[3]; uint solve[3]; };
+// Indirect dispatch arguments of one level's iterations. Once the level converges (or ICP fails) the
+// solve zeroes them, so the remaining iterations launch nothing.
+struct LevelDispatch { uint groups[3]; };
 
-inline void stop_level(device LevelDispatch* disp) {
-    disp->acc[0] = 0;
-    disp->solve[0] = 0;
-}
+inline void stop_level(device LevelDispatch* disp) { disp->groups[0] = 0; }
 
 kernel void icp_level_begin(device IcpState* st [[buffer(0)]], device LevelDispatch* disp [[buffer(1)]],
-                            constant uint2& groups [[buffer(2)]]) {
+                            constant uint2& groups [[buffer(2)]], device atomic_uint* arrived [[buffer(3)]]) {
     st->level_done = 0;
-    const uint on = st->failed ? 0u : 1u;
-    disp->acc[0] = groups.x * on; disp->acc[1] = groups.y; disp->acc[2] = 1;
-    disp->solve[0] = on; disp->solve[1] = 1; disp->solve[2] = 1;
-}
-
-kernel void icp_accumulate(device const float4* src_pts [[buffer(0)]], device const float4* src_nrm [[buffer(1)]],
-                           device const float* src_w [[buffer(2)]], device const float4* mdl_pts [[buffer(3)]],
-                           device const float4* mdl_nrm [[buffer(4)]], device IcpState* st [[buffer(5)]],
-                           device float* partials [[buffer(6)]], constant AccArgs& a [[buffer(7)]],
-                           uint2 gid [[thread_position_in_grid]], uint2 tgid [[threadgroup_position_in_grid]],
-                           uint2 tgs [[threadgroups_per_grid]], uint lidx [[thread_index_in_threadgroup]],
-                           uint lane [[thread_index_in_simdgroup]], uint simd_id [[simdgroup_index_in_threadgroup]],
-                           uint nsimd [[simdgroups_per_threadgroup]]) {
-    if (st->failed || st->level_done) return;  // uniform across the grid
-    float acc[31];
-    for (int j = 0; j < 31; ++j) acc[j] = 0.0f;
-    const float4x4 T = load4(st->T);
-    const float4x4 Mcw = load4c(a.M_cw);
-    const float3 c = float3(a.c[0], a.c[1], a.c[2]);
-    for (uint rep = 0; rep < 4; ++rep) {
-    const uint x = (gid.x * 4 + rep) * a.step, y = gid.y * a.step;
-    if (x < a.W && y < a.H) {
-        const uint i = y * a.W + x;
-        const float4 pc = src_pts[i];
-        if (pc.z > 0) {
-            acc[29] += 1.0f;  // considered
-            const float3 pw = (T * float4(pc.xyz, 1)).xyz;
-            const float3 pm = (Mcw * float4(pw, 1)).xyz;
-            if (pm.z > 0) {
-                const int u = int(rint(a.mfx * pm.x / pm.z + a.mcx));
-                const int v = int(rint(a.mfy * pm.y / pm.z + a.mcy));
-                if (u >= 0 && v >= 0 && u < int(a.mw) && v < int(a.mh)) {
-                    const uint mi = uint(v) * a.mw + uint(u);
-                    const float4 q4 = mdl_pts[mi];
-                    if (q4.w > 0) {
-                        acc[30] += 1.0f;  // on model
-                        const float3 q = q4.xyz;
-                        const float3 nq = mdl_nrm[mi].xyz;
-                        const float r = dot(nq, pw - q);
-                        bool ok = !(abs(r) > a.gate || length(pw - q) > 2 * a.gate);
-                        const float3 ns = src_nrm[i].xyz;
-                        if (ok && dot(ns, ns) > 0) {
-                            const float3 nsw = (T * float4(ns, 0)).xyz;
-                            if (dot(nsw, nq) < a.cos_max) ok = false;
-                        }
-                        if (ok) {
-                            const float w_h = abs(r) <= a.huber ? 1.0f : a.huber / abs(r);
-                            const float w = w_h * src_w[i];
-                            float J[6];
-                            J[0] = nq.x; J[1] = nq.y; J[2] = nq.z;
-                            const float3 jr = cross(pw - c, nq);  // centred rotation Jacobian (better float precision)
-                            J[3] = jr.x; J[4] = jr.y; J[5] = jr.z;
-                            int k = 0;
-                            for (int r0 = 0; r0 < 6; ++r0)
-                                for (int c0 = r0; c0 < 6; ++c0) acc[k++] += w * J[r0] * J[c0];
-                            for (int j = 0; j < 6; ++j) acc[21 + j] -= w * J[j] * r;
-                            acc[27] += w * r * r;
-                            acc[28] += 1.0f;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    }
-    threadgroup float tg_sum[32 * 31];
-    for (int j = 0; j < 31; ++j) {
-        const float s = simd_sum(acc[j]);
-        if (lane == 0) tg_sum[simd_id * 31 + uint(j)] = s;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lidx < 31) {
-        float s = 0;
-        for (uint g = 0; g < nsimd; ++g) s += tg_sum[g * 31 + lidx];
-        partials[(tgid.y * tgs.x + tgid.x) * kP + lidx] = s;
-    }
+    atomic_store_explicit(arrived, 0u, memory_order_relaxed);
+    disp->groups[0] = st->failed ? 0u : groups.x;
+    disp->groups[1] = groups.y;
+    disp->groups[2] = 1;
 }
 
 // ---- small dense linear algebra for the solve thread ----
@@ -278,39 +203,41 @@ inline float4x4 inverse_rigid(float4x4 T) {
     return float4x4(float4(Rt[0], 0), float4(Rt[1], 0), float4(Rt[2], 0), float4(t, 1));
 }
 
-kernel void icp_solve(device IcpState* st [[buffer(0)]], device const float* partials [[buffer(1)]],
-                      constant SolveArgs& a [[buffer(2)]], device const float4* markers [[buffer(3)]],
-                      device LevelDispatch* disp [[buffer(4)]], uint lidx [[thread_index_in_threadgroup]],
-                      uint tgsize [[threads_per_threadgroup]], uint lane [[thread_index_in_simdgroup]],
-                      uint simd_id [[simdgroup_index_in_threadgroup]], uint nsimd [[simdgroups_per_threadgroup]]) {
-    if (st->failed || st->level_done) return;
-    threadgroup float totals[31];
-    threadgroup float tg_sum[32 * 31];
+// Threadgroup scratch of the solve (threadgroup variables can only be declared in kernels).
+struct SolveShared {
+    float totals[31];
+    float sum[32 * 31];
+    float E[36], V[36], ev[6];
+    int abort;
+};
+
+// Sums the per-threadgroup partials and takes one Gauss-Newton step; run by one threadgroup.
+inline void solve_step(device IcpState* st, device atomic_float* partials, constant SolveArgs& a, device const float4* markers,
+                       device LevelDispatch* disp, threadgroup SolveShared& sh, uint lidx, uint tgsize, uint lane, uint simd_id,
+                       uint nsimd) {
     float acc[31];
     for (int j = 0; j < 31; ++j) acc[j] = 0.0f;
     for (uint i = lidx; i < a.num_partials; i += tgsize)
-        for (int j = 0; j < 31; ++j) acc[j] += partials[i * kP + uint(j)];
+        for (int j = 0; j < 31; ++j) acc[j] += atomic_load_explicit(&partials[i * kP + uint(j)], memory_order_relaxed);
     for (int j = 0; j < 31; ++j) {
         const float v = simd_sum(acc[j]);
-        if (lane == 0) tg_sum[simd_id * 31 + uint(j)] = v;
+        if (lane == 0) sh.sum[simd_id * 31 + uint(j)] = v;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lidx < 31) {
         float v = 0;
-        for (uint g = 0; g < nsimd; ++g) v += tg_sum[g * 31 + lidx];
-        totals[lidx] = v;
+        for (uint g = 0; g < nsimd; ++g) v += sh.sum[g * 31 + lidx];
+        sh.totals[lidx] = v;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simd_id != 0) return;  // one SIMD group from here: lane 0 runs the serial parts, all lanes the eigen solve
-    threadgroup float tgE[36], tgV[36], tgEv[6];
-    threadgroup int tg_abort;
-    if (lane == 0) tg_abort = 0;
+    if (lane == 0) sh.abort = 0;
     // Locals of the serial part (lane 0 computes them; declared for all lanes).
     Mat6 Ao, As, Ar, E, V;
     float bo[6], bs[6], rhs[6], xs[6], ev[6], prior_s[6];
     const float sc[6] = {1, 1, 1, 0.01f, 0.01f, 0.01f};
     const float3 c = float3(a.c[0], a.c[1], a.c[2]);
-    const float n = totals[28];
+    const float n = sh.totals[28];
     float marker_ss = 0;
     float4x4 T;
     if (lane == 0) {
@@ -319,17 +246,17 @@ kernel void icp_solve(device IcpState* st [[buffer(0)]], device const float* par
         st->failed = 1;
         st->correspondences = int(n);
         stop_level(disp);
-        tg_abort = 1;
+        sh.abort = 1;
     }
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
-    if (tg_abort) return;
+    if (sh.abort) return;
     if (lane == 0) {
     // Normal equations about the centroid c (same convention as the CPU solver).
     int k = 0;
     for (int r = 0; r < 6; ++r)
-        for (int c0 = r; c0 < 6; ++c0) { Ao[r][c0] = totals[k]; Ao[c0][r] = totals[k]; ++k; }
-    for (int j = 0; j < 6; ++j) bo[j] = totals[21 + j];
+        for (int c0 = r; c0 < 6; ++c0) { Ao[r][c0] = sh.totals[k]; Ao[c0][r] = sh.totals[k]; ++k; }
+    for (int j = 0; j < 6; ++j) bo[j] = sh.totals[21 + j];
     // Joint marker terms: r = T p - q, J = [I, -hat(Tp - c)].
     {
         const float4x4 Tm = load4(st->T);
@@ -379,18 +306,18 @@ kernel void icp_solve(device IcpState* st [[buffer(0)]], device const float* par
     if (!cholesky_solve6(Ar, rhs, xs)) {
         st->failed = 1;
         stop_level(disp);
-        tg_abort = 1;
+        sh.abort = 1;
     }
     for (int i = 0; i < 6; ++i)
-        for (int j = 0; j < 6; ++j) tgE[i * 6 + j] = E[i][j];
+        for (int j = 0; j < 6; ++j) sh.E[i * 6 + j] = E[i][j];
     }  // lane 0
     simdgroup_barrier(mem_flags::mem_threadgroup);
-    if (tg_abort) return;
-    jacobi6_simd(tgE, tgV, tgEv, lane);
+    if (sh.abort) return;
+    jacobi6_simd(sh.E, sh.V, sh.ev, lane);
     if (lane != 0) return;
     for (int i = 0; i < 6; ++i) {
-        ev[i] = tgEv[i];
-        for (int j = 0; j < 6; ++j) V[i][j] = tgV[i * 6 + j];
+        ev[i] = sh.ev[i];
+        for (int j = 0; j < 6; ++j) V[i][j] = sh.V[i * 6 + j];
     }
     // sort ascending (eigenvectors are columns of V)
     for (int i = 0; i < 6; ++i)
@@ -425,10 +352,10 @@ kernel void icp_solve(device IcpState* st [[buffer(0)]], device const float* par
     if (a.final_level && (a.last_iter || converged)) {
         st->stats_written = 1;
         st->correspondences = int(n);
-        st->candidates = int(totals[29]);
-        st->rms = sqrt(totals[27] / max(1.0f, n));
-        st->inlier_ratio = totals[30] > 0 ? n / totals[30] : 0.0f;
-        st->coverage = totals[29] > 0 ? totals[30] / totals[29] : 0.0f;
+        st->candidates = int(sh.totals[29]);
+        st->rms = sqrt(sh.totals[27] / max(1.0f, n));
+        st->inlier_ratio = sh.totals[30] > 0 ? n / sh.totals[30] : 0.0f;
+        st->coverage = sh.totals[29] > 0 ? sh.totals[30] / sh.totals[29] : 0.0f;
         st->eig_ratio = ev[5] > 0 ? ev[0] / ev[5] : 0.0f;
         st->marker_rms = a.marker_count ? sqrt(marker_ss / float(a.marker_count)) : 0.0f;
         st->degenerate_dirs = degenerate;
@@ -440,6 +367,96 @@ kernel void icp_solve(device IcpState* st [[buffer(0)]], device const float* par
         st->level_done = 1;
         stop_level(disp);
     }
+}
+
+// One Gauss-Newton iteration in one dispatch: every threadgroup accumulates its partial normal
+// equations; the last threadgroup to finish (atomic counter, device-scope fences) sums them all and
+// solves, so an iteration costs one launch and one barrier instead of two.
+kernel void icp_iterate(device const float4* src_pts [[buffer(0)]], device const float4* src_nrm [[buffer(1)]],
+                           device const float* src_w [[buffer(2)]], device const float4* mdl_pts [[buffer(3)]],
+                           device const float4* mdl_nrm [[buffer(4)]], device IcpState* st [[buffer(5)]],
+                           device atomic_float* partials [[buffer(6)]], constant AccArgs& a [[buffer(7)]],
+                           constant SolveArgs& sa [[buffer(8)]], device const float4* markers [[buffer(9)]],
+                           device LevelDispatch* disp [[buffer(10)]], device atomic_uint* arrived [[buffer(11)]],
+                           uint2 gid [[thread_position_in_grid]], uint2 tgid [[threadgroup_position_in_grid]],
+                           uint2 tgs [[threadgroups_per_grid]], uint lidx [[thread_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]], uint simd_id [[simdgroup_index_in_threadgroup]],
+                           uint nsimd [[simdgroups_per_threadgroup]]) {
+    if (st->failed || st->level_done) return;  // uniform across the grid
+    float acc[31];
+    for (int j = 0; j < 31; ++j) acc[j] = 0.0f;
+    const float4x4 T = load4(st->T);
+    const float4x4 Mcw = load4c(a.M_cw);
+    const float3 c = float3(a.c[0], a.c[1], a.c[2]);
+    for (uint rep = 0; rep < 4; ++rep) {
+    const uint x = (gid.x * 4 + rep) * a.step, y = gid.y * a.step;
+    if (x < a.W && y < a.H) {
+        const uint i = y * a.W + x;
+        const float4 pc = src_pts[i];
+        if (pc.z > 0) {
+            acc[29] += 1.0f;  // considered
+            const float3 pw = (T * float4(pc.xyz, 1)).xyz;
+            const float3 pm = (Mcw * float4(pw, 1)).xyz;
+            if (pm.z > 0) {
+                const int u = int(rint(a.mfx * pm.x / pm.z + a.mcx));
+                const int v = int(rint(a.mfy * pm.y / pm.z + a.mcy));
+                if (u >= 0 && v >= 0 && u < int(a.mw) && v < int(a.mh)) {
+                    const uint mi = uint(v) * a.mw + uint(u);
+                    const float4 q4 = mdl_pts[mi];
+                    if (q4.w > 0) {
+                        acc[30] += 1.0f;  // on model
+                        const float3 q = q4.xyz;
+                        const float3 nq = mdl_nrm[mi].xyz;
+                        const float r = dot(nq, pw - q);
+                        bool ok = !(abs(r) > a.gate || length(pw - q) > 2 * a.gate);
+                        const float3 ns = src_nrm[i].xyz;
+                        if (ok && dot(ns, ns) > 0) {
+                            const float3 nsw = (T * float4(ns, 0)).xyz;
+                            if (dot(nsw, nq) < a.cos_max) ok = false;
+                        }
+                        if (ok) {
+                            const float w_h = abs(r) <= a.huber ? 1.0f : a.huber / abs(r);
+                            const float w = w_h * src_w[i];
+                            float J[6];
+                            J[0] = nq.x; J[1] = nq.y; J[2] = nq.z;
+                            const float3 jr = cross(pw - c, nq);  // centred rotation Jacobian (better float precision)
+                            J[3] = jr.x; J[4] = jr.y; J[5] = jr.z;
+                            int k = 0;
+                            for (int r0 = 0; r0 < 6; ++r0)
+                                for (int c0 = r0; c0 < 6; ++c0) acc[k++] += w * J[r0] * J[c0];
+                            for (int j = 0; j < 6; ++j) acc[21 + j] -= w * J[j] * r;
+                            acc[27] += w * r * r;
+                            acc[28] += 1.0f;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    }
+    threadgroup float tg_sum[32 * 31];
+    for (int j = 0; j < 31; ++j) {
+        const float s = simd_sum(acc[j]);
+        if (lane == 0) tg_sum[simd_id * 31 + uint(j)] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lidx < 31) {
+        float s = 0;
+        for (uint g = 0; g < nsimd; ++g) s += tg_sum[g * 31 + lidx];
+        atomic_store_explicit(&partials[(tgid.y * tgs.x + tgid.x) * kP + lidx], s, memory_order_relaxed);
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);  // publish before arriving
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    threadgroup bool last;
+    if (lidx == 0) {
+        last = atomic_fetch_add_explicit(arrived, 1u, memory_order_relaxed) == tgs.x * tgs.y - 1;
+        if (last) atomic_store_explicit(arrived, 0u, memory_order_relaxed);  // ready for the next iteration
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!last) return;
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);  // see every partial
+    threadgroup SolveShared sh;
+    solve_step(st, partials, sa, markers, disp, sh, lidx, 256, lane, simd_id, nsimd);
 }
 
 // ---- normal-space balancing weights (mirrors track::normal_balance_weights) ----

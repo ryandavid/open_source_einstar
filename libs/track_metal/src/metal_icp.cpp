@@ -74,9 +74,10 @@ SE3 load(const float* src) {
 
 struct MetalIcp::Impl {
     std::shared_ptr<gpu::Context> ctx;
-    Ref<MTL::ComputePipelineState> level_begin, accumulate, solve, bal_hist, bal_bins, bal_apply;
+    Ref<MTL::ComputePipelineState> level_begin, iterate, bal_hist, bal_bins, bal_apply;
     Ref<MTL::Buffer> hist, w_bin;
-    Ref<MTL::Buffer> state, partials, markers, dispatch;  // dispatch: LevelDispatch per level (6 uints)
+    Ref<MTL::Buffer> state, partials, markers, arrived;
+    Ref<MTL::Buffer> dispatch;  // indirect threadgroup counts of each level's iterations (3 uints per level)
     Ref<MTL::Buffer> src_pts, src_nrm, src_w, mdl_pts, mdl_nrm;
     std::size_t src_n = 0, mdl_n = 0;
     // Cache of the last uploaded frame (the tracker calls ICP several times per frame).
@@ -94,14 +95,15 @@ Result<std::unique_ptr<MetalIcp>> MetalIcp::create(std::shared_ptr<gpu::Context>
     im->ctx = std::move(ctx);
     auto lib = im->ctx->library("icp", kSource);
     if (!lib) return std::unexpected(lib.error());
-    for (auto [name, slot] : {std::pair{"icp_level_begin", &im->level_begin}, std::pair{"icp_accumulate", &im->accumulate},
-                              std::pair{"icp_solve", &im->solve}, std::pair{"balance_hist", &im->bal_hist},
+    for (auto [name, slot] : {std::pair{"icp_level_begin", &im->level_begin}, std::pair{"icp_iterate", &im->iterate},
+                              std::pair{"balance_hist", &im->bal_hist},
                               std::pair{"balance_bins", &im->bal_bins}, std::pair{"balance_apply", &im->bal_apply}}) {
         auto p = im->ctx->compute_pipeline(*lib, name);
         if (!p) return std::unexpected(p.error());
         *slot = std::move(*p);
     }
     im->state = im->ctx->buffer(sizeof(IcpState));
+    im->arrived = im->ctx->buffer(4);  // zeroed on allocation; reset by icp_level_begin and each iteration
     im->hist = im->ctx->buffer(128 * 4);
     im->w_bin = im->ctx->buffer(128 * 4);
     return std::unique_ptr<MetalIcp>(new MetalIcp(std::move(im)));
@@ -251,8 +253,8 @@ track::IcpResult MetalIcp::solve(const track::DepthFrame& frame, const track::Ra
     // Partials buffer sized for the finest level.
     const std::size_t max_groups = static_cast<std::size_t>((W + 15) / 16) * static_cast<std::size_t>((H + 15) / 16);
     if (!im.partials || im.partials->length() < max_groups * 32 * 4) im.partials = im.ctx->buffer(max_groups * 32 * 4);
-    if (!im.dispatch || im.dispatch->length() < static_cast<std::size_t>(p.levels) * 24)
-        im.dispatch = im.ctx->buffer(static_cast<std::size_t>(p.levels) * 24);
+    if (!im.dispatch || im.dispatch->length() < static_cast<std::size_t>(p.levels) * 12)
+        im.dispatch = im.ctx->buffer(static_cast<std::size_t>(p.levels) * 12);
 
     NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
     MTL::CommandBuffer* cmd = im.ctx->queue()->commandBuffer();
@@ -278,25 +280,15 @@ track::IcpResult MetalIcp::solve(const track::DepthFrame& frame, const track::Ra
         // Accumulate grid in whole threadgroups (the kernel bounds-checks its pixels); launched
         // indirectly so iterations after convergence cost nothing.
         const std::uint32_t acc_groups[2] = {static_cast<std::uint32_t>((gw + 15) / 16), static_cast<std::uint32_t>((gh + 15) / 16)};
-        const auto disp_offset = static_cast<NS::UInteger>(level) * 24;
+        const auto disp_offset = static_cast<NS::UInteger>(level) * 12;
         enc->setComputePipelineState(im.level_begin.get());
         enc->setBuffer(im.state.get(), 0, 0);
         enc->setBuffer(im.dispatch.get(), disp_offset, 1);
         enc->setBytes(acc_groups, sizeof(acc_groups), 2);
+        enc->setBuffer(im.arrived.get(), 0, 3);
         enc->dispatchThreads(MTL::Size(1, 1, 1), MTL::Size(1, 1, 1));
         enc->memoryBarrier(MTL::BarrierScopeBuffers);
         for (int it = 0; it < iters; ++it) {
-            enc->setComputePipelineState(im.accumulate.get());
-            enc->setBuffer(src_pts, 0, 0);
-            enc->setBuffer(src_nrm, 0, 1);
-            enc->setBuffer(im.src_w.get(), 0, 2);
-            enc->setBuffer(mdl_pts, 0, 3);
-            enc->setBuffer(mdl_nrm, 0, 4);
-            enc->setBuffer(im.state.get(), 0, 5);
-            enc->setBuffer(im.partials.get(), 0, 6);
-            enc->setBytes(&aa, sizeof(aa), 7);
-            enc->dispatchThreadgroups(im.dispatch.get(), disp_offset, MTL::Size(16, 16, 1));
-            enc->memoryBarrier(MTL::BarrierScopeBuffers);
             SolveArgs sa{};
             sa.num_partials = groups;
             sa.final_level = level == 0 ? 1u : 0u;
@@ -307,13 +299,20 @@ track::IcpResult MetalIcp::solve(const track::DepthFrame& frame, const track::Ra
             sa.c[0] = aa.c[0], sa.c[1] = aa.c[1], sa.c[2] = aa.c[2];
             sa.marker_count = marker_count;
             sa.marker_weight = static_cast<float>(p.marker_weight);
-            enc->setComputePipelineState(im.solve.get());
-            enc->setBuffer(im.state.get(), 0, 0);
-            enc->setBuffer(im.partials.get(), 0, 1);
-            enc->setBytes(&sa, sizeof(sa), 2);
-            enc->setBuffer(im.markers.get(), 0, 3);
-            enc->setBuffer(im.dispatch.get(), disp_offset, 4);
-            enc->dispatchThreadgroups(im.dispatch.get(), disp_offset + 12, MTL::Size(256, 1, 1));
+            enc->setComputePipelineState(im.iterate.get());
+            enc->setBuffer(src_pts, 0, 0);
+            enc->setBuffer(src_nrm, 0, 1);
+            enc->setBuffer(im.src_w.get(), 0, 2);
+            enc->setBuffer(mdl_pts, 0, 3);
+            enc->setBuffer(mdl_nrm, 0, 4);
+            enc->setBuffer(im.state.get(), 0, 5);
+            enc->setBuffer(im.partials.get(), 0, 6);
+            enc->setBytes(&aa, sizeof(aa), 7);
+            enc->setBytes(&sa, sizeof(sa), 8);
+            enc->setBuffer(im.markers.get(), 0, 9);
+            enc->setBuffer(im.dispatch.get(), disp_offset, 10);
+            enc->setBuffer(im.arrived.get(), 0, 11);
+            enc->dispatchThreadgroups(im.dispatch.get(), disp_offset, MTL::Size(16, 16, 1));
             enc->memoryBarrier(MTL::BarrierScopeBuffers);
         }
     }
