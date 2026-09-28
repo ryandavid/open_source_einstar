@@ -4,8 +4,11 @@
 #include <cmath>
 #include <future>
 
+#include <Eigen/Eigenvalues>
+
 #include "einstar/core/log.hpp"
 #include "einstar/core/timing.hpp"
+#include "einstar/gpu/device_data.hpp"
 #include "einstar/depth/point_image.hpp"
 
 namespace einstar::pipeline {
@@ -78,6 +81,21 @@ struct FrameAccess {
         }
         return frame->points(x, y);
     }
+    // Writes a point (CPU images, or the GPU frame's shared buffers in place).
+    void set(int x, int y, const Vec3f& p, const Vec3f& n, float w) const {
+        const auto i = static_cast<std::size_t>(y) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x);
+        if (const auto* md = dynamic_cast<const gpu::MetalFrameData*>(frame->device.get())) {
+            auto* P = static_cast<float*>(md->points_buffer()->contents()) + 4 * i;
+            auto* N = static_cast<float*>(md->normals_buffer()->contents()) + 4 * i;
+            P[0] = p.x(), P[1] = p.y(), P[2] = p.z(), P[3] = 1.0f;
+            N[0] = n.x(), N[1] = n.y(), N[2] = n.z(), N[3] = 0.0f;
+            static_cast<float*>(md->weights_buffer()->contents())[i] = w;
+            return;
+        }
+        frame->points(x, y) = p;
+        frame->normals(x, y) = n;
+        if (!frame->weights.empty()) frame->weights(x, y) = w;
+    }
     [[nodiscard]] Vec3f normal(int x, int y) const {
         if (dev_normals) {
             const float* n = dev_normals + 4 * (static_cast<std::size_t>(y) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x));
@@ -86,6 +104,67 @@ struct FrameAccess {
         return frame->normals(x, y);
     }
 };
+
+void fill_marker_hole(const FrameAccess& fa, const track::Intrinsics& k, const StereoFrontendParams& params, const markers::Marker3D& m,
+                      double radius_full) {
+    // The retro-reflective sticker (and its dark ring) returns no speckle depth. It sits flat on the
+    // surface, so the surface around it, fitted as a plane, fills the hole: no dimple in the model,
+    // and tracking gets that little bit of surface back.
+    const double cx = m.left_rect.x() * 0.5, cy = m.left_rect.y() * 0.5, r_half = radius_full * 0.5;
+    const double r_fill = 2.0 * r_half, r1 = r_fill + std::max(3.0, 0.8 * r_half);
+    const int R = static_cast<int>(std::ceil(r1));
+    const int ix = static_cast<int>(std::lround(cx)), iy = static_cast<int>(std::lround(cy));
+    std::vector<Vec3> ring;
+    for (int y = std::max(0, iy - R); y <= std::min(fa.height - 1, iy + R); ++y)
+        for (int x = std::max(0, ix - R); x <= std::min(fa.width - 1, ix + R); ++x) {
+            const double d2 = (x - cx) * (x - cx) + (y - cy) * (y - cy);
+            if (d2 < r_fill * r_fill || d2 > r1 * r1) continue;
+            const Vec3f p = fa.point(x, y);
+            if (p.z() > 0) ring.push_back(p.cast<double>());
+        }
+    if (ring.size() < 12) return;
+    // Robust plane: least squares, then again on the points within 2.5x the median residual (stereo
+    // errors bleed from the textureless ring into its surroundings).
+    Vec3 c = Vec3::Zero(), n = Vec3::UnitZ();
+    double rms = 0;
+    for (int pass = 0; pass < 2; ++pass) {
+        c.setZero();
+        for (const auto& p : ring) c += p;
+        c /= static_cast<double>(ring.size());
+        Mat3 cov = Mat3::Zero();
+        for (const auto& p : ring) cov += (p - c) * (p - c).transpose();
+        const Eigen::SelfAdjointEigenSolver<Mat3> es(cov);
+        n = es.eigenvectors().col(0);
+        rms = std::sqrt(std::max(0.0, es.eigenvalues()(0)) / static_cast<double>(ring.size()));
+        if (pass == 1) break;
+        std::vector<double> res;
+        for (const auto& p : ring) res.push_back(std::abs(n.dot(p - c)));
+        auto mid = res.begin() + static_cast<std::ptrdiff_t>(res.size() / 2);
+        std::nth_element(res.begin(), mid, res.end());
+        const double gate = std::max(0.05, 2.5 * *mid);
+        std::erase_if(ring, [&](const Vec3& p) { return std::abs(n.dot(p - c)) > gate; });
+        if (ring.size() < 12) return;
+    }
+    if (n.dot(c) > 0) n = -n;  // towards the camera
+    // Only flat surroundings, and the marker itself must lie on that plane.
+    // Stereo depth noise grows with the square of the distance.
+    const double zr = m.position.z() / 300.0;
+    if (rms > params.marker_fill_max_rms_mm * std::max(1.0, zr * zr) || std::abs(n.dot(m.position - c)) > params.marker_fill_max_offset_mm)
+        return;
+    const Vec3f nf = n.cast<float>();
+    for (int y = std::max(0, iy - R); y <= std::min(fa.height - 1, iy + R); ++y)
+        for (int x = std::max(0, ix - R); x <= std::min(fa.width - 1, ix + R); ++x) {
+            // The whole sticker (disc and ring) is textureless for stereo: its depth is either missing
+            // or guessed, so all of it is replaced.
+            if ((x - cx) * (x - cx) + (y - cy) * (y - cy) > r_fill * r_fill) continue;
+            const Vec3 dir((x - k.cx) / k.fx, (y - k.cy) / k.fy, 1.0);
+            const double den = n.dot(dir);
+            if (std::abs(den) < 1e-6) continue;
+            const double t = n.dot(c) / den;
+            if (t <= 0) continue;
+            fa.set(x, y, (t * dir).cast<float>(), nf, params.marker_fill_weight);
+        }
+}
 
 }  // namespace
 
@@ -153,8 +232,11 @@ void StereoFrontend::add_markers(const ImageU8& raw_left, const ImageU8& raw_rig
     }
     for (std::size_t i = 0; i < left.size(); ++i)
         if (!used[i]) out.unmatched_left.push_back(marker_stereo_->rectify_left(left[i].center));
+    if (params_.fill_marker_holes)
+        for (const auto& m : out.markers) fill_marker_hole(fa, depth_k_, params_, m, left[static_cast<std::size_t>(m.left_index)].a);
     out.marker_ms = sw.elapsed_ms();
 }
+
 
 DepthOutput StereoFrontend::process(const ImageU8& raw_left, const ImageU8& raw_right) const {
     Stopwatch sw;

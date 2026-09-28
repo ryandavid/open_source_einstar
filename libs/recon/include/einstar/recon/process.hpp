@@ -64,6 +64,14 @@ struct ProcessParams {
     // of them overlaps the main model and less than this fraction of the overlap agrees with it.
     double island_min_overlap = 0.2;
     double island_min_agreement = 0.6;
+    // Lost-frame recovery: frames live tracking rejected are registered against the final model.
+    bool recover_lost_frames = true;
+    float recover_start_distance_mm = 8.0f;  // wide initial gate: lost frames are often fast motion
+    double recover_min_fitness = 0.7;
+    double recover_max_rms_mm = 0.3;
+    double recover_min_eigen_ratio = 2e-3;   // ambiguous (sliding) geometry is not trusted
+    double recover_max_correction_mm = 40.0;
+    double recover_max_correction_deg = 15.0;
     bool use_markers = true;
     double marker_sigma_mm = 0.08;
     double marker_consistency_mm = 3.0;     // observations this far from their landmark are dropped
@@ -91,6 +99,7 @@ struct ProcessReport {
     double max_correction_mm = 0, max_correction_deg = 0;  // largest change of a frame pose
     double median_correction_mm = 0;
     int frames_refined = 0;       // by frame-to-model registration (last round)
+    int frames_recovered = 0;     // untracked live, registered against the final model
     int graph_iterations = 0;
     int islands = 0;              // segments with no verified link to the main model
     int islands_excluded = 0;     // ... that contradicted it and were left out of the fusion

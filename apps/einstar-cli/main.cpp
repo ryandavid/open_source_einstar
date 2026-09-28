@@ -414,6 +414,7 @@ int process_cmd(const char* path, std::span<char*> args) {
     pp.chain_sigma_mm = arg_double(args, "--chain-mm", pp.chain_sigma_mm);
     pp.fragment_frames = static_cast<int>(arg_int(args, "--fragment-frames", pp.fragment_frames));
     pp.use_markers = !has_flag(args, "--no-markers");
+    pp.recover_lost_frames = !has_flag(args, "--no-recover");
     pp.marker_sigma_mm = arg_double(args, "--marker-sigma", pp.marker_sigma_mm);
     std::string last_stage;
     pp.progress = [&](const std::string& stage, double) {
@@ -434,7 +435,8 @@ int process_cmd(const char* path, std::span<char*> args) {
                  rep.graph_iterations, rep.marker_landmarks, rep.marker_observations);
     std::println("pose corrections: median {:.2f} mm, max {:.2f} mm / {:.2f} deg; {} frames refined against the model",
                  rep.median_correction_mm, rep.max_correction_mm, rep.max_correction_deg, rep.frames_refined);
-    std::println("islands: {} unverified segments, {} excluded ({} frames)", rep.islands, rep.islands_excluded, rep.frames_excluded);
+    std::println("islands: {} unverified segments, {} excluded ({} frames); {} lost frames recovered", rep.islands, rep.islands_excluded,
+                 rep.frames_excluded, rep.frames_recovered);
     std::println("mesh: {} vertices, {} triangles ({} small pieces removed)", rep.vertices, rep.triangles, rep.cleanup.removed_components);
     std::string times;
     for (const auto& [stage, ms] : rep.stage_ms) times += std::format(" {} {:.1f} s,", stage, ms / 1000.0);
@@ -474,6 +476,15 @@ int process_cmd(const char* path, std::span<char*> args) {
                      opt_t.size(), percentile(live_t, 0.5), percentile(live_t, 0.95), percentile(live_r, 0.5), percentile(live_r, 0.95),
                      percentile(opt_t, 0.5), percentile(opt_t, 0.95), percentile(opt_r, 0.5), percentile(opt_r, 0.95));
         std::println("frames > 3 mm from EXStar: live only {}, processed only {}, both {}", bad_to_good, good_to_bad, bad_both);
+        std::vector<double> rec_err;
+        for (const auto& [i, T] : r->frame_poses) {
+            if ((*s)->meta(i).accepted()) continue;
+            const auto it = exstar.find((*s)->meta(i).index);
+            if (it != exstar.end()) rec_err.push_back(translation_norm(it->second.inverse() * T));
+        }
+        if (!rec_err.empty())
+            std::println("recovered frames vs EXStar ({}): median {:.2f} mm p95 {:.2f} mm, {} beyond 3 mm", rec_err.size(), percentile(rec_err, 0.5),
+                         percentile(rec_err, 0.95), std::ranges::count_if(rec_err, [](double e) { return e > 3.0; }));
         // The process step fixes only the first frame, so the whole scan may differ from EXStar's by a
         // rigid transform; compare after the best rigid alignment of the camera centres.
         auto aligned = [&](bool processed) {

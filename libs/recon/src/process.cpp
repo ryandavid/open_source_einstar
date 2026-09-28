@@ -448,6 +448,79 @@ Result<ProcessResult> process_session(const session::SessionReader& s, const Pro
     std::ranges::nth_element(corr, corr.begin() + static_cast<std::ptrdiff_t>(corr.size() / 2));
     rep.median_correction_mm = corr[corr.size() / 2];
 
+    // ---- Lost-frame recovery ---------------------------------------------------------------------
+    // Frames live tracking rejected are re-tracked against the complete model: each run of lost
+    // frames is walked inward from both ends, starting from the neighbouring pose.
+    if (params.recover_lost_frames && !frags.empty()) {
+        sw.reset();
+        Cloud model;
+        for (const auto& f : frags) {
+            const auto it = out.frame_poses.find(f.anchor);
+            if (it == out.frame_poses.end()) continue;  // excluded island
+            const auto c = transformed(f.cloud, it->second);
+            model.points.insert(model.points.end(), c.points.begin(), c.points.end());
+            model.normals.insert(model.normals.end(), c.normals.begin(), c.normals.end());
+        }
+        model = voxel_downsample(model, params.cloud_voxel_mm);
+        const CloudIndex model_index(model);
+        // Runs of consecutive untracked frames with a tracked neighbour on at least one side.
+        std::vector<std::vector<std::size_t>> runs;
+        for (std::size_t i = 0; i < s.frame_count(); ++i) {
+            if (out.frame_poses.contains(i) || s.meta(i).accepted()) continue;  // tracked (or excluded) frames
+            if (runs.empty() || runs.back().back() + 1 != i) runs.emplace_back();
+            runs.back().push_back(i);
+        }
+        RegistrationParams rp = params.registration;
+        rp.start_distance_mm = params.recover_start_distance_mm;
+        rp.iterations = 40;
+        std::mutex mtx;
+        std::atomic<int> recovered{0}, done{0};
+        tbb::parallel_for(std::size_t{0}, runs.size(), [&](std::size_t ri) {
+            if (cancelled(params)) return;
+            const auto& run = runs[ri];
+            auto pose_of = [&](std::size_t i) -> std::optional<SE3> {
+                std::lock_guard lock(mtx);
+                const auto it = out.frame_poses.find(i);
+                return it == out.frame_poses.end() ? std::nullopt : std::optional<SE3>(it->second);
+            };
+            std::map<std::size_t, SE3> found;
+            auto try_frame = [&](std::size_t i, const SE3& guess) -> bool {
+                auto rec = s.read(i);
+                if (!rec) return false;
+                const auto cloud = voxel_downsample(frame_cloud(rec->depth_frame(k), SE3::Identity(), params.refine_stride_px), params.cloud_voxel_mm);
+                if (cloud.size() < 200) return false;
+                const auto r = register_point_to_plane(cloud, model_index, guess, rp);
+                const SE3 d = guess.inverse() * r.T_target_source;
+                if (!r.converged || r.fitness < params.recover_min_fitness || r.rms_mm > params.recover_max_rms_mm ||
+                    r.min_eigen_ratio < params.recover_min_eigen_ratio || translation_norm(d) > params.recover_max_correction_mm ||
+                    rotation_angle(d) * 180.0 / M_PI > params.recover_max_correction_deg)
+                    return false;
+                found[i] = r.T_target_source;
+                return true;
+            };
+            // Forward from the frame before the run, backward from the frame after it.
+            std::optional<SE3> fwd = run.front() > 0 ? pose_of(run.front() - 1) : std::nullopt;
+            std::size_t a = 0;
+            for (; fwd && a < run.size(); ++a) {
+                if (!try_frame(run[a], *fwd)) break;
+                fwd = found[run[a]];
+            }
+            std::optional<SE3> bwd = pose_of(run.back() + 1);
+            for (std::size_t b = run.size(); bwd && b > a; --b) {
+                if (!try_frame(run[b - 1], *bwd)) break;
+                bwd = found[run[b - 1]];
+            }
+            std::lock_guard lock(mtx);
+            for (const auto& [i, T] : found) out.frame_poses[i] = T;
+            recovered += static_cast<int>(found.size());
+            progress(params, "Recovering lost frames", static_cast<double>(++done) / static_cast<double>(runs.size()));
+        });
+        rep.frames_recovered = recovered;
+        rep.stage_ms["recover"] = sw.elapsed_ms();
+        log::info("process: recovered {} of {} lost frames", recovered.load(),
+                  std::accumulate(runs.begin(), runs.end(), std::size_t{0}, [](std::size_t n, const auto& r) { return n + r.size(); }));
+    }
+
     // ---- 3. Re-fusion ---------------------------------------------------------------------------
     sw.reset();
     std::unique_ptr<track::Volume> volume;

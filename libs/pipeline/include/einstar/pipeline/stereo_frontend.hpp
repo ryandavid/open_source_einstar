@@ -27,6 +27,11 @@ struct StereoFrontendParams {
     bool detect_markers = true;
     markers::DetectParams marker_detect;
     markers::StereoParams marker_stereo{.require_prior = true};
+    // Fill the depth hole under each stereo marker from a plane fitted to the surrounding surface.
+    bool fill_marker_holes = true;
+    double marker_fill_max_rms_mm = 0.2;     // surroundings must be this flat (at 300 mm; scales with z^2)
+    double marker_fill_max_offset_mm = 1.0;  // and the marker must lie on them
+    float marker_fill_weight = 0.5f;
 };
 
 struct DepthOutput {
