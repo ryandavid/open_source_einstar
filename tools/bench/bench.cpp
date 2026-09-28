@@ -1,0 +1,104 @@
+// Stage-by-stage timing of the depth + tracking path (CPU reference vs GPU once ported).
+#include <filesystem>
+#include <functional>
+#include <print>
+
+#include "einstar/calib/device_calibration.hpp"
+#include "einstar/core/timing.hpp"
+#include "einstar/depth/point_image.hpp"
+#include "einstar/depth/stereo.hpp"
+#include "einstar/fixtures/exstar_project.hpp"
+#include "einstar/pipeline/stereo_frontend.hpp"
+#include "einstar/synth/speckle_scene.hpp"
+#include "einstar/track/icp.hpp"
+#include "einstar/track/tsdf.hpp"
+
+using namespace einstar;
+
+static void time_it(const char* name, int n, const std::function<void()>& f) {
+    f();  // warm-up
+    TimingStats st(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        Stopwatch sw;
+        f();
+        st.add(sw.elapsed_ms());
+    }
+    std::println("{:28} median {:7.2f} ms  p95 {:7.2f} ms", name, st.median(), st.percentile(0.95));
+}
+
+int main() {
+    auto cal = calib::load_ccf_directory("/Applications/EXStar.app/Contents/Resources/res/Einscan-E10/200x150");
+    if (!cal) {
+        std::println(stderr, "needs EXStar calibration cache");
+        return 1;
+    }
+    const auto rig = cal->rig();
+    const SE3 T_lr = rig.T_right_left.inverse();
+    synth::Scene scene;
+    scene.primitives.push_back(synth::Plane{Vec3(0, 70, 0), Vec3(0, -1, 0)});
+    scene.primitives.push_back(synth::Sphere{Vec3(-80, 20, 20), 45.0});
+    synth::Projector proj;
+    proj.model.fx = proj.model.fy = 800;
+    proj.model.cx = 640;
+    proj.model.cy = 400;
+    proj.pattern = synth::DotPattern::random(1280, 800, 9000, 3.5, 11);
+    SE3 T_wl = SE3::Identity();
+    T_wl.linear() = Eigen::AngleAxisd(11.07 * M_PI / 180, Vec3::UnitY()).toRotationMatrix();
+    T_wl.translation() = Vec3(-160, -40, -260);
+    proj.T_world_projector = T_wl;
+    proj.T_world_projector.translation() = T_wl * (0.5 * T_lr.translation());
+    synth::RenderParams rp;
+    rp.supersample = 1;
+    const auto l = synth::render_view(scene, proj, rig.left, T_wl, rp);
+    const auto r = synth::render_view(scene, proj, rig.right, T_wl * T_lr, rp);
+
+    pipeline::StereoFrontend fe(rig);
+    const auto& rect = fe.rectification();
+    const auto map_l = calib::build_remap(rig.left, rect.R_left, rect.rectified);
+    ImageU8 rl, rr, hl, hr;
+    std::println("== stereo (1280x1024 raw -> 640x512 depth) ==");
+    time_it("remap x2 (full res)", 20, [&] {
+        rl = calib::remap(l.image.view(), map_l);
+        rr = calib::remap(r.image.view(), map_l);
+    });
+    time_it("downsample x2", 20, [&] {
+        hl = depth::downsample2(rl.view());
+        hr = depth::downsample2(rr.view());
+    });
+    const auto ql = depth::downsample2(hl.view()), qr = depth::downsample2(hr.view());
+    depth::StereoParams sp;
+    sp.pyramid_levels = 1;
+    const auto& g = rect.geometry;
+    sp.sgm.min_disparity = static_cast<int>(g.disparity_from_depth(700) / 4) - 2;
+    sp.sgm.num_disparities = static_cast<int>(g.disparity_from_depth(150) / 4) - sp.sgm.min_disparity + 4;
+    time_it("SGM quarter res", 10, [&] { (void)depth::sgm_disparity(ql.view(), qr.view(), sp.sgm, true); });
+    depth::StereoResult sr;
+    time_it("compute_disparity total", 10, [&] { sr = depth::compute_disparity(hl.view(), hr.view(), sp); });
+    time_it("disparity_to_points", 20, [&] { (void)depth::disparity_to_points(sr.disparity, sr.confidence, g); });
+    time_it("frontend.process total", 10, [&] { (void)fe.process(l.image, r.image); });
+
+    const auto mustang = std::filesystem::path(std::getenv("HOME")) / "Documents/EXStar/mustang_differential/Project1.ir_E10_prj";
+    auto proj_f = fixtures::ExstarProject::open(mustang);
+    if (!proj_f) return 0;
+    std::println("== tracking (EXStar fixture frames, model from 60 frames) ==");
+    track::TsdfVolume vol;
+    track::Intrinsics k;
+    track::DepthFrame df;
+    SE3 pose;
+    for (std::size_t i = 0; i < 60; ++i) {
+        auto f = (*proj_f)->read_frame(i);
+        k = {640, 512, f->intrinsics.fx, f->intrinsics.fy, f->intrinsics.cx, f->intrinsics.cy};
+        df = track::make_depth_frame(f->depth, k);
+        pose = f->T_world_camera;
+        vol.integrate(df, pose);
+    }
+    std::println("model bricks {}", vol.brick_count());
+    track::RaycastResult model;
+    time_it("raycast 320x256", 20, [&] { model = vol.raycast(pose, k.scaled(0.5)); });
+    time_it("icp (3 levels)", 20, [&] { (void)track::icp_point_to_plane(df, model, pose, pose, {}); });
+    time_it("integrate", 20, [&] { vol.integrate(df, pose); });
+    time_it("make_depth_frame", 20, [&] { (void)track::make_depth_frame((*proj_f)->read_frame(60)->depth, k); });
+    const auto dirty = vol.bricks_updated_since(vol.frame_counter() - 1);
+    time_it("extract dirty bricks", 10, [&] { (void)vol.extract_points(dirty); });
+    return 0;
+}

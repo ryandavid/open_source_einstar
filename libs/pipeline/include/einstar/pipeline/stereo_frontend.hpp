@@ -2,16 +2,22 @@
 
 // Raw IR pair -> rectified half-resolution depth frame (640x512, like EXStar's point image).
 
+#include <memory>
+#include <mutex>
 #include <optional>
 
 #include "einstar/calib/rectify.hpp"
 #include "einstar/depth/stereo.hpp"
+#include "einstar/depth_metal/metal_stereo.hpp"
 #include "einstar/track/frame.hpp"
 #include "einstar/usb/stream.hpp"
 
 namespace einstar::pipeline {
 
+enum class StereoBackend { automatic, cpu, metal };
+
 struct StereoFrontendParams {
+    StereoBackend backend = StereoBackend::automatic;
     double min_depth_mm = 150.0;
     double max_depth_mm = 700.0;
     depth::RefineParams refine;
@@ -40,6 +46,7 @@ public:
     void set_left_sensor(int s) { left_sensor_ = s; }
 
     [[nodiscard]] const track::Intrinsics& depth_intrinsics() const { return depth_k_; }
+    [[nodiscard]] bool using_gpu() const { return metal_ != nullptr; }
     [[nodiscard]] const calib::StereoRectification& rectification() const { return rect_; }
 
 private:
@@ -49,6 +56,8 @@ private:
     depth::StereoParams stereo_;
     track::Intrinsics depth_k_;
     int left_sensor_ = 0;
+    std::unique_ptr<depth_metal::MetalStereo> metal_;
+    mutable std::mutex metal_mutex_;
 };
 
 }  // namespace einstar::pipeline

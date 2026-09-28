@@ -27,19 +27,44 @@ StereoFrontend::StereoFrontend(const RigCalibration& rig, StereoFrontendParams p
     const track::Intrinsics full{rect_.rectified.width, rect_.rectified.height, rect_.rectified.fx, rect_.rectified.fy,
                                  rect_.rectified.cx, rect_.rectified.cy};
     depth_k_ = full.scaled(0.5);
-    log::info("stereo frontend: rectified f {:.1f}, baseline {:.2f} mm, SGM disparities {}..{} at quarter res",
+
+    if (params_.backend != StereoBackend::cpu) {
+        auto ctx = gpu::Context::create();
+        auto m = ctx ? depth_metal::MetalStereo::create(*ctx, stereo_, rect_.rectified.width / 2, rect_.rectified.height / 2)
+                     : Result<std::unique_ptr<depth_metal::MetalStereo>>(std::unexpected(ctx.error()));
+        if (m && (*m)->set_rectification(map_left_, map_right_, rig.left.width, rig.left.height)) {
+            metal_ = std::move(*m);
+        } else if (params_.backend == StereoBackend::metal) {
+            log::error("Metal stereo unavailable: {}", m ? "rectification setup failed" : m.error().message);
+        }
+        if (!metal_) log::warn("stereo: falling back to the CPU implementation");
+    }
+    log::info("stereo frontend: rectified f {:.1f}, baseline {:.2f} mm, SGM disparities {}..{} at quarter res ({})",
               rect_.rectified.fx, g.baseline, stereo_.sgm.min_disparity,
-              stereo_.sgm.min_disparity + stereo_.sgm.num_disparities);
+              stereo_.sgm.min_disparity + stereo_.sgm.num_disparities, metal_ ? "Metal" : "CPU");
 }
 
 DepthOutput StereoFrontend::process(const ImageU8& raw_left, const ImageU8& raw_right) const {
     Stopwatch sw;
     DepthOutput out;
-    const ImageU8 rl = calib::remap(raw_left.view(), map_left_);
-    const ImageU8 rr = calib::remap(raw_right.view(), map_right_);
-    out.rectified_left = depth::downsample2(rl.view());
-    out.rectified_right = depth::downsample2(rr.view());
-    const auto stereo = depth::compute_disparity(out.rectified_left.view(), out.rectified_right.view(), stereo_);
+    depth::StereoResult stereo;
+    bool done = false;
+    if (metal_) {
+        std::lock_guard lock(metal_mutex_);
+        if (auto r = metal_->compute_raw(raw_left.view(), raw_right.view(), &out.rectified_left, &out.rectified_right)) {
+            stereo = std::move(*r);
+            done = true;
+        } else {
+            log::warn("Metal stereo failed ({}); using CPU for this frame", r.error().message);
+        }
+    }
+    if (!done) {
+        const ImageU8 rl = calib::remap(raw_left.view(), map_left_);
+        const ImageU8 rr = calib::remap(raw_right.view(), map_right_);
+        out.rectified_left = depth::downsample2(rl.view());
+        out.rectified_right = depth::downsample2(rr.view());
+        stereo = depth::compute_disparity(out.rectified_left.view(), out.rectified_right.view(), stereo_);
+    }
 
     // Disparity at half resolution -> depth with the half-resolution geometry.
     depth::RectifiedGeometry half = rect_.geometry;

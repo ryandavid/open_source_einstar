@@ -10,8 +10,8 @@ endfunction()
 einstar_add_test(test_core core/test_se3.cpp core/test_spsc_ring.cpp)
 target_link_libraries(test_core PRIVATE einstar::core)
 
-einstar_add_test(test_depth depth/test_stereo.cpp)
-target_link_libraries(test_depth PRIVATE einstar::depth einstar::synth)
+einstar_add_test(test_depth depth/test_stereo.cpp depth/test_metal_stereo.cpp)
+target_link_libraries(test_depth PRIVATE einstar::depth_metal einstar::synth)
 
 einstar_add_test(test_calib calib/test_rectify.cpp calib/test_device_calibration.cpp)
 target_link_libraries(test_calib PRIVATE einstar::calib)
