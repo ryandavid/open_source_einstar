@@ -292,6 +292,7 @@ int track_fixture(const char* path, std::span<char*> args) {
     int run_lost = 0;
     std::optional<SE3> prev_ours, prev_theirs;
     int gross = 0;
+    int gross_fit[4] = {};  // >20 mm frames by fit to the reference mesh: [ours*2 + exstar's]
     int accepted = 0, lost = 0, reloc = 0, degenerate = 0, processed = 0, marker_frames = 0;
     const SE3* first_ref = nullptr;
     SE3 ref0, prev_ref;
@@ -433,6 +434,23 @@ int track_fixture(const char* path, std::span<char*> args) {
                     }
                 }
             }
+            if (translation_norm(f->T_world_camera.inverse() * r.T_world_camera) > 20.0 && mesh_dist) {
+                // Who is wrong? Fit of the frame to the reference mesh at our pose and at EXStar's.
+                auto fit = [&](const SE3& pose) {
+                    std::vector<float> e;
+                    int far = 0;
+                    const Eigen::Matrix4f T = pose.matrix().cast<float>();
+                    for (const auto& p : fixtures::unproject(*f, 8)) {
+                        if (auto d = mesh_dist->distance((T * p.homogeneous()).head<3>(), 2.0f)) e.push_back(*d);
+                        else ++far;
+                    }
+                    if (e.empty()) return false;
+                    std::ranges::sort(e);
+                    return e[e.size() / 2] <= 0.5f && far <= static_cast<int>(e.size() + static_cast<std::size_t>(far)) / 10;
+                };
+                const bool ours = fit(r.T_world_camera), theirs = fit(f->T_world_camera);
+                ++gross_fit[(ours ? 2 : 0) + (theirs ? 1 : 0)];
+            }
             if (translation_norm(f->T_world_camera.inverse() * r.T_world_camera) > 20.0) {
                 if (gross == 0)
                     std::println("frame {:5} first gross error {:.1f} mm (state reloc={} rms {:.3f} inl {:.2f} cov {:.2f} eig {:.1e})", i,
@@ -477,6 +495,9 @@ int track_fixture(const char* path, std::span<char*> args) {
     std::println("relative pose error per frame: translation median {:.3f} mm p95 {:.3f} mm, rotation median {:.4f} deg p95 {:.4f} deg",
                  pct(rpe_t, 0.5), pct(rpe_t, 0.95), pct(rpe_r, 0.5), pct(rpe_r, 0.95));
     std::println("pose differs from EXStar by >20 mm: {} frames (includes equally valid poses on symmetric surfaces)", gross);
+    if (mesh_dist)
+        std::println(">20 mm frames against the reference mesh: both poses fit {}, only ours {}, only EXStar's {}, neither {}",
+                     gross_fit[3], gross_fit[2], gross_fit[1], gross_fit[0]);
     if (mesh_dist)
         std::println("geometric fit to reference mesh ({} sampled frames): median of medians {:.3f} mm, misfit frames {} ({:.1f}%)",
                      fit_checked, pct(fit_median, 0.5), fit_bad, 100.0 * fit_bad / std::max(1, fit_checked));
