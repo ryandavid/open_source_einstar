@@ -105,6 +105,24 @@ public:
     void reset(bool keep_fixed_markers = false);
 
 private:
+    struct FrameMarkers {
+        bool usable = false;  // marker alignment enabled and at least 3 in the frame
+        std::vector<Vec3> positions;
+        std::vector<double> diameters;
+    };
+    // Stages of process().
+    [[nodiscard]] FrameMarkers usable_markers(const DepthFrame& frame) const;
+    bool start(const DepthFrame& frame, const FrameMarkers& fm, TrackResult& out);  // first frame
+    [[nodiscard]] std::vector<SE3> seed_poses(double t) const;
+    [[nodiscard]] std::optional<markers::PoseEstimate> marker_pose(const FrameMarkers& fm, const SE3& predicted);
+    [[nodiscard]] std::optional<IcpResult> align(const DepthFrame& frame, const std::vector<SE3>& seeds,
+                                                 const std::optional<markers::PoseEstimate>& mpose, TrackResult& out, std::string& reason);
+    [[nodiscard]] std::optional<IcpResult> global_relocalise(const DepthFrame& frame, std::string& reason);
+    void mark_lost(TrackResult& out, const std::string& reason);
+    bool still_confirming(bool marker_pose, double t, TrackResult& out);  // true: result is final (not fused)
+    void fuse(const DepthFrame& frame, const FrameMarkers& fm, TrackResult& out);
+    void report_marker_ids(const FrameMarkers& fm, const SE3& T, TrackResult& out) const;
+
     [[nodiscard]] SE3 predict(double t) const;
     [[nodiscard]] std::optional<SE3> global_candidate(const DepthFrame& frame, std::string& why);
     [[nodiscard]] std::optional<std::string> check(const IcpResult& r, const SE3& from, double dt, bool strict) const;
