@@ -1,0 +1,97 @@
+#pragma once
+
+// Frame-to-model tracker: motion prediction, robust ICP against the fused TSDF, explicit
+// acceptance tests, lost/relocalisation state. Every frame gets a verdict; nothing is dropped
+// silently (rejected frames are reported with a reason).
+
+#include <deque>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "einstar/track/global_registration.hpp"
+#include "einstar/track/icp.hpp"
+#include "einstar/track/tsdf.hpp"
+
+namespace einstar::track {
+
+enum class TrackState { initializing, tracking, lost, confirming };
+
+struct TrackerParams {
+    TsdfParams tsdf;
+    IcpParams icp;
+    double model_scale = 0.5;           // raycast resolution relative to the depth frame
+    double min_inlier_ratio = 0.6;      // of source points that land on the model
+    double min_coverage = 0.15;         // of the frame that must overlap the model
+    int min_correspondences = 800;
+    double max_rms_mm = 0.45;
+    double max_speed_mm_s = 800.0;      // generous hand-motion limits, scaled by elapsed time
+    double max_rot_speed_deg_s = 240.0;
+    // Below this the pose is only weakly determined by geometry (e.g. surfaces of revolution): the
+    // frame is tracked but only extends the model into unobserved space.
+    double degenerate_eigen_ratio = 1e-4;
+    float degenerate_weight = 0.5f;
+    int relocalize_attempts_per_frame = 2;
+    // A relocalisation is only trusted after this many consecutive frames track consistently from
+    // it, under stricter thresholds; nothing is fused into the model until then.
+    int confirm_frames = 3;
+    double reloc_min_inlier_ratio = 0.75;
+    double reloc_min_coverage = 0.35;
+    double reloc_min_eigen_ratio = 1e-4;   // relocalising onto ambiguous (sliding) geometry is refused
+    // Global (pose-independent) relocalisation while lost.
+    bool global_relocalization = true;
+    int global_reloc_every = 3;            // attempt on every Nth lost frame (it costs ~50-150 ms)
+    GlobalRegistrationParams global;
+    double feature_model_rebuild_growth = 0.15;  // rebuild descriptors when the model grew by 15%
+};
+
+struct TrackResult {
+    TrackState state = TrackState::initializing;
+    SE3 T_world_camera = SE3::Identity();
+    IcpResult icp;
+    bool accepted = false;
+    bool integrated = false;
+    bool degenerate = false;
+    bool relocalized = false;
+    std::string reason;  // why a frame was rejected
+    double ms = 0;
+};
+
+class Tracker {
+public:
+    explicit Tracker(TrackerParams params = {});
+
+    TrackResult process(const DepthFrame& frame);
+    // Seed the pose of the first frame (e.g. from markers); otherwise identity.
+    void set_initial_pose(const SE3& T) { initial_pose_ = T; }
+
+    [[nodiscard]] TsdfVolume& volume() { return volume_; }
+    [[nodiscard]] const TsdfVolume& volume() const { return volume_; }
+    [[nodiscard]] TrackState state() const { return state_; }
+    [[nodiscard]] const SE3& last_good_pose() const { return last_pose_; }
+    void reset();
+
+private:
+    [[nodiscard]] SE3 predict(double t) const;
+    [[nodiscard]] std::optional<SE3> global_candidate(const DepthFrame& frame);
+    [[nodiscard]] std::optional<std::string> check(const IcpResult& r, const SE3& from, double dt, bool strict) const;
+
+    TrackerParams params_;
+    TsdfVolume volume_;
+    TrackState state_ = TrackState::initializing;
+    std::optional<SE3> initial_pose_;
+    SE3 last_pose_ = SE3::Identity();
+    SE3 prev_pose_ = SE3::Identity();
+    double last_time_ = 0, prev_time_ = 0;
+    bool have_velocity_ = false;
+    int degenerate_dirs_ = 0;              // unobservable directions at the last frame
+    Mat6 degenerate_basis_ = Mat6::Zero(); // (unit-scaled twist coordinates)
+    int confirm_count_ = 0;
+    int lost_frames_ = 0;
+    FeatureModel feature_model_;
+    std::size_t feature_model_bricks_ = 0;
+    std::uint32_t reloc_seed_ = 1;
+    SE3 lost_pose_ = SE3::Identity();  // last trusted pose before the loss
+};
+
+}  // namespace einstar::track

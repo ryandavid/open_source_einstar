@@ -1,0 +1,5 @@
+add_library(einstar_device src/einstar_device.cpp)
+add_library(einstar::device ALIAS einstar_device)
+target_include_directories(einstar_device PUBLIC include)
+target_link_libraries(einstar_device PUBLIC einstar::usb einstar::core)
+einstar_target_defaults(einstar_device)

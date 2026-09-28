@@ -1,0 +1,5 @@
+add_library(einstar_usb src/command.cpp src/stream.cpp src/libusb_transport.cpp)
+add_library(einstar::usb ALIAS einstar_usb)
+target_include_directories(einstar_usb PUBLIC include)
+target_link_libraries(einstar_usb PUBLIC einstar::core PRIVATE PkgConfig::LIBUSB)
+einstar_target_defaults(einstar_usb)

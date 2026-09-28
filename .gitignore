@@ -1,0 +1,26 @@
+# Build output
+build/
+out/
+CMakeUserPresets.json
+compile_commands.json
+.cache/
+
+# Reverse-engineering scratch: extracted vendor material, decrypted config dumps.
+# Never commit these (vendor code, and the config dump held account tokens).
+.re/
+
+# Vendor logs may contain credentials — never commit them.
+*.log
+
+# Local data
+/fixtures-data/
+*.estr
+*.pgm
+*.ppm
+
+# App / editor state
+imgui.ini
+.DS_Store
+.vscode/
+.idea/
+*.swp

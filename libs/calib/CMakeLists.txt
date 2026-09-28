@@ -1,0 +1,5 @@
+add_library(einstar_calib src/rectify.cpp src/device_calibration.cpp)
+add_library(einstar::calib ALIAS einstar_calib)
+target_include_directories(einstar_calib PUBLIC include)
+target_link_libraries(einstar_calib PUBLIC einstar::core einstar::depth PRIVATE TBB::tbb)
+einstar_target_defaults(einstar_calib)

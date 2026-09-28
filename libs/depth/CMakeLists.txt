@@ -1,0 +1,5 @@
+add_library(einstar_depth src/stereo.cpp src/point_image.cpp)
+add_library(einstar::depth ALIAS einstar_depth)
+target_include_directories(einstar_depth PUBLIC include)
+target_link_libraries(einstar_depth PUBLIC einstar::core PRIVATE TBB::tbb)
+einstar_target_defaults(einstar_depth)

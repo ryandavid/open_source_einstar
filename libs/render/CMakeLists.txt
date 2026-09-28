@@ -1,0 +1,10 @@
+add_library(einstar_render src/view_camera.cpp src/scene_renderer.cpp)
+add_library(einstar::render ALIAS einstar_render)
+target_include_directories(einstar_render PUBLIC include PRIVATE src)
+target_link_libraries(einstar_render PUBLIC einstar::gpu einstar::render_types Eigen3::Eigen)
+einstar_target_defaults(einstar_render)
+
+add_library(einstar_render_types INTERFACE)
+add_library(einstar::render_types ALIAS einstar_render_types)
+target_include_directories(einstar_render_types INTERFACE include)
+target_link_libraries(einstar_render_types INTERFACE Eigen3::Eigen)

@@ -1,0 +1,5 @@
+add_library(einstar_sim src/sim_transport.cpp)
+add_library(einstar::sim ALIAS einstar_sim)
+target_include_directories(einstar_sim PUBLIC include)
+target_link_libraries(einstar_sim PUBLIC einstar::usb einstar::core)
+einstar_target_defaults(einstar_sim)

@@ -1,0 +1,5 @@
+add_library(einstar_gpu src/metal_impl.cpp src/context.cpp)
+add_library(einstar::gpu ALIAS einstar_gpu)
+target_include_directories(einstar_gpu PUBLIC include)
+target_link_libraries(einstar_gpu PUBLIC einstar::core metal_cpp)
+einstar_target_defaults(einstar_gpu)

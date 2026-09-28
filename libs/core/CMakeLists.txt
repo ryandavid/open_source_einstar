@@ -1,0 +1,5 @@
+add_library(einstar_core src/log.cpp)
+add_library(einstar::core ALIAS einstar_core)
+target_include_directories(einstar_core PUBLIC include)
+target_link_libraries(einstar_core PUBLIC Eigen3::Eigen)
+einstar_target_defaults(einstar_core)

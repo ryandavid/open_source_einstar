@@ -1,0 +1,5 @@
+add_library(einstar_synth src/speckle_scene.cpp)
+add_library(einstar::synth ALIAS einstar_synth)
+target_include_directories(einstar_synth PUBLIC include)
+target_link_libraries(einstar_synth PUBLIC einstar::core PRIVATE TBB::tbb)
+einstar_target_defaults(einstar_synth)
