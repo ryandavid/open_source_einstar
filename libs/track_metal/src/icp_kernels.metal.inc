@@ -355,4 +355,53 @@ kernel void icp_solve(device IcpState* st [[buffer(0)]], device const float* par
     }
     if (converged) st->level_done = 1;
 }
+
+// ---- normal-space balancing weights (mirrors track::normal_balance_weights) ----
+struct BalanceArgs { uint w; uint h; float alpha; uint enabled; };
+
+inline int normal_bin(float3 n) {
+    const float theta = acos(clamp(n.z, -1.0f, 1.0f));
+    const float phi = atan2(n.y, n.x) + M_PI_F;
+    const int bt = min(7, int(theta / M_PI_F * 8.0f));
+    const int bp = min(15, int(phi / (2.0f * M_PI_F) * 16.0f));
+    return bt * 16 + bp;
+}
+
+kernel void balance_hist(device const float4* pts [[buffer(0)]], device const float4* nrm [[buffer(1)]],
+                         device atomic_uint* hist [[buffer(2)]], constant BalanceArgs& a [[buffer(3)]],
+                         uint2 gid [[thread_position_in_grid]], uint lidx [[thread_index_in_threadgroup]]) {
+    threadgroup atomic_uint local[128];
+    if (lidx < 128) atomic_store_explicit(&local[lidx], 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (gid.x < a.w && gid.y < a.h) {
+        const uint i = gid.y * a.w + gid.x;
+        const float3 n = nrm[i].xyz;
+        if (pts[i].z > 0 && dot(n, n) > 0) atomic_fetch_add_explicit(&local[normal_bin(n)], 1u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lidx < 128) {
+        const uint c = atomic_load_explicit(&local[lidx], memory_order_relaxed);
+        if (c) atomic_fetch_add_explicit(&hist[lidx], c, memory_order_relaxed);
+    }
+}
+
+kernel void balance_bins(device const uint* hist [[buffer(0)]], device float* w_bin [[buffer(1)]],
+                         constant BalanceArgs& a [[buffer(2)]], uint tid [[thread_position_in_grid]]) {
+    if (tid != 0) return;
+    uint total = 0, occupied = 0;
+    for (int b = 0; b < 128; ++b) { total += hist[b]; occupied += hist[b] > 0; }
+    const float mean = occupied ? float(total) / float(occupied) : 1.0f;
+    for (int b = 0; b < 128; ++b) w_bin[b] = hist[b] ? min(pow(mean / float(hist[b]), a.alpha), 20.0f) : 0.0f;
+}
+
+kernel void balance_apply(device const float4* nrm [[buffer(0)]], device const float* wts [[buffer(1)]],
+                          device const float* w_bin [[buffer(2)]], device float* src_w [[buffer(3)]],
+                          constant BalanceArgs& a [[buffer(4)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= a.w || gid.y >= a.h) return;
+    const uint i = gid.y * a.w + gid.x;
+    float w = max(0.1f, wts[i]);
+    const float3 n = nrm[i].xyz;
+    if (a.enabled && dot(n, n) > 0) w *= w_bin[normal_bin(n)];
+    src_w[i] = w;
+}
 )METAL"

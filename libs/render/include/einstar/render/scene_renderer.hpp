@@ -34,6 +34,10 @@ public:
     void set_frame_points(std::span<const PointVertex> points);
     void set_markers(std::span<const MarkerInstance> markers);
     void set_lines(std::span<const LineVertex> lines);  // pairs of vertices (line list)
+    // Zero-copy: draw PointVertex records that already live in a GPU buffer (the renderer keeps a
+    // reference; the producer must not modify the buffer afterwards).
+    void set_model_buffer(gpu::Ref<MTL::Buffer> buffer, std::size_t count);
+    void set_frame_buffer(gpu::Ref<MTL::Buffer> buffer, std::size_t count);
 
     [[nodiscard]] std::size_t model_point_count() const { return model_.count; }
 

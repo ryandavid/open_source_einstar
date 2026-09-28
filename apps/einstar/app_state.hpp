@@ -18,9 +18,16 @@
 namespace einstar::app {
 
 // Everything the render thread needs from the pipeline since the last UI frame.
+struct GpuPoints {
+    gpu::Ref<MTL::Buffer> buffer;  // render::PointVertex records
+    std::size_t count = 0;
+};
+
 struct RenderUpdate {
-    std::optional<std::vector<render::PointVertex>> model;  // full replacement when present
+    std::optional<std::vector<render::PointVertex>> model;  // full replacement when present (CPU path)
+    std::optional<GpuPoints> model_gpu;                     // full replacement when present (GPU path)
     std::vector<render::PointVertex> frame_points;
+    std::optional<GpuPoints> frame_gpu;
     std::vector<render::MarkerInstance> markers;
     std::vector<render::LineVertex> lines;
     ImageU8 ir_left, ir_right;

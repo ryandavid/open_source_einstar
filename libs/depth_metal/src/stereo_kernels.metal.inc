@@ -327,3 +327,126 @@ kernel void refine_slanted(device const uchar* left [[buffer(0)]], device const 
     out_conf[i] = best;
 }
 )METAL"
+R"METAL(
+// ---- speckle removal: union-find connected components (4-connectivity, |d_a - d_b| <= max_diff) ----
+struct CclArgs { uint w; uint h; float max_diff; uint min_size; };
+
+inline int ccl_find(device atomic_int* L, int x) {
+    int p = atomic_load_explicit(&L[x], memory_order_relaxed);
+    while (p != x) {
+        x = p;
+        p = atomic_load_explicit(&L[x], memory_order_relaxed);
+    }
+    return x;
+}
+
+inline void ccl_unite(device atomic_int* L, int a, int b) {
+    bool done = false;
+    while (!done) {
+        a = ccl_find(L, a);
+        b = ccl_find(L, b);
+        if (a < b) {
+            const int old = atomic_fetch_min_explicit(&L[b], a, memory_order_relaxed);
+            done = old == b;
+            b = old;
+        } else if (b < a) {
+            const int old = atomic_fetch_min_explicit(&L[a], b, memory_order_relaxed);
+            done = old == a;
+            a = old;
+        } else {
+            done = true;
+        }
+    }
+}
+
+kernel void ccl_init(device const float* disp [[buffer(0)]], device atomic_int* L [[buffer(1)]],
+                     device atomic_uint* sizes [[buffer(2)]], constant CclArgs& a [[buffer(3)]],
+                     uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= a.w || gid.y >= a.h) return;
+    const uint i = gid.y * a.w + gid.x;
+    atomic_store_explicit(&L[i], disp[i] >= 0 ? int(i) : -1, memory_order_relaxed);
+    atomic_store_explicit(&sizes[i], 0u, memory_order_relaxed);
+}
+
+kernel void ccl_merge(device const float* disp [[buffer(0)]], device atomic_int* L [[buffer(1)]],
+                      constant CclArgs& a [[buffer(2)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= a.w || gid.y >= a.h) return;
+    const uint i = gid.y * a.w + gid.x;
+    const float d = disp[i];
+    if (d < 0) return;
+    if (gid.x + 1 < a.w) {
+        const float dr = disp[i + 1];
+        if (dr >= 0 && abs(dr - d) <= a.max_diff) ccl_unite(L, int(i), int(i + 1));
+    }
+    if (gid.y + 1 < a.h) {
+        const float dd = disp[i + a.w];
+        if (dd >= 0 && abs(dd - d) <= a.max_diff) ccl_unite(L, int(i), int(i + a.w));
+    }
+}
+
+kernel void ccl_count(device const float* disp [[buffer(0)]], device atomic_int* L [[buffer(1)]],
+                      device atomic_uint* sizes [[buffer(2)]], constant CclArgs& a [[buffer(3)]],
+                      uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= a.w || gid.y >= a.h) return;
+    const uint i = gid.y * a.w + gid.x;
+    if (disp[i] < 0) return;
+    const int root = ccl_find(L, int(i));
+    atomic_fetch_add_explicit(&sizes[root], 1u, memory_order_relaxed);
+}
+
+kernel void ccl_filter(device float* disp [[buffer(0)]], device float* conf [[buffer(1)]], device atomic_int* L [[buffer(2)]],
+                       device const atomic_uint* sizes [[buffer(3)]], constant CclArgs& a [[buffer(4)]],
+                       uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= a.w || gid.y >= a.h) return;
+    const uint i = gid.y * a.w + gid.x;
+    if (disp[i] < 0) { conf[i] = 0.0f; return; }
+    const int root = ccl_find(L, int(i));
+    if (atomic_load_explicit(&sizes[root], memory_order_relaxed) < a.min_size) {
+        disp[i] = kInvalid;
+        conf[i] = 0.0f;
+    }
+}
+
+// ---- disparity -> organised points, normals, weights (mirrors depth::disparity_to_points) ----
+struct PointsArgs { uint w; uint h; float f; float cx; float cy; float baseline; float min_depth; float max_depth; float max_jump; };
+
+kernel void disparity_points(device const float* disp [[buffer(0)]], device const float* conf [[buffer(1)]],
+                             device float4* pts [[buffer(2)]], constant PointsArgs& a [[buffer(3)]],
+                             uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= a.w || gid.y >= a.h) return;
+    const uint i = gid.y * a.w + gid.x;
+    float4 p = float4(0);
+    const float d = disp[i];
+    if (d > 0) {
+        const float z = a.f * a.baseline / d;
+        if (z >= a.min_depth && z <= a.max_depth)
+            p = float4((float(gid.x) - a.cx) * z / a.f, (float(gid.y) - a.cy) * z / a.f, z, 1.0f);
+    }
+    pts[i] = p;
+}
+
+kernel void point_normals(device const float4* pts [[buffer(0)]], device const float* conf [[buffer(1)]],
+                          device float4* nrm [[buffer(2)]], device float* wts [[buffer(3)]], constant PointsArgs& a [[buffer(4)]],
+                          uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= a.w || gid.y >= a.h) return;
+    const uint i = gid.y * a.w + gid.x;
+    const float4 p = pts[i];
+    float w = p.w > 0 ? conf[i] : 0.0f;
+    float4 n = float4(0);
+    if (p.w > 0 && gid.x > 0 && gid.y > 0 && gid.x + 1 < a.w && gid.y + 1 < a.h) {
+        const float4 l = pts[i - 1], r = pts[i + 1], t = pts[i - a.w], b = pts[i + a.w];
+        if (l.w > 0 && r.w > 0 && t.w > 0 && b.w > 0 && abs(l.z - r.z) <= a.max_jump && abs(t.z - b.z) <= a.max_jump) {
+            float3 nn = cross(r.xyz - l.xyz, b.xyz - t.xyz);
+            const float len = length(nn);
+            if (len >= 1e-9f) {
+                nn /= len;
+                if (dot(nn, p.xyz) > 0) nn = -nn;
+                n = float4(nn, 0);
+                w *= max(0.0f, -dot(nn, normalize(p.xyz)));
+            }
+        }
+    }
+    nrm[i] = n;
+    wts[i] = w;
+}
+)METAL"

@@ -3,6 +3,7 @@
 #include "einstar/core/log.hpp"
 #include "einstar/gpu/context.hpp"
 #include "einstar/track_metal/metal_tsdf.hpp"
+#include "gpu_overlay.hpp"
 
 #include <algorithm>
 
@@ -86,6 +87,7 @@ ScanPipeline::ScanPipeline(std::unique_ptr<StereoFrontend> frontend, ScanPipelin
             if (auto icp = track_metal::MetalIcp::create(*ctx)) {
                 gpu_icp_ = std::move(*icp);
                 tracker_.set_icp_solver(gpu_icp_->as_function());
+                overlay_ = GpuOverlay::create(*ctx);
             }
         log::info("tracking: {} volume, {} ICP", tracker_.volume().fast_full_extraction() ? "Metal" : "CPU", gpu_icp_ ? "Metal" : "CPU");
     }
@@ -192,29 +194,54 @@ void ScanPipeline::process(usb::FrameGroup&& group) {
     up.last_good_pose = tracker_.last_good_pose();
     // Current frame overlay: green when tracked, red when not.
     const render::Rgba8 col = r.accepted ? render::Rgba8{90, 230, 120, 255} : render::Rgba8{235, 70, 70, 255};
-    const Eigen::Matrix4f T = r.T_world_camera.matrix().cast<float>();
+    const auto* dev = dynamic_cast<const gpu::MetalFrameData*>(depth->frame.device.get());
     double zsum = 0;
     int zn = 0;
-    const auto& pts = depth->frame.points;
-    for (int y = 0; y < pts.height(); y += params_.frame_point_step)
-        for (int x = 0; x < pts.width(); x += params_.frame_point_step) {
-            const Vec3f& p = pts(x, y);
-            if (p.z() <= 0) continue;
-            zsum += p.z();
-            ++zn;
-            const Vec3f w = (T * p.homogeneous()).head<3>();
-            const Vec3f n = T.topLeftCorner<3, 3>() * depth->frame.normals(x, y);
-            up.frame_points.push_back({w.x(), w.y(), w.z(), n.x(), n.y(), n.z(), col});
-        }
+    if (dev && overlay_) {
+        auto pts = overlay_->frame_points(*dev, r.T_world_camera, params_.frame_point_step, col);
+        up.frame_buffer = std::move(pts.buffer);
+        up.frame_buffer_count = pts.count;
+        // Mean depth from a sparse in-place read of the shared buffer.
+        const float* p = dev->points_xyzw();
+        for (int y = 0; y < dev->height(); y += 8)
+            for (int x = 0; x < dev->width(); x += 8) {
+                const float z = p[4 * (static_cast<std::size_t>(y) * static_cast<std::size_t>(dev->width()) + static_cast<std::size_t>(x)) + 2];
+                if (z > 0) {
+                    zsum += z;
+                    ++zn;
+                }
+            }
+    } else {
+        depth->frame.ensure_cpu();
+        const Eigen::Matrix4f T = r.T_world_camera.matrix().cast<float>();
+        const auto& pts = depth->frame.points;
+        for (int y = 0; y < pts.height(); y += params_.frame_point_step)
+            for (int x = 0; x < pts.width(); x += params_.frame_point_step) {
+                const Vec3f& p = pts(x, y);
+                if (p.z() <= 0) continue;
+                zsum += p.z();
+                ++zn;
+                const Vec3f w = (T * p.homogeneous()).head<3>();
+                const Vec3f n = T.topLeftCorner<3, 3>() * depth->frame.normals(x, y);
+                up.frame_points.push_back({w.x(), w.y(), w.z(), n.x(), n.y(), n.z(), col});
+            }
+    }
     stats_.mean_depth_mm = zn ? static_cast<float>(zsum / zn) : 0.0f;
 
     if (r.integrated && model_clock_.elapsed_ms() > params_.model_refresh_s * 1000.0) {
-        cache_.update(tracker_.volume());
-        up.model = cache_.flatten();
+        if (const auto* mv = dynamic_cast<const track_metal::MetalTsdfVolume*>(&tracker_.volume())) {
+            auto rp = mv->extract_render_points();
+            up.model_buffer = std::move(rp.buffer);
+            up.model_buffer_count = rp.count;
+            stats_.model_points = rp.count;
+        } else {
+            cache_.update(tracker_.volume());
+            up.model = cache_.flatten();
+            stats_.model_points = cache_.size();
+        }
         up.model_changed = true;
         model_clock_.reset();
     }
-    stats_.model_points = cache_.size();
     up.preview_left = std::move(depth->rectified_left);
     up.preview_right = std::move(depth->rectified_right);
     up.stats = stats_;

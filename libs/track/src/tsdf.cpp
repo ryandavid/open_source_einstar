@@ -65,6 +65,22 @@ bool robust_sample(VoxelReader& r, const Vec3f& g, float& out) {
 
 }  // namespace
 
+void RaycastResult::ensure_cpu() const {
+    if (!device || !points.empty()) return;
+    const int w = device->width(), h = device->height();
+    points = Image<Vec3f>(w, h, Vec3f::Zero());
+    normals = Image<Vec3f>(w, h, Vec3f::Zero());
+    valid = Image<std::uint8_t>(w, h, 0);
+    const float* p = device->points_xyzw();
+    const float* n = device->normals_xyzw();
+    for (std::size_t i = 0; i < static_cast<std::size_t>(w * h); ++i) {
+        if (p[4 * i + 3] == 0.0f) continue;
+        points.data()[i] = Vec3f(p[4 * i], p[4 * i + 1], p[4 * i + 2]);
+        normals.data()[i] = Vec3f(n[4 * i], n[4 * i + 1], n[4 * i + 2]);
+        valid.data()[i] = 1;
+    }
+}
+
 TsdfVolume::TsdfVolume(TsdfParams params) : params_(params), brick_mm_(params.voxel_mm * kBrickSize) {}
 
 BrickCoord TsdfVolume::brick_of(const Vec3f& p) const {
@@ -89,6 +105,7 @@ void TsdfVolume::clear() {
 }
 
 void TsdfVolume::integrate(const DepthFrame& frame, const SE3& T_world_camera, float weight_scale, bool extend_only) {
+    frame.ensure_cpu();
     const Eigen::Matrix4f T_wc = T_world_camera.matrix().cast<float>();
     const Eigen::Matrix4f T_cw = T_world_camera.inverse().matrix().cast<float>();
     const Vec3f cam_center = T_wc.block<3, 1>(0, 3);

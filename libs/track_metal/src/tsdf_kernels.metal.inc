@@ -308,4 +308,39 @@ kernel void extract(device const atomic_uint* keys [[buffer(0)]], device const a
     sp.w = w;
     out[slot] = sp;
 }
+
+// ---- surface extraction straight into render vertices (layout of render::PointVertex) ----
+struct RenderVertex { packed_float3 p; packed_float3 n; uchar4 color; };
+
+kernel void extract_render(device const atomic_uint* keys [[buffer(0)]], device const atomic_int* values [[buffer(1)]],
+                           device const half2* voxels [[buffer(2)]], device const int4* coords [[buffer(3)]],
+                           device RenderVertex* out [[buffer(4)]], device atomic_uint* out_count [[buffer(5)]],
+                           constant VolumeArgs& a [[buffer(6)]], constant uint& out_capacity [[buffer(7)]],
+                           uint3 tg3 [[threadgroup_position_in_grid]], uint3 lid [[thread_position_in_threadgroup]]) {
+    const uint brick = tg3.x;
+    const uint vi = brick * 512u + (lid.z * 8u + lid.y) * 8u + lid.x;
+    const half2 v = voxels[vi];
+    const float sdf = float(v.x), w = float(v.y);
+    if (w < a.min_weight || abs(sdf) > 0.5f * a.voxel / a.trunc) return;
+    const int3 g = coords[brick].xyz * kBrick + int3(lid);
+    VoxelReader r{keys, values, voxels, a.table_mask, int3(INT_MIN), -1};
+    float sx0, sx1, sy0, sy1, sz0, sz1, ww;
+    if (!r.get(g - int3(1, 0, 0), sx0, ww) || !r.get(g + int3(1, 0, 0), sx1, ww) || !r.get(g - int3(0, 1, 0), sy0, ww) ||
+        !r.get(g + int3(0, 1, 0), sy1, ww) || !r.get(g - int3(0, 0, 1), sz0, ww) || !r.get(g + int3(0, 0, 1), sz1, ww))
+        return;
+    float3 n = float3(sx1 - sx0, sy1 - sy0, sz1 - sz0);
+    const float len = length(n);
+    if (len < 1e-6f) return;
+    n /= len;
+    const uint slot = atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed);
+    if (slot >= out_capacity) return;
+    // Confidence shading (same map as the CPU path): well-observed surface lighter, thin coverage bluish.
+    const float c = clamp(w / 8.0f, 0.0f, 1.0f);
+    const float grey = 150.0f + 70.0f * c;
+    RenderVertex rv;
+    rv.p = packed_float3((float3(g) + 0.5f) * a.voxel - n * (sdf * a.trunc));
+    rv.n = packed_float3(n);
+    rv.color = uchar4(uchar(grey - 40.0f * (1 - c)), uchar(grey - 20.0f * (1 - c)), uchar(grey), 255);
+    out[slot] = rv;
+}
 )METAL"

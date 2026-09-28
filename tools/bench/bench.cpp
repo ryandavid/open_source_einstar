@@ -4,6 +4,8 @@
 #include <format>
 #include <functional>
 #include <print>
+#include <string_view>
+#include <vector>
 
 #include "einstar/calib/device_calibration.hpp"
 #include "einstar/core/timing.hpp"
@@ -13,6 +15,7 @@
 #include "einstar/pipeline/stereo_frontend.hpp"
 #include "einstar/synth/speckle_scene.hpp"
 #include "einstar/track/icp.hpp"
+#include "einstar/track/tracker.hpp"
 #include "einstar/track/tsdf.hpp"
 #include "einstar/track_metal/metal_icp.hpp"
 #include "einstar/track_metal/metal_tsdf.hpp"
@@ -30,7 +33,77 @@ static void time_it(const char* name, int n, const std::function<void()>& f) {
     std::println("{:28} median {:7.2f} ms  p95 {:7.2f} ms", name, st.median(), st.percentile(0.95));
 }
 
-int main() {
+// Full per-frame path (frontend + tracker) on pre-rendered emulated frames of a sweep.
+static void bench_pipeline(const RigCalibration& rig) {
+    const SE3 T_lr = rig.T_right_left.inverse();
+    synth::Scene scene;
+    scene.primitives.push_back(synth::Plane{Vec3(0, 70, 0), Vec3(0, -1, 0)});
+    scene.primitives.push_back(synth::Sphere{Vec3(-80, 20, 20), 45.0});
+    SE3 B = SE3::Identity();
+    B.linear() = Eigen::AngleAxisd(0.5, Vec3::UnitY()).toRotationMatrix();
+    B.translation() = Vec3(-10, 45, 40);
+    scene.primitives.push_back(synth::Box{B, Vec3(25, 25, 18)});
+    synth::Projector proj;
+    proj.model.fx = proj.model.fy = 800;
+    proj.model.cx = 640;
+    proj.model.cy = 400;
+    proj.pattern = synth::DotPattern::random(1280, 800, 9000, 3.5, 11);
+    const double half_toe = 0.5 * rotation_angle(rig.T_right_left);
+    std::vector<std::pair<ImageU8, ImageU8>> frames;
+    for (int f = 0; f < 40; ++f) {
+        const double t = 0.05 * f;
+        const Vec3 eye(-190 + 55 * t, -130 - 12 * t, -240);
+        const Vec3 target(-100 + 30 * t, 25, 10 + 10 * t);
+        const Vec3 fwd = (target - eye).normalized();
+        const Vec3 right = -Vec3(0, 1, 0).cross(fwd).normalized();
+        SE3 T = SE3::Identity();
+        T.linear().col(0) = right;
+        T.linear().col(1) = fwd.cross(right);
+        T.linear().col(2) = fwd;
+        T.translation() = eye;
+        T.linear() = T.linear() * Eigen::AngleAxisd(half_toe, Vec3::UnitY()).toRotationMatrix();
+        synth::Projector p = proj;
+        p.T_world_projector = T;
+        p.T_world_projector.translation() = T * (0.5 * T_lr.translation());
+        synth::RenderParams rp;
+        rp.supersample = 1;
+        rp.seed = static_cast<std::uint32_t>(f);
+        frames.emplace_back(synth::render_view(scene, p, rig.left, T, rp).image,
+                            synth::render_view(scene, p, rig.right, T * T_lr, rp).image);
+    }
+    pipeline::StereoFrontend fe(rig);
+    auto ctx = gpu::Context::create();
+    auto vol = track_metal::MetalTsdfVolume::create(*ctx);
+    auto icp = track_metal::MetalIcp::create(*ctx);
+    track::Tracker tracker({}, std::move(*vol));
+    tracker.set_icp_solver((*icp)->as_function());
+    TimingStats st(64), tt(64), total(64);
+    for (std::size_t i = 0; i < frames.size(); ++i) {
+        Stopwatch sw;
+        auto d = fe.process(frames[i].first, frames[i].second);
+        const double s_ms = sw.elapsed_ms();
+        d.frame.timestamp_s = 0.068 * static_cast<double>(i);
+        d.frame.index = i;
+        const auto r = tracker.process(d.frame);
+        if (i >= 5) {
+            st.add(s_ms);
+            tt.add(r.ms);
+            total.add(sw.elapsed_ms());
+        }
+    }
+    std::println("== full frame path (GPU, emulated sweep, {} frames) ==", frames.size());
+    std::println("{:28} median {:7.2f} ms  p95 {:7.2f} ms", "frontend", st.median(), st.percentile(0.95));
+    std::println("{:28} median {:7.2f} ms  p95 {:7.2f} ms", "tracker", tt.median(), tt.percentile(0.95));
+    std::println("{:28} median {:7.2f} ms  p95 {:7.2f} ms", "total", total.median(), total.percentile(0.95));
+}
+
+int main(int argc, char** argv) {
+    if (argc > 1 && std::string_view(argv[1]) == "pipeline") {
+        auto cal = calib::load_ccf_directory("/Applications/EXStar.app/Contents/Resources/res/Einscan-E10/200x150");
+        if (!cal) return 1;
+        bench_pipeline(cal->rig());
+        return 0;
+    }
     auto cal = calib::load_ccf_directory("/Applications/EXStar.app/Contents/Resources/res/Einscan-E10/200x150");
     if (!cal) {
         std::println(stderr, "needs EXStar calibration cache");

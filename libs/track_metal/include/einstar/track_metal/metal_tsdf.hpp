@@ -37,6 +37,13 @@ public:
 
     [[nodiscard]] bool pool_exhausted() const;
 
+    // Whole surface as render::PointVertex records in a fresh GPU buffer (drawn without copies).
+    struct RenderPoints {
+        gpu::Ref<MTL::Buffer> buffer;
+        std::size_t count = 0;
+    };
+    [[nodiscard]] RenderPoints extract_render_points(float min_weight = 0.5f) const;
+
 private:
     struct Impl;
     MetalTsdfVolume(std::unique_ptr<Impl> impl, track::TsdfParams params);

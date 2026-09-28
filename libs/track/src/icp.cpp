@@ -67,18 +67,30 @@ Vec6 twist_to_center(const Vec6& xo, const Vec3& c) {
 Vec3 icp_center(const DepthFrame& frame, const SE3& T_world_camera) {
     Vec3 c = Vec3::Zero();
     int n = 0;
-    for (int y = 0; y < frame.points.height(); y += 16)
-        for (int x = 0; x < frame.points.width(); x += 16)
-            if (frame.points(x, y).z() > 0) {
-                c += T_world_camera * frame.points(x, y).cast<double>();
+    const int w = frame.width(), h = frame.height();
+    // GPU frames are read in place (shared memory); only a sparse subsample is touched.
+    const float* dev = frame.points.empty() && frame.device ? frame.device->points_xyzw() : nullptr;
+    for (int y = 0; y < h; y += 16)
+        for (int x = 0; x < w; x += 16) {
+            Vec3f p;
+            if (dev) {
+                const float* q = dev + 4 * (static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x));
+                p = Vec3f(q[0], q[1], q[2]);
+            } else {
+                p = frame.points(x, y);
+            }
+            if (p.z() > 0) {
+                c += T_world_camera * p.cast<double>();
                 ++n;
             }
+        }
     return n > 0 ? Vec3(c / n) : T_world_camera.translation();
 }
 
 std::vector<float> normal_balance_weights(const DepthFrame& frame, double alpha) {
     std::vector<float> balance;
     if (alpha <= 0) return balance;
+    frame.ensure_cpu();
     const int W = frame.points.width(), H = frame.points.height();
     std::array<int, 128> hist{};
     int total = 0;
@@ -108,6 +120,8 @@ std::vector<float> normal_balance_weights(const DepthFrame& frame, double alpha)
 
 IcpResult icp_point_to_plane(const DepthFrame& frame, const RaycastResult& model, const SE3& T_model_camera,
                              const SE3& T_init, const IcpParams& p) {
+    frame.ensure_cpu();
+    model.ensure_cpu();
     IcpResult res;
     SE3 T = T_init;
     // Linearise about the centroid of the observed surface rather than the world origin: the

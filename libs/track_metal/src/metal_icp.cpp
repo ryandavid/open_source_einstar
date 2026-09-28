@@ -8,6 +8,7 @@
 #include <Eigen/Eigenvalues>
 
 #include "einstar/core/log.hpp"
+#include "einstar/gpu/device_data.hpp"
 
 namespace einstar::track_metal {
 namespace {
@@ -68,7 +69,8 @@ SE3 load(const float* src) {
 
 struct MetalIcp::Impl {
     std::shared_ptr<gpu::Context> ctx;
-    Ref<MTL::ComputePipelineState> level_begin, accumulate, solve;
+    Ref<MTL::ComputePipelineState> level_begin, accumulate, solve, bal_hist, bal_bins, bal_apply;
+    Ref<MTL::Buffer> hist, w_bin;
     Ref<MTL::Buffer> state, partials;
     Ref<MTL::Buffer> src_pts, src_nrm, src_w, mdl_pts, mdl_nrm;
     std::size_t src_n = 0, mdl_n = 0;
@@ -88,12 +90,15 @@ Result<std::unique_ptr<MetalIcp>> MetalIcp::create(std::shared_ptr<gpu::Context>
     auto lib = im->ctx->library("icp", kSource);
     if (!lib) return std::unexpected(lib.error());
     for (auto [name, slot] : {std::pair{"icp_level_begin", &im->level_begin}, std::pair{"icp_accumulate", &im->accumulate},
-                              std::pair{"icp_solve", &im->solve}}) {
+                              std::pair{"icp_solve", &im->solve}, std::pair{"balance_hist", &im->bal_hist},
+                              std::pair{"balance_bins", &im->bal_bins}, std::pair{"balance_apply", &im->bal_apply}}) {
         auto p = im->ctx->compute_pipeline(*lib, name);
         if (!p) return std::unexpected(p.error());
         *slot = std::move(*p);
     }
     im->state = im->ctx->buffer(sizeof(IcpState));
+    im->hist = im->ctx->buffer(128 * 4);
+    im->w_bin = im->ctx->buffer(128 * 4);
     return std::unique_ptr<MetalIcp>(new MetalIcp(std::move(im)));
 }
 
@@ -106,12 +111,20 @@ track::IcpResult MetalIcp::solve(const track::DepthFrame& frame, const track::Ra
                                  const SE3& T_init, const track::IcpParams& p) {
     auto& im = *impl_;
     track::IcpResult res;
-    const int W = frame.points.width(), H = frame.points.height();
+    const int W = frame.width(), H = frame.height();
     const auto n = static_cast<std::size_t>(W * H);
 
-    // Source frame (uploaded once per frame).
-    const bool same_frame = im.cached_frame == frame.points.data() && im.cached_index == frame.index &&
-                            im.cached_time == frame.timestamp_s && im.cached_alpha == p.normal_balance_alpha && im.src_n == n;
+    // Source frame: bind GPU-resident frames directly, otherwise upload once per frame.
+    const auto* dev_frame = dynamic_cast<const gpu::MetalFrameData*>(frame.device.get());
+    const bool same_frame = im.cached_frame == static_cast<const void*>(dev_frame ? static_cast<const void*>(dev_frame) : frame.points.data()) &&
+                            im.cached_index == frame.index && im.cached_time == frame.timestamp_s &&
+                            im.cached_alpha == p.normal_balance_alpha && im.src_n == n;
+    MTL::Buffer* src_pts = nullptr;
+    MTL::Buffer* src_nrm = nullptr;
+    if (dev_frame) {
+        src_pts = dev_frame->points_buffer();
+        src_nrm = dev_frame->normals_buffer();
+    }
     if (!same_frame) {
         if (im.src_n != n) {
             im.src_pts = im.ctx->buffer(n * 16);
@@ -119,33 +132,78 @@ track::IcpResult MetalIcp::solve(const track::DepthFrame& frame, const track::Ra
             im.src_w = im.ctx->buffer(n * 4);
             im.src_n = n;
         }
-        const auto balance = track::normal_balance_weights(frame, p.normal_balance_alpha);
-        auto* sp = static_cast<float*>(im.src_pts->contents());
-        auto* sn = static_cast<float*>(im.src_nrm->contents());
-        auto* sw = static_cast<float*>(im.src_w->contents());
-        for (std::size_t i = 0; i < n; ++i) {
-            const Vec3f& pt = frame.points.data()[i];
-            const Vec3f& nr = frame.normals.data()[i];
-            sp[4 * i] = pt.x(), sp[4 * i + 1] = pt.y(), sp[4 * i + 2] = pt.z(), sp[4 * i + 3] = 1;
-            sn[4 * i] = nr.x(), sn[4 * i + 1] = nr.y(), sn[4 * i + 2] = nr.z(), sn[4 * i + 3] = 0;
-            float w = std::max(0.1f, frame.weights.empty() ? 1.0f : frame.weights.data()[i]);
-            if (!balance.empty()) w *= balance[i];
-            sw[i] = w;
+        if (dev_frame) {
+            // Balancing weights on the GPU from the resident normals.
+            const struct { std::uint32_t w, h; float alpha; std::uint32_t enabled; } ba{
+                static_cast<std::uint32_t>(W), static_cast<std::uint32_t>(H), static_cast<float>(p.normal_balance_alpha),
+                p.normal_balance_alpha > 0 ? 1u : 0u};
+            std::memset(im.hist->contents(), 0, 128 * 4);
+            NS::AutoreleasePool* bp = NS::AutoreleasePool::alloc()->init();
+            MTL::CommandBuffer* bcmd = im.ctx->queue()->commandBuffer();
+            MTL::ComputeCommandEncoder* be = bcmd->computeCommandEncoder();
+            be->setComputePipelineState(im.bal_hist.get());
+            be->setBuffer(src_pts, 0, 0);
+            be->setBuffer(src_nrm, 0, 1);
+            be->setBuffer(im.hist.get(), 0, 2);
+            be->setBytes(&ba, sizeof(ba), 3);
+            be->dispatchThreads(MTL::Size(static_cast<NS::UInteger>(W), static_cast<NS::UInteger>(H), 1), MTL::Size(16, 16, 1));
+            be->memoryBarrier(MTL::BarrierScopeBuffers);
+            be->setComputePipelineState(im.bal_bins.get());
+            be->setBuffer(im.hist.get(), 0, 0);
+            be->setBuffer(im.w_bin.get(), 0, 1);
+            be->setBytes(&ba, sizeof(ba), 2);
+            be->dispatchThreads(MTL::Size(1, 1, 1), MTL::Size(1, 1, 1));
+            be->memoryBarrier(MTL::BarrierScopeBuffers);
+            be->setComputePipelineState(im.bal_apply.get());
+            be->setBuffer(src_nrm, 0, 0);
+            be->setBuffer(dev_frame->weights_buffer(), 0, 1);
+            be->setBuffer(im.w_bin.get(), 0, 2);
+            be->setBuffer(im.src_w.get(), 0, 3);
+            be->setBytes(&ba, sizeof(ba), 4);
+            be->dispatchThreads(MTL::Size(static_cast<NS::UInteger>(W), static_cast<NS::UInteger>(H), 1), MTL::Size(16, 16, 1));
+            be->endEncoding();
+            bcmd->commit();  // same queue: ordered before the ICP command buffer
+            bp->release();
+        } else {
+            frame.ensure_cpu();
+            const auto balance = track::normal_balance_weights(frame, p.normal_balance_alpha);
+            auto* sp = static_cast<float*>(im.src_pts->contents());
+            auto* sn = static_cast<float*>(im.src_nrm->contents());
+            auto* sw = static_cast<float*>(im.src_w->contents());
+            for (std::size_t i = 0; i < n; ++i) {
+                const Vec3f& pt = frame.points.data()[i];
+                const Vec3f& nr = frame.normals.data()[i];
+                sp[4 * i] = pt.x(), sp[4 * i + 1] = pt.y(), sp[4 * i + 2] = pt.z(), sp[4 * i + 3] = 1;
+                sn[4 * i] = nr.x(), sn[4 * i + 1] = nr.y(), sn[4 * i + 2] = nr.z(), sn[4 * i + 3] = 0;
+                float w = std::max(0.1f, frame.weights.empty() ? 1.0f : frame.weights.data()[i]);
+                if (!balance.empty()) w *= balance[i];
+                sw[i] = w;
+            }
         }
-        im.cached_frame = frame.points.data();
+        im.cached_frame = dev_frame ? static_cast<const void*>(dev_frame) : static_cast<const void*>(frame.points.data());
         im.cached_index = frame.index;
         im.cached_time = frame.timestamp_s;
         im.cached_alpha = p.normal_balance_alpha;
     }
-    // Model view.
+    if (!dev_frame) {
+        src_pts = im.src_pts.get();
+        src_nrm = im.src_nrm.get();
+    }
+    // Model view: bind GPU raycasts directly, otherwise upload.
     const auto& mk = model.intrinsics;
     const auto mn = static_cast<std::size_t>(mk.width * mk.height);
-    if (im.mdl_n != mn) {
-        im.mdl_pts = im.ctx->buffer(mn * 16);
-        im.mdl_nrm = im.ctx->buffer(mn * 16);
-        im.mdl_n = mn;
-    }
-    {
+    MTL::Buffer* mdl_pts = nullptr;
+    MTL::Buffer* mdl_nrm = nullptr;
+    if (const auto* dev_model = dynamic_cast<const gpu::MetalRaycastData*>(model.device.get())) {
+        mdl_pts = dev_model->points_buffer();
+        mdl_nrm = dev_model->normals_buffer();
+    } else {
+        if (im.mdl_n != mn) {
+            im.mdl_pts = im.ctx->buffer(mn * 16);
+            im.mdl_nrm = im.ctx->buffer(mn * 16);
+            im.mdl_n = mn;
+        }
+        model.ensure_cpu();
         auto* mp = static_cast<float*>(im.mdl_pts->contents());
         auto* mnr = static_cast<float*>(im.mdl_nrm->contents());
         for (std::size_t i = 0; i < mn; ++i) {
@@ -154,6 +212,8 @@ track::IcpResult MetalIcp::solve(const track::DepthFrame& frame, const track::Ra
             mp[4 * i] = q.x(), mp[4 * i + 1] = q.y(), mp[4 * i + 2] = q.z(), mp[4 * i + 3] = model.valid.data()[i] ? 1.0f : 0.0f;
             mnr[4 * i] = nq.x(), mnr[4 * i + 1] = nq.y(), mnr[4 * i + 2] = nq.z(), mnr[4 * i + 3] = 0;
         }
+        mdl_pts = im.mdl_pts.get();
+        mdl_nrm = im.mdl_nrm.get();
     }
     // Linearisation centre: same definition as the CPU solver.
     const Vec3 c = track::icp_center(frame, T_init);
@@ -200,11 +260,11 @@ track::IcpResult MetalIcp::solve(const track::DepthFrame& frame, const track::Ra
         enc->memoryBarrier(MTL::BarrierScopeBuffers);
         for (int it = 0; it < iters; ++it) {
             enc->setComputePipelineState(im.accumulate.get());
-            enc->setBuffer(im.src_pts.get(), 0, 0);
-            enc->setBuffer(im.src_nrm.get(), 0, 1);
+            enc->setBuffer(src_pts, 0, 0);
+            enc->setBuffer(src_nrm, 0, 1);
             enc->setBuffer(im.src_w.get(), 0, 2);
-            enc->setBuffer(im.mdl_pts.get(), 0, 3);
-            enc->setBuffer(im.mdl_nrm.get(), 0, 4);
+            enc->setBuffer(mdl_pts, 0, 3);
+            enc->setBuffer(mdl_nrm, 0, 4);
             enc->setBuffer(im.state.get(), 0, 5);
             enc->setBuffer(im.partials.get(), 0, 6);
             enc->setBytes(&aa, sizeof(aa), 7);

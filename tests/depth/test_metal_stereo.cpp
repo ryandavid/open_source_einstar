@@ -5,6 +5,7 @@
 
 #include "einstar/calib/device_calibration.hpp"
 #include "einstar/core/timing.hpp"
+#include "einstar/depth/point_image.hpp"
 #include "einstar/depth/stereo.hpp"
 #include "einstar/depth_metal/metal_stereo.hpp"
 #include "einstar/synth/speckle_scene.hpp"
@@ -114,4 +115,63 @@ TEST_CASE("Metal stereo matches the CPU reference") {
     REQUIRE(both > 20000);
     CHECK(static_cast<double>(close) / both >= 0.995);
     CHECK(static_cast<double>(only_cpu + only_gpu) / both < 0.01);
+}
+
+TEST_CASE("Metal stereo produces GPU-resident frames matching the CPU point conversion") {
+    auto ctx = gpu::Context::create();
+    REQUIRE(ctx.has_value());
+    const Pair pr = make_pair();
+    const auto rect = calib::compute_rectification(pr.rig);
+    const auto ml = calib::build_remap(pr.rig.left, rect.R_left, rect.rectified);
+    const auto mr = calib::build_remap(pr.rig.right, rect.R_right, rect.rectified);
+    depth::StereoParams sp;
+    sp.pyramid_levels = 1;
+    const auto& g = rect.geometry;
+    sp.sgm.min_disparity = static_cast<int>(g.disparity_from_depth(700) / 4) - 2;
+    sp.sgm.num_disparities = static_cast<int>(g.disparity_from_depth(150) / 4) - sp.sgm.min_disparity + 4;
+    auto gpu = depth_metal::MetalStereo::create(*ctx, sp, ml.width / 2, ml.height / 2);
+    REQUIRE(gpu.has_value());
+    REQUIRE((*gpu)->set_rectification(ml, mr, pr.left.width(), pr.left.height()).has_value());
+    depth::RectifiedGeometry half = g;
+    half.f = g.f / 2;
+    half.cx = (g.cx + 0.5) / 2 - 0.5;
+    half.cy = (g.cy + 0.5) / 2 - 0.5;
+    (*gpu)->set_point_params(half, 150.0f, 700.0f, 4.0f);
+
+    // Reference: GPU disparity (already speckle-filtered on the GPU) converted on the CPU.
+    auto disp = (*gpu)->compute_raw(pr.left.view(), pr.right.view());
+    REQUIRE(disp.has_value());
+    depth::PointImageParams pp;
+    pp.min_depth = 150.0f;
+    pp.max_depth = 700.0f;
+    const auto ref = depth::disparity_to_points(disp->disparity, disp->confidence, half, pp);
+
+    auto frame = (*gpu)->compute_frame_raw(pr.left.view(), pr.right.view());
+    for (int i = 0; i < 3; ++i) frame = (*gpu)->compute_frame_raw(pr.left.view(), pr.right.view());  // exercise the pool
+    REQUIRE(frame.has_value());
+    const auto t = (*gpu)->last_timings();
+    const float* p = (*frame)->points_xyzw();
+    const float* n = (*frame)->normals_xyzw();
+    const float* w = (*frame)->weights();
+    int valid = 0, mismatch = 0, nvalid = 0, nmis = 0, wmis = 0;
+    for (std::size_t i = 0; i < ref.points.size(); ++i) {
+        const Vec3f rp = ref.points.data()[i];
+        const bool rv = rp.z() > 0, gv = p[4 * i + 3] > 0;
+        if (rv != gv) { ++mismatch; continue; }
+        if (!rv) continue;
+        ++valid;
+        if ((rp - Vec3f(p[4 * i], p[4 * i + 1], p[4 * i + 2])).norm() > 1e-3f) ++mismatch;
+        const Vec3f rn = ref.normals.data()[i];
+        if (rn.squaredNorm() > 0) {
+            ++nvalid;
+            if (rn.dot(Vec3f(n[4 * i], n[4 * i + 1], n[4 * i + 2])) < 0.9999f) ++nmis;
+        }
+        if (std::abs(ref.weights.data()[i] - w[i]) > 1e-4f) ++wmis;
+    }
+    std::println("gpu frame: {} valid points ({} mismatched), {} normals ({} mismatched), {} weight mismatches; gpu {:.2f} ms total {:.2f} ms",
+                 valid, mismatch, nvalid, nmis, wmis, t.gpu_ms, t.total_ms);
+    REQUIRE(valid > 15000);
+    CHECK(mismatch == 0);
+    CHECK(nmis <= nvalid / 1000);
+    CHECK(wmis <= valid / 1000);
 }

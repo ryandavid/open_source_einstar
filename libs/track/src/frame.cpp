@@ -6,6 +6,23 @@
 
 namespace einstar::track {
 
+void DepthFrame::ensure_cpu() const {
+    if (!device || !points.empty()) return;
+    const int w = device->width(), h = device->height();
+    points = Image<Vec3f>(w, h);
+    normals = Image<Vec3f>(w, h);
+    weights = ImageF32(w, h);
+    const float* p = device->points_xyzw();
+    const float* n = device->normals_xyzw();
+    const float* wt = device->weights();
+    const auto count = static_cast<std::size_t>(w * h);
+    for (std::size_t i = 0; i < count; ++i) {
+        points.data()[i] = Vec3f(p[4 * i], p[4 * i + 1], p[4 * i + 2]);
+        normals.data()[i] = Vec3f(n[4 * i], n[4 * i + 1], n[4 * i + 2]);
+        weights.data()[i] = wt[i];
+    }
+}
+
 DepthFrame make_depth_frame(const ImageF32& depth, const Intrinsics& k, double max_jump) {
     const int w = depth.width(), h = depth.height();
     DepthFrame f;

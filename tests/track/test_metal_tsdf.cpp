@@ -77,6 +77,7 @@ TEST_CASE("Metal TSDF matches the CPU volume") {
     sw.reset();
     const auto rg = (*gpu_vol)->raycast(pose0, mk);
     const double gpu_ray = sw.elapsed_ms();
+    rg.ensure_cpu();  // GPU raycasts are device-resident; CPU images on demand
     int vc = 0, vg = 0, both = 0, close = 0;
     for (std::size_t i = 0; i < rc.valid.size(); ++i) {
         vc += rc.valid.data()[i];
@@ -148,4 +149,47 @@ TEST_CASE("Metal ICP matches the CPU solver") {
         CHECK(std::abs(cpu.correspondences - gpu.correspondences) < cpu.correspondences / 100 + 5);
         CHECK(std::abs(std::log(cpu.min_eigenvalue_ratio / gpu.min_eigenvalue_ratio)) < 0.05);
     }
+}
+
+#include "einstar/gpu/device_data.hpp"
+
+TEST_CASE("Metal ICP on a GPU-resident frame matches the CPU solver") {
+    auto ctx = gpu::Context::create();
+    REQUIRE(ctx.has_value());
+    auto icp = track_metal::MetalIcp::create(*ctx);
+    REQUIRE(icp.has_value());
+    TsdfVolume vol;
+    vol.integrate(make_depth_frame(render_depth(SE3::Identity(), kK), kK), SE3::Identity());
+    const auto model = vol.raycast(SE3::Identity(), kK.scaled(0.5));
+    Vec6 xi;
+    xi << 2.5, -1.5, 1.0, 0.012, -0.02, 0.01;
+    const SE3 pose1 = se3_exp(xi);
+    const auto cpu_frame = make_depth_frame(render_depth(pose1, kK), kK);
+
+    // Same frame, but only as device buffers (as produced by the Metal stereo frontend).
+    const auto n = static_cast<std::size_t>(kK.width * kK.height);
+    auto pts = (*ctx)->buffer(n * 16), nrm = (*ctx)->buffer(n * 16), wts = (*ctx)->buffer(n * 4);
+    auto* p = static_cast<float*>(pts->contents());
+    auto* q = static_cast<float*>(nrm->contents());
+    auto* w = static_cast<float*>(wts->contents());
+    for (std::size_t i = 0; i < n; ++i) {
+        const Vec3f a = cpu_frame.points.data()[i], b = cpu_frame.normals.data()[i];
+        p[4 * i] = a.x(), p[4 * i + 1] = a.y(), p[4 * i + 2] = a.z(), p[4 * i + 3] = a.z() > 0 ? 1.0f : 0.0f;
+        q[4 * i] = b.x(), q[4 * i + 1] = b.y(), q[4 * i + 2] = b.z(), q[4 * i + 3] = 0;
+        w[i] = cpu_frame.weights.data()[i];
+    }
+    DepthFrame dev_frame;
+    dev_frame.intrinsics = kK;
+    dev_frame.index = 77;
+    dev_frame.device = std::make_shared<gpu::MetalFrameData>(kK.width, kK.height, pts, nrm, wts);
+
+    const auto cpu = icp_point_to_plane(cpu_frame, model, SE3::Identity(), SE3::Identity(), {});
+    const auto gpu = (*icp)->solve(dev_frame, model, SE3::Identity(), SE3::Identity(), {});
+    REQUIRE(gpu.converged);
+    const SE3 d = cpu.T_world_camera.inverse() * gpu.T_world_camera;
+    std::println("device-frame icp: gpu-cpu {:.4f} mm {:.5f} deg, n {}/{}, rms {:.4f}/{:.4f}", translation_norm(d),
+                 rotation_angle(d) * 180 / M_PI, cpu.correspondences, gpu.correspondences, cpu.rms_mm, gpu.rms_mm);
+    CHECK(translation_norm(d) < 0.01);
+    CHECK(rotation_angle(d) * 180 / M_PI < 0.002);
+    CHECK(std::abs(cpu.correspondences - gpu.correspondences) <= cpu.correspondences / 200);
 }

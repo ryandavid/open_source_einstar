@@ -27,7 +27,7 @@ the float GPU solve well conditioned and makes the degeneracy analysis independe
 scan started; the degeneracy/relocalisation thresholds were recalibrated for it.
 
 ## Known issues / next steps
-1. **Speed**: done for the main path (stereo 5.7 ms + tracking/fusion 6.7 ms). Remaining: keep depth frames on the GPU between stereo, ICP and fusion (today they round-trip through CPU memory, ~1 ms each); renderer could draw the extracted surface buffer directly.
+1. **Speed**: done. Frames stay GPU-resident from stereo through ICP, fusion and rendering (speckle filter, points/normals, balancing weights, raycasts, surface extraction and the live overlay are all GPU buffers; the CPU only touches them for relocalisation and fallbacks). Full frame path 8.6 ms (was 12.9 ms with CPU round trips, ~50 ms all-CPU).
 2. **Open-loop drift** on young models (synthetic sweep: ~0.03 deg/frame). Fix in the process step: keyframe pose graph + loop closure + re-fusion.
 3. **Surfaces of revolution** are geometrically ambiguous; depth-only tracking holds but may slide. Needs markers (next) or texture.
 4. **Markers**: detection, stereo matching, marker map, joint marker + ICP tracking — not started (EXStar's parameters are in docs/algorithms.md).

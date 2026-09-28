@@ -1,6 +1,7 @@
 #include "einstar/depth_metal/metal_stereo.hpp"
 
 #include <cstring>
+#include <mutex>
 #include <format>
 #include <vector>
 
@@ -21,6 +22,8 @@ struct PathArgs { std::uint32_t w, h, nd; std::int32_t dx, dy, p1, p2; std::uint
 struct WtaArgs { std::uint32_t w, h, nd; std::int32_t min_disp; float uniqueness; std::uint32_t subpixel; };
 struct LrArgs { std::uint32_t w, h; float max_diff; };
 struct RefineArgs { std::uint32_t w, h, cw, ch; std::int32_t radius, search_radius; float min_zncc; std::uint32_t subpixel; };
+struct CclArgs { std::uint32_t w, h; float max_diff; std::uint32_t min_size; };
+struct PointsArgs { std::uint32_t w, h; float f, cx, cy, baseline, min_depth, max_depth, max_jump; };
 
 using gpu::Ref;
 
@@ -34,6 +37,15 @@ struct MetalStereo::Impl {
     int nd = 0;
 
     Ref<MTL::ComputePipelineState> rectify, down, census, cost, path, wta_l, wta_r, lr, median, refine;
+    Ref<MTL::ComputePipelineState> ccl_init, ccl_merge, ccl_count, ccl_filter, pts_kernel, nrm_kernel;
+    Ref<MTL::Buffer> labels, sizes;
+    PointsArgs points_args{};
+    bool have_points = false;
+    // Output frame pool (frames are handed out as shared_ptr and come back when released).
+    struct FrameBuffers { Ref<MTL::Buffer> points, normals, weights; };
+    std::mutex pool_mutex;
+    std::vector<FrameBuffers> pool;
+    FrameBuffers current;
     std::vector<Ref<MTL::Buffer>> img_l, img_r;  // pyramid images per level
     Ref<MTL::Buffer> census_l, census_r, cost_vol, sum_vol, disp_coarse, rdisp;
     std::vector<Ref<MTL::Buffer>> disp, conf, med;  // per level
@@ -69,7 +81,10 @@ Result<std::unique_ptr<MetalStereo>> MetalStereo::create(std::shared_ptr<gpu::Co
                            std::pair{"census", &im->census}, std::pair{"cost_volume", &im->cost},
                            std::pair{"sgm_path", &im->path}, std::pair{"wta_left", &im->wta_l},
                            std::pair{"wta_right", &im->wta_r}, std::pair{"lr_check", &im->lr},
-                           std::pair{"median3", &im->median}, std::pair{"refine_slanted", &im->refine}})
+                           std::pair{"median3", &im->median}, std::pair{"refine_slanted", &im->refine},
+                           std::pair{"ccl_init", &im->ccl_init}, std::pair{"ccl_merge", &im->ccl_merge},
+                           std::pair{"ccl_count", &im->ccl_count}, std::pair{"ccl_filter", &im->ccl_filter},
+                           std::pair{"disparity_points", &im->pts_kernel}, std::pair{"point_normals", &im->nrm_kernel}})
         if (auto r = make(n, *slot); !r) return std::unexpected(r.error());
 
     const int levels = params.pyramid_levels;
@@ -95,6 +110,9 @@ Result<std::unique_ptr<MetalStereo>> MetalStereo::create(std::shared_ptr<gpu::Co
     im->cost_vol = im->buf(cpx * static_cast<std::size_t>(im->nd) * 2);
     im->sum_vol = im->buf(cpx * static_cast<std::size_t>(im->nd) * 2);
     im->rdisp = im->buf(cpx * 4);
+    const auto fpx = static_cast<std::size_t>(width * height);
+    im->labels = im->buf(fpx * 4);
+    im->sizes = im->buf(fpx * 4);
     return std::unique_ptr<MetalStereo>(new MetalStereo(std::move(im)));
 }
 
@@ -133,7 +151,48 @@ Result<depth::StereoResult> MetalStereo::compute(ImageView<const std::uint8_t> l
     };
     copy(left, im.img_l[0].get());
     copy(right, im.img_r[0].get());
-    return run(false, nullptr, nullptr);
+    if (auto r = encode_and_run(false, false, nullptr, nullptr); !r) return std::unexpected(r.error());
+    return read_result();
+}
+
+void MetalStereo::set_point_params(const depth::RectifiedGeometry& g, float min_depth, float max_depth, float max_jump) {
+    auto& im = *impl_;
+    im.points_args = {static_cast<std::uint32_t>(im.w), static_cast<std::uint32_t>(im.h), static_cast<float>(g.f),
+                      static_cast<float>(g.cx), static_cast<float>(g.cy), static_cast<float>(g.baseline), min_depth, max_depth, max_jump};
+    im.have_points = true;
+}
+
+Result<std::shared_ptr<gpu::MetalFrameData>> MetalStereo::compute_frame_raw(ImageView<const std::uint8_t> raw_left,
+                                                                            ImageView<const std::uint8_t> raw_right,
+                                                                            ImageU8* rect_left, ImageU8* rect_right) {
+    auto& im = *impl_;
+    if (!im.have_points) return make_error(Errc::invalid_argument, "set_point_params() not called");
+    if (!im.map_l) return make_error(Errc::invalid_argument, "set_rectification() not called");
+    if (raw_left.width != im.raw_w || raw_left.height != im.raw_h) return make_error(Errc::invalid_argument, "raw size mismatch");
+    {
+        std::lock_guard lock(im.pool_mutex);
+        if (!im.pool.empty()) {
+            im.current = std::move(im.pool.back());
+            im.pool.pop_back();
+        } else {
+            const auto n = static_cast<std::size_t>(im.w * im.h);
+            im.current = {im.buf(n * 16), im.buf(n * 16), im.buf(n * 4)};
+        }
+    }
+    auto copy = [&](ImageView<const std::uint8_t> src, MTL::Buffer* dst) {
+        auto* d = static_cast<std::uint8_t*>(dst->contents());
+        for (int y = 0; y < src.height; ++y) std::memcpy(d + y * src.width, src.row(y), static_cast<std::size_t>(src.width));
+    };
+    copy(raw_left, im.raw_l.get());
+    copy(raw_right, im.raw_r.get());
+    if (auto r = encode_and_run(true, true, rect_left, rect_right); !r) return std::unexpected(r.error());
+    auto bufs = std::move(im.current);
+    Impl* owner = impl_.get();
+    auto keep = std::make_shared<Impl::FrameBuffers>(bufs);
+    return std::make_shared<gpu::MetalFrameData>(im.w, im.h, bufs.points, bufs.normals, bufs.weights, [owner, keep] {
+        std::lock_guard lock(owner->pool_mutex);
+        if (owner->pool.size() < 4) owner->pool.push_back(*keep);
+    });
 }
 
 Result<depth::StereoResult> MetalStereo::compute_raw(ImageView<const std::uint8_t> raw_left, ImageView<const std::uint8_t> raw_right,
@@ -147,10 +206,26 @@ Result<depth::StereoResult> MetalStereo::compute_raw(ImageView<const std::uint8_
     };
     copy(raw_left, im.raw_l.get());
     copy(raw_right, im.raw_r.get());
-    return run(true, rect_left, rect_right);
+    if (auto r = encode_and_run(true, false, rect_left, rect_right); !r) return std::unexpected(r.error());
+    return read_result();
 }
 
-Result<depth::StereoResult> MetalStereo::run(bool from_raw, ImageU8* rect_left, ImageU8* rect_right) {
+depth::StereoResult MetalStereo::read_result() const {
+    const auto& im = *impl_;
+    depth::StereoResult res;
+    res.disparity = ImageF32(im.w, im.h);
+    res.confidence = ImageF32(im.w, im.h);
+    const auto n = static_cast<std::size_t>(im.w * im.h);
+    std::memcpy(res.disparity.data(), im.disp[0]->contents(), n * 4);
+    if (im.p.pyramid_levels == 0) {
+        for (std::size_t i = 0; i < n; ++i) res.confidence.data()[i] = res.disparity.data()[i] < 0 ? 0.0f : 1.0f;
+    } else {
+        std::memcpy(res.confidence.data(), im.conf[0]->contents(), n * 4);
+    }
+    return res;
+}
+
+Result<void> MetalStereo::encode_and_run(bool from_raw, bool make_points, ImageU8* rect_left, ImageU8* rect_right) {
     auto& im = *impl_;
     Stopwatch total;
     const auto& sp = im.p.sgm;
@@ -267,39 +342,71 @@ Result<depth::StereoResult> MetalStereo::run(bool from_raw, ImageU8* rect_left, 
         enc->setBytes(&rf, sizeof(rf), 5);
         dispatch2d(im.refine.get(), im.lw[lf], im.lh[lf]);
     }
+    // --- speckle removal: connected components on the GPU (same rule as depth::remove_speckles) ---
+    const int fw = im.lw[0], fh = im.lh[0];
+    if (im.p.speckle.max_region_size > 0) {
+        const CclArgs cc{static_cast<std::uint32_t>(fw), static_cast<std::uint32_t>(fh), im.p.speckle.max_diff,
+                         static_cast<std::uint32_t>(im.p.speckle.max_region_size)};
+        enc->memoryBarrier(MTL::BarrierScopeBuffers);
+        enc->setBuffer(im.disp[0].get(), 0, 0);
+        enc->setBuffer(im.labels.get(), 0, 1);
+        enc->setBuffer(im.sizes.get(), 0, 2);
+        enc->setBytes(&cc, sizeof(cc), 3);
+        dispatch2d(im.ccl_init.get(), fw, fh);
+        enc->memoryBarrier(MTL::BarrierScopeBuffers);
+        enc->setBuffer(im.disp[0].get(), 0, 0);
+        enc->setBuffer(im.labels.get(), 0, 1);
+        enc->setBytes(&cc, sizeof(cc), 2);
+        dispatch2d(im.ccl_merge.get(), fw, fh);
+        enc->memoryBarrier(MTL::BarrierScopeBuffers);
+        enc->setBuffer(im.disp[0].get(), 0, 0);
+        enc->setBuffer(im.labels.get(), 0, 1);
+        enc->setBuffer(im.sizes.get(), 0, 2);
+        enc->setBytes(&cc, sizeof(cc), 3);
+        dispatch2d(im.ccl_count.get(), fw, fh);
+        enc->memoryBarrier(MTL::BarrierScopeBuffers);
+        enc->setBuffer(im.disp[0].get(), 0, 0);
+        enc->setBuffer(im.conf[0].get(), 0, 1);
+        enc->setBuffer(im.labels.get(), 0, 2);
+        enc->setBuffer(im.sizes.get(), 0, 3);
+        enc->setBytes(&cc, sizeof(cc), 4);
+        dispatch2d(im.ccl_filter.get(), fw, fh);
+    }
+    // --- points / normals / weights ---
+    if (make_points) {
+        enc->memoryBarrier(MTL::BarrierScopeBuffers);
+        enc->setBuffer(im.disp[0].get(), 0, 0);
+        enc->setBuffer(im.conf[0].get(), 0, 1);
+        enc->setBuffer(im.current.points.get(), 0, 2);
+        enc->setBytes(&im.points_args, sizeof(im.points_args), 3);
+        dispatch2d(im.pts_kernel.get(), fw, fh);
+        enc->memoryBarrier(MTL::BarrierScopeBuffers);
+        enc->setBuffer(im.current.points.get(), 0, 0);
+        enc->setBuffer(im.conf[0].get(), 0, 1);
+        enc->setBuffer(im.current.normals.get(), 0, 2);
+        enc->setBuffer(im.current.weights.get(), 0, 3);
+        enc->setBytes(&im.points_args, sizeof(im.points_args), 4);
+        dispatch2d(im.nrm_kernel.get(), fw, fh);
+    }
     enc->endEncoding();
     cmd->commit();
     cmd->waitUntilCompleted();
     timings_.gpu_ms = (cmd->GPUEndTime() - cmd->GPUStartTime()) * 1000.0;
+    timings_.speckle_ms = 0;
     const bool failed = cmd->status() == MTL::CommandBufferStatusError;
     pool->release();
     if (failed) return make_error(Errc::io, "Metal stereo command buffer failed");
-
-    depth::StereoResult res;
-    res.disparity = ImageF32(im.w, im.h);
-    res.confidence = ImageF32(im.w, im.h);
-    const auto n = static_cast<std::size_t>(im.w * im.h);
-    std::memcpy(res.disparity.data(), im.disp[0]->contents(), n * 4);
-    if (levels == 0) {
-        for (std::size_t i = 0; i < n; ++i) res.confidence.data()[i] = res.disparity.data()[i] < 0 ? 0.0f : 1.0f;
-    } else {
-        std::memcpy(res.confidence.data(), im.conf[0]->contents(), n * 4);
-    }
-    Stopwatch sw;
-    depth::remove_speckles(res.disparity, im.p.speckle);
-    for (std::size_t i = 0; i < n; ++i)
-        if (res.disparity.data()[i] < 0) res.confidence.data()[i] = 0.0f;
-    timings_.speckle_ms = sw.elapsed_ms();
+    const auto n = static_cast<std::size_t>(fw * fh);
     if (rect_left) {
-        *rect_left = ImageU8(im.w, im.h);
+        *rect_left = ImageU8(fw, fh);
         std::memcpy(rect_left->data(), im.img_l[0]->contents(), n);
     }
     if (rect_right) {
-        *rect_right = ImageU8(im.w, im.h);
+        *rect_right = ImageU8(fw, fh);
         std::memcpy(rect_right->data(), im.img_r[0]->contents(), n);
     }
     timings_.total_ms = total.elapsed_ms();
-    return res;
+    return {};
 }
 
 }  // namespace einstar::depth_metal

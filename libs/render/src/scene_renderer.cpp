@@ -79,7 +79,7 @@ Result<std::unique_ptr<SceneRenderer>> SceneRenderer::create(std::shared_ptr<gpu
 void SceneRenderer::upload(Layer& layer, const void* data, std::size_t count, std::size_t stride, bool append) {
     const std::size_t start = append ? layer.count : 0;
     const std::size_t needed = start + count;
-    if (needed > layer.capacity) {
+    if (needed > layer.capacity || layer.capacity == 0) {
         const std::size_t cap = std::max<std::size_t>(needed + needed / 2, 1024);
         auto grown = ctx_->buffer(cap * stride);
         if (append && layer.buffer && layer.count > 0)
@@ -95,6 +95,18 @@ void SceneRenderer::set_model_points(std::span<const PointVertex> p) { upload(mo
 void SceneRenderer::append_model_points(std::span<const PointVertex> p) { upload(model_, p.data(), p.size(), sizeof(PointVertex), true); }
 void SceneRenderer::set_frame_points(std::span<const PointVertex> p) { upload(frame_, p.data(), p.size(), sizeof(PointVertex), false); }
 void SceneRenderer::set_markers(std::span<const MarkerInstance> m) { upload(markers_, m.data(), m.size(), sizeof(MarkerInstance), false); }
+void SceneRenderer::set_model_buffer(gpu::Ref<MTL::Buffer> buffer, std::size_t count) {
+    model_.buffer = std::move(buffer);
+    model_.count = count;
+    model_.capacity = 0;  // external: never written into; the next upload allocates a new buffer
+}
+
+void SceneRenderer::set_frame_buffer(gpu::Ref<MTL::Buffer> buffer, std::size_t count) {
+    frame_.buffer = std::move(buffer);
+    frame_.count = count;
+    frame_.capacity = 0;
+}
+
 void SceneRenderer::set_lines(std::span<const LineVertex> l) { upload(lines_, l.data(), l.size(), sizeof(LineVertex), false); }
 
 void SceneRenderer::encode(MTL::RenderCommandEncoder* enc, const ViewCamera& cam, float vw, float vh,

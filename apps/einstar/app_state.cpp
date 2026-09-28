@@ -102,8 +102,12 @@ Hud AppState::hud() const {
 
 void AppState::on_live_update(pipeline::LiveUpdate&& u) {
     RenderUpdate up;
-    if (u.model_changed) up.model = std::move(u.model);
+    if (u.model_changed) {
+        if (u.model_buffer) up.model_gpu = GpuPoints{std::move(u.model_buffer), u.model_buffer_count};
+        else up.model = std::move(u.model);
+    }
     up.frame_points = std::move(u.frame_points);
+    if (u.frame_buffer) up.frame_gpu = GpuPoints{std::move(u.frame_buffer), u.frame_buffer_count};
     up.ir_left = std::move(u.preview_left);
     up.ir_right = std::move(u.preview_right);
 
@@ -141,8 +145,16 @@ void AppState::on_live_update(pipeline::LiveUpdate&& u) {
         return;
     }
     // UI hasn't consumed the previous update: keep the newest of everything.
-    if (up.model) pending_->model = std::move(up.model);
+    if (up.model) {
+        pending_->model = std::move(up.model);
+        pending_->model_gpu.reset();
+    }
+    if (up.model_gpu) {
+        pending_->model_gpu = std::move(up.model_gpu);
+        pending_->model.reset();
+    }
     pending_->frame_points = std::move(up.frame_points);
+    pending_->frame_gpu = std::move(up.frame_gpu);
     pending_->lines = std::move(up.lines);
     pending_->ir_left = std::move(up.ir_left);
     pending_->ir_right = std::move(up.ir_right);

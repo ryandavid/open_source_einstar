@@ -52,9 +52,12 @@ struct TsdfParams {
 
 struct RaycastResult {
     Intrinsics intrinsics;
-    Image<Vec3f> points;   // world frame, z-component irrelevant for validity; see `valid`
-    Image<Vec3f> normals;  // world frame
-    Image<std::uint8_t> valid;
+    mutable Image<Vec3f> points;   // world frame, z-component irrelevant for validity; see `valid`
+    mutable Image<Vec3f> normals;  // world frame
+    mutable Image<std::uint8_t> valid;
+    std::shared_ptr<const DeviceRaycastData> device;  // GPU volumes: CPU images filled on demand
+
+    void ensure_cpu() const;
 };
 
 struct SurfacePoint {

@@ -33,6 +33,11 @@ StereoFrontend::StereoFrontend(const RigCalibration& rig, StereoFrontendParams p
         auto m = ctx ? depth_metal::MetalStereo::create(*ctx, stereo_, rect_.rectified.width / 2, rect_.rectified.height / 2)
                      : Result<std::unique_ptr<depth_metal::MetalStereo>>(std::unexpected(ctx.error()));
         if (m && (*m)->set_rectification(map_left_, map_right_, rig.left.width, rig.left.height)) {
+            depth::RectifiedGeometry half = rect_.geometry;
+            half.f = depth_k_.fx;
+            half.cx = depth_k_.cx;
+            half.cy = depth_k_.cy;
+            (*m)->set_point_params(half, static_cast<float>(params_.min_depth_mm), static_cast<float>(params_.max_depth_mm), 4.0f);
             metal_ = std::move(*m);
         } else if (params_.backend == StereoBackend::metal) {
             log::error("Metal stereo unavailable: {}", m ? "rectification setup failed" : m.error().message);
@@ -47,25 +52,23 @@ StereoFrontend::StereoFrontend(const RigCalibration& rig, StereoFrontendParams p
 DepthOutput StereoFrontend::process(const ImageU8& raw_left, const ImageU8& raw_right) const {
     Stopwatch sw;
     DepthOutput out;
-    depth::StereoResult stereo;
-    bool done = false;
     if (metal_) {
+        // GPU path: the whole frame (points, normals, weights) stays resident on the GPU.
         std::lock_guard lock(metal_mutex_);
-        if (auto r = metal_->compute_raw(raw_left.view(), raw_right.view(), &out.rectified_left, &out.rectified_right)) {
-            stereo = std::move(*r);
-            done = true;
+        if (auto f = metal_->compute_frame_raw(raw_left.view(), raw_right.view(), &out.rectified_left, &out.rectified_right)) {
+            out.frame.intrinsics = depth_k_;
+            out.frame.device = std::move(*f);
+            out.stereo_ms = sw.elapsed_ms();
+            return out;
         } else {
-            log::warn("Metal stereo failed ({}); using CPU for this frame", r.error().message);
+            log::warn("Metal stereo failed ({}); using CPU for this frame", f.error().message);
         }
     }
-    if (!done) {
-        const ImageU8 rl = calib::remap(raw_left.view(), map_left_);
-        const ImageU8 rr = calib::remap(raw_right.view(), map_right_);
-        out.rectified_left = depth::downsample2(rl.view());
-        out.rectified_right = depth::downsample2(rr.view());
-        stereo = depth::compute_disparity(out.rectified_left.view(), out.rectified_right.view(), stereo_);
-    }
-
+    const ImageU8 rl = calib::remap(raw_left.view(), map_left_);
+    const ImageU8 rr = calib::remap(raw_right.view(), map_right_);
+    out.rectified_left = depth::downsample2(rl.view());
+    out.rectified_right = depth::downsample2(rr.view());
+    const auto stereo = depth::compute_disparity(out.rectified_left.view(), out.rectified_right.view(), stereo_);
     // Disparity at half resolution -> depth with the half-resolution geometry.
     depth::RectifiedGeometry half = rect_.geometry;
     half.f = depth_k_.fx;
@@ -96,6 +99,7 @@ std::optional<DepthOutput> StereoFrontend::process(const usb::FrameGroup& group)
 int StereoFrontend::detect_sensor_order(const usb::FrameGroup& group) {
     if (!group.sensors[0] || !group.sensors[1]) return left_sensor_;
     auto count = [](const DepthOutput& o) {
+        o.frame.ensure_cpu();
         return std::ranges::count_if(o.frame.points.pixels(), [](const Vec3f& p) { return p.z() > 0; });
     };
     const auto a = count(process(group.sensors[0]->pixels, group.sensors[1]->pixels));

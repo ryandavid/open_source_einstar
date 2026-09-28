@@ -5,6 +5,7 @@
 #include <functional>
 
 #include "einstar/core/log.hpp"
+#include "einstar/gpu/device_data.hpp"
 
 namespace einstar::track_metal {
 namespace {
@@ -72,14 +73,12 @@ std::uint32_t hash_key(std::uint32_t key, std::uint32_t mask) {
 struct MetalTsdfVolume::Impl {
     std::shared_ptr<gpu::Context> ctx;
     MetalTsdfOptions opt;
-    Ref<MTL::ComputePipelineState> init_voxels, allocate, integrate, raycast, extract;
+    Ref<MTL::ComputePipelineState> init_voxels, allocate, integrate, raycast, extract, extract_render;
+    mutable std::size_t render_capacity = 0;
     Ref<MTL::Buffer> keys, values, coords, brick_count, stamps, visible_count, visible, voxels, last_update;
     // per-frame inputs
     Ref<MTL::Buffer> points, weights;
     std::size_t frame_pixels = 0;
-    // raycast outputs
-    mutable Ref<MTL::Buffer> ray_points, ray_normals;
-    mutable std::size_t ray_pixels = 0;
     // extraction
     mutable Ref<MTL::Buffer> ext_out, ext_count, ext_list;
     mutable std::size_t ext_capacity = 0;
@@ -141,7 +140,7 @@ Result<std::unique_ptr<MetalTsdfVolume>> MetalTsdfVolume::create(std::shared_ptr
     if (!lib) return std::unexpected(lib.error());
     for (auto [name, slot] : {std::pair{"init_voxels", &im->init_voxels}, std::pair{"allocate", &im->allocate},
                               std::pair{"integrate", &im->integrate}, std::pair{"raycast", &im->raycast},
-                              std::pair{"extract", &im->extract}}) {
+                              std::pair{"extract", &im->extract}, std::pair{"extract_render", &im->extract_render}}) {
         auto p = im->ctx->compute_pipeline(*lib, name);
         if (!p) return std::unexpected(p.error());
         *slot = std::move(*p);
@@ -187,22 +186,33 @@ bool MetalTsdfVolume::pool_exhausted() const {
 
 void MetalTsdfVolume::integrate(const track::DepthFrame& frame, const SE3& T_world_camera, float weight_scale, bool extend_only) {
     auto& im = *impl_;
-    const int w = frame.points.width(), h = frame.points.height();
+    const int w = frame.width(), h = frame.height();
     const auto n = static_cast<std::size_t>(w * h);
-    if (n != im.frame_pixels) {
-        im.points = im.ctx->buffer(n * 16);
-        im.weights = im.ctx->buffer(n * 4);
-        im.frame_pixels = n;
-    }
-    auto* pts = static_cast<float*>(im.points->contents());
-    auto* wts = static_cast<float*>(im.weights->contents());
-    for (std::size_t i = 0; i < n; ++i) {
-        const Vec3f& p = frame.points.data()[i];
-        pts[4 * i] = p.x();
-        pts[4 * i + 1] = p.y();
-        pts[4 * i + 2] = p.z();
-        pts[4 * i + 3] = 1.0f;
-        wts[i] = frame.weights.empty() ? 1.0f : frame.weights.data()[i];
+    MTL::Buffer* points_buf = nullptr;
+    MTL::Buffer* weights_buf = nullptr;
+    if (const auto* dev = dynamic_cast<const gpu::MetalFrameData*>(frame.device.get())) {
+        // GPU-resident frame: bind its buffers directly.
+        points_buf = dev->points_buffer();
+        weights_buf = dev->weights_buffer();
+    } else {
+        if (n != im.frame_pixels) {
+            im.points = im.ctx->buffer(n * 16);
+            im.weights = im.ctx->buffer(n * 4);
+            im.frame_pixels = n;
+        }
+        frame.ensure_cpu();
+        auto* pts = static_cast<float*>(im.points->contents());
+        auto* wts = static_cast<float*>(im.weights->contents());
+        for (std::size_t i = 0; i < n; ++i) {
+            const Vec3f& p = frame.points.data()[i];
+            pts[4 * i] = p.x();
+            pts[4 * i + 1] = p.y();
+            pts[4 * i + 2] = p.z();
+            pts[4 * i + 3] = 1.0f;
+            wts[i] = frame.weights.empty() ? 1.0f : frame.weights.data()[i];
+        }
+        points_buf = im.points.get();
+        weights_buf = im.weights.get();
     }
     ++frame_;
     VolumeArgs a = im.args(params_, frame_);
@@ -213,7 +223,7 @@ void MetalTsdfVolume::integrate(const track::DepthFrame& frame, const SE3& T_wor
     *static_cast<std::uint32_t*>(im.visible_count->contents()) = 0;
     im.run([&](MTL::ComputeCommandEncoder* enc) {
         enc->setComputePipelineState(im.allocate.get());
-        enc->setBuffer(im.points.get(), 0, 0);
+        enc->setBuffer(points_buf, 0, 0);
         enc->setBuffer(im.keys.get(), 0, 1);
         enc->setBuffer(im.values.get(), 0, 2);
         enc->setBuffer(im.coords.get(), 0, 3);
@@ -230,8 +240,8 @@ void MetalTsdfVolume::integrate(const track::DepthFrame& frame, const SE3& T_wor
     if (visible == 0) return;
     im.run([&](MTL::ComputeCommandEncoder* enc) {
         enc->setComputePipelineState(im.integrate.get());
-        enc->setBuffer(im.points.get(), 0, 0);
-        enc->setBuffer(im.weights.get(), 0, 1);
+        enc->setBuffer(points_buf, 0, 0);
+        enc->setBuffer(weights_buf, 0, 1);
         enc->setBuffer(im.coords.get(), 0, 2);
         enc->setBuffer(im.visible.get(), 0, 3);
         enc->setBuffer(im.voxels.get(), 0, 4);
@@ -245,11 +255,9 @@ void MetalTsdfVolume::integrate(const track::DepthFrame& frame, const SE3& T_wor
 track::RaycastResult MetalTsdfVolume::raycast(const SE3& T_world_camera, const track::Intrinsics& k) const {
     auto& im = *impl_;
     const auto n = static_cast<std::size_t>(k.width * k.height);
-    if (n != im.ray_pixels) {
-        im.ray_points = im.ctx->buffer(n * 16);
-        im.ray_normals = im.ctx->buffer(n * 16);
-        im.ray_pixels = n;
-    }
+    // Fresh output buffers each call: the result may be held (e.g. by ICP) while the next raycast runs.
+    auto points = im.ctx->buffer(n * 16);
+    auto normals = im.ctx->buffer(n * 16);
     const VolumeArgs a = im.args(params_, frame_);
     const CameraArgs cam = camera_args(T_world_camera, k.fx, k.fy, k.cx, k.cy, k.width, k.height);
     im.run([&](MTL::ComputeCommandEncoder* enc) {
@@ -257,22 +265,15 @@ track::RaycastResult MetalTsdfVolume::raycast(const SE3& T_world_camera, const t
         enc->setBuffer(im.keys.get(), 0, 0);
         enc->setBuffer(im.values.get(), 0, 1);
         enc->setBuffer(im.voxels.get(), 0, 2);
-        enc->setBuffer(im.ray_points.get(), 0, 3);
-        enc->setBuffer(im.ray_normals.get(), 0, 4);
+        enc->setBuffer(points.get(), 0, 3);
+        enc->setBuffer(normals.get(), 0, 4);
         enc->setBytes(&a, sizeof(a), 5);
         enc->setBytes(&cam, sizeof(cam), 6);
         enc->dispatchThreads(MTL::Size(static_cast<NS::UInteger>(k.width), static_cast<NS::UInteger>(k.height), 1), MTL::Size(16, 16, 1));
     });
-    track::RaycastResult out{k, Image<Vec3f>(k.width, k.height, Vec3f::Zero()), Image<Vec3f>(k.width, k.height, Vec3f::Zero()),
-                             Image<std::uint8_t>(k.width, k.height, 0)};
-    const auto* p = static_cast<const float*>(im.ray_points->contents());
-    const auto* nr = static_cast<const float*>(im.ray_normals->contents());
-    for (std::size_t i = 0; i < n; ++i) {
-        if (p[4 * i + 3] == 0.0f) continue;
-        out.points.data()[i] = Vec3f(p[4 * i], p[4 * i + 1], p[4 * i + 2]);
-        out.normals.data()[i] = Vec3f(nr[4 * i], nr[4 * i + 1], nr[4 * i + 2]);
-        out.valid.data()[i] = 1;
-    }
+    track::RaycastResult out;
+    out.intrinsics = k;
+    out.device = std::make_shared<gpu::MetalRaycastData>(k.width, k.height, std::move(points), std::move(normals));
     return out;
 }
 
@@ -322,6 +323,42 @@ std::vector<track::SurfacePoint> MetalTsdfVolume::extract_points(std::uint32_t s
         return out;
     }
     return {};
+}
+
+MetalTsdfVolume::RenderPoints MetalTsdfVolume::extract_render_points(float min_weight) const {
+    auto& im = *impl_;
+    RenderPoints out;
+    const std::uint32_t bricks = im.count();
+    if (bricks == 0) return out;
+    VolumeArgs a = im.args(params_, frame_);
+    a.min_weight = min_weight;
+    constexpr std::size_t kVertex = 28;  // render::PointVertex
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        const std::size_t cap = std::max<std::size_t>(im.render_capacity, static_cast<std::size_t>(bricks) * 96);
+        out.buffer = im.ctx->buffer(cap * kVertex);
+        *static_cast<std::uint32_t*>(im.ext_count->contents()) = 0;
+        const auto cap32 = static_cast<std::uint32_t>(cap);
+        im.run([&](MTL::ComputeCommandEncoder* enc) {
+            enc->setComputePipelineState(im.extract_render.get());
+            enc->setBuffer(im.keys.get(), 0, 0);
+            enc->setBuffer(im.values.get(), 0, 1);
+            enc->setBuffer(im.voxels.get(), 0, 2);
+            enc->setBuffer(im.coords.get(), 0, 3);
+            enc->setBuffer(out.buffer.get(), 0, 4);
+            enc->setBuffer(im.ext_count.get(), 0, 5);
+            enc->setBytes(&a, sizeof(a), 6);
+            enc->setBytes(&cap32, sizeof(cap32), 7);
+            enc->dispatchThreadgroups(MTL::Size(bricks, 1, 1), MTL::Size(8, 8, 8));
+        });
+        const std::uint32_t found = *static_cast<std::uint32_t*>(im.ext_count->contents());
+        if (found <= cap) {
+            out.count = found;
+            im.render_capacity = std::max(im.render_capacity, static_cast<std::size_t>(found) + found / 8);
+            return out;
+        }
+        im.render_capacity = found + found / 4;  // grow and retry once
+    }
+    return out;
 }
 
 std::vector<track::BrickCoord> MetalTsdfVolume::bricks_updated_since(std::uint32_t frame) const {

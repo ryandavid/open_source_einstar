@@ -190,7 +190,9 @@ int main(int argc, char** argv) {
             state.update();
             if (auto upd = state.take_render_update()) {
                 if (upd->model) (*renderer)->set_model_points(*upd->model);
-                (*renderer)->set_frame_points(upd->frame_points);
+                if (upd->model_gpu) (*renderer)->set_model_buffer(upd->model_gpu->buffer, upd->model_gpu->count);
+                if (upd->frame_gpu) (*renderer)->set_frame_buffer(upd->frame_gpu->buffer, upd->frame_gpu->count);
+                else (*renderer)->set_frame_points(upd->frame_points);
                 (*renderer)->set_markers(upd->markers);
                 (*renderer)->set_lines(upd->lines);
                 preview_left.upload(device, upd->ir_left);

@@ -1,8 +1,10 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
+#include "einstar/core/device_data.hpp"
 #include "einstar/core/image.hpp"
 #include "einstar/core/se3.hpp"
 
@@ -33,14 +35,23 @@ struct MarkerPoint {
 };
 
 // One depth frame ready for tracking: organised points/normals in the camera frame.
+//
+// A frame may live on the GPU (`device` set by a GPU frontend). Its CPU images are then empty
+// until ensure_cpu() is called; GPU consumers read `device` directly, CPU code calls ensure_cpu().
 struct DepthFrame {
     std::uint64_t index = 0;
     double timestamp_s = 0;
     Intrinsics intrinsics;
-    Image<Vec3f> points;   // z == 0 where invalid
-    Image<Vec3f> normals;  // zero where unknown
-    ImageF32 weights;      // 0..1
+    mutable Image<Vec3f> points;   // z == 0 where invalid
+    mutable Image<Vec3f> normals;  // zero where unknown
+    mutable ImageF32 weights;      // 0..1
     std::vector<MarkerPoint> markers;
+    std::shared_ptr<const DeviceFrameData> device;
+
+    // Fills the CPU images from `device` if they are empty (no-op for CPU frames).
+    void ensure_cpu() const;
+    [[nodiscard]] int width() const { return device ? device->width() : points.width(); }
+    [[nodiscard]] int height() const { return device ? device->height() : points.height(); }
 };
 
 // Builds points/normals/weights from a Z-depth image (e.g. EXStar fixture frames).

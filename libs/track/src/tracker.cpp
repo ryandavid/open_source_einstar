@@ -77,6 +77,7 @@ std::optional<SE3> Tracker::global_candidate(const DepthFrame& frame) {
         feature_model_ = FeatureModel(voxel_downsample(model, params_.global.voxel_mm), params_.global.feature_radius_mm);
         feature_model_bricks_ = bricks;
     }
+    frame.ensure_cpu();
     OrientedCloud cloud;
     for (int v = 0; v < frame.points.height(); v += 2)
         for (int u = 0; u < frame.points.width(); u += 2) {

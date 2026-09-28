@@ -19,6 +19,7 @@
 #include "einstar/pipeline/stereo_frontend.hpp"
 #include "einstar/render/types.hpp"
 #include "einstar/track/tracker.hpp"
+#include "einstar/gpu/device_data.hpp"
 #include "einstar/track_metal/metal_icp.hpp"
 #include "einstar/usb/stream.hpp"
 
@@ -43,8 +44,13 @@ struct LiveUpdate {
     std::uint64_t frame_id = 0;
     bool accepted = false;
     bool model_changed = false;
-    std::vector<render::PointVertex> model;         // full model snapshot when model_changed
-    std::vector<render::PointVertex> frame_points;  // current frame in world coordinates
+    std::vector<render::PointVertex> model;         // full model snapshot when model_changed (CPU path)
+    std::vector<render::PointVertex> frame_points;  // current frame in world coordinates (CPU path)
+    // GPU path: the same data as GPU buffers of render::PointVertex, drawn without copies.
+    gpu::Ref<MTL::Buffer> model_buffer;
+    std::size_t model_buffer_count = 0;
+    gpu::Ref<MTL::Buffer> frame_buffer;
+    std::size_t frame_buffer_count = 0;
     std::optional<SE3> pose;
     std::optional<SE3> last_good_pose;              // for the lost-tracking ghost
     bool tracking_lost = false;
@@ -107,6 +113,7 @@ private:
     Sink sink_;
     track::Tracker tracker_;
     std::unique_ptr<track_metal::MetalIcp> gpu_icp_;
+    std::unique_ptr<class GpuOverlay> overlay_;
     ModelPointCache cache_;
 
     std::mutex mutex_;
