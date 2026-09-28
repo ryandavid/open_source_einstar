@@ -32,7 +32,8 @@ struct RenderUpdate {
     std::optional<GpuPoints> frame_gpu;
     std::vector<render::MarkerInstance> markers;
     std::vector<render::LineVertex> lines;
-    ImageU8 ir_left, ir_right;
+    ImageU8 ir_left, ir_right;                        // CPU backend
+    gpu::Ref<MTL::Texture> ir_left_tex, ir_right_tex;  // GPU backend
     std::vector<pipeline::LiveUpdate::PreviewMarker> preview_markers;  // on the left preview (half-res px)
     std::optional<Eigen::Matrix4f> scanner_pose;
     // Processed mesh (full replacement when present; an empty mesh clears it).

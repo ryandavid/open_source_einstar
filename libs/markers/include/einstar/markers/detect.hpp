@@ -45,6 +45,16 @@ struct Ellipse {
 
 [[nodiscard]] std::vector<Ellipse> detect_markers(ImageView<const std::uint8_t> image, const DetectParams& params = {});
 
+// The two stages of detect_markers: connected blobs above the threshold (also computed on the GPU,
+// see depth_metal::MetalStereo), then the sub-pixel contour / ellipse / ring tests per blob.
+struct Blob {
+    int x0 = 0, y0 = 0, x1 = 0, y1 = 0;  // inclusive box
+    int pixels = 0;
+    int peak = 0;
+};
+[[nodiscard]] std::vector<Blob> find_blobs_cpu(ImageView<const std::uint8_t> image, int threshold);
+[[nodiscard]] std::vector<Ellipse> fit_blobs(ImageView<const std::uint8_t> image, const std::vector<Blob>& blobs, const DetectParams& params);
+
 // Fitzgibbon direct ellipse fit; returns false for degenerate input.
 [[nodiscard]] bool fit_ellipse(const std::vector<Vec2>& points, Ellipse& out);
 

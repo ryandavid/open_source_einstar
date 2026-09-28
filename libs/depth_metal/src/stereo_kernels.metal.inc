@@ -450,3 +450,124 @@ kernel void point_normals(device const float4* pts [[buffer(0)]], device const f
     wts[i] = w;
 }
 )METAL"
+R"METAL(
+// ---- marker blob search on the raw IR images (the O(pixels) part of markers::detect_markers) ----
+// Connected components of pixels above the threshold (union-find as for the speckle filter), per
+// component box / size / peak / second moments by atomics, then the cheap gates of the CPU detector
+// and a dark-ring pre-check on the moment ellipse write a short candidate list; the CPU fits
+// sub-pixel ellipses to those only.
+struct BlobArgs {
+    uint w; uint h; uint threshold; uint min_diameter; uint max_diameter; float max_aspect; float min_fill;
+    uint border; float max_axis_ratio; float ring_scale; float ring_contrast; float ring_max_bright; uint max_blobs;
+};
+struct BlobOut { uint x0; uint y0; uint x1; uint y1; uint pixels; uint peak; };
+
+kernel void blob_init(device const uchar* img [[buffer(0)]], device atomic_int* L [[buffer(1)]],
+                      device atomic_uint* count [[buffer(2)]], device atomic_uint* bx0 [[buffer(3)]], device atomic_uint* by0 [[buffer(4)]],
+                      device atomic_uint* bx1 [[buffer(5)]], device atomic_uint* by1 [[buffer(6)]], device atomic_uint* peak [[buffer(7)]],
+                      device atomic_float* mom [[buffer(8)]], constant BlobArgs& a [[buffer(9)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= a.w || gid.y >= a.h) return;
+    const uint i = gid.y * a.w + gid.x;
+    atomic_store_explicit(&L[i], img[i] > a.threshold ? int(i) : -1, memory_order_relaxed);
+    atomic_store_explicit(&count[i], 0u, memory_order_relaxed);
+    atomic_store_explicit(&bx0[i], 0xFFFFFFFFu, memory_order_relaxed);
+    atomic_store_explicit(&by0[i], 0xFFFFFFFFu, memory_order_relaxed);
+    atomic_store_explicit(&bx1[i], 0u, memory_order_relaxed);
+    atomic_store_explicit(&by1[i], 0u, memory_order_relaxed);
+    atomic_store_explicit(&peak[i], 0u, memory_order_relaxed);
+    for (uint k = 0; k < 5; ++k) atomic_store_explicit(&mom[5 * i + k], 0.0f, memory_order_relaxed);
+}
+
+kernel void blob_merge(device const uchar* img [[buffer(0)]], device atomic_int* L [[buffer(1)]], constant BlobArgs& a [[buffer(2)]],
+                       uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= a.w || gid.y >= a.h) return;
+    const uint i = gid.y * a.w + gid.x;
+    if (img[i] <= a.threshold) return;
+    if (gid.x + 1 < a.w && img[i + 1] > a.threshold) ccl_unite(L, int(i), int(i + 1));
+    if (gid.y + 1 < a.h && img[i + a.w] > a.threshold) ccl_unite(L, int(i), int(i + a.w));
+}
+
+kernel void blob_stats(device const uchar* img [[buffer(0)]], device atomic_int* L [[buffer(1)]],
+                       device atomic_uint* count [[buffer(2)]], device atomic_uint* bx0 [[buffer(3)]], device atomic_uint* by0 [[buffer(4)]],
+                       device atomic_uint* bx1 [[buffer(5)]], device atomic_uint* by1 [[buffer(6)]], device atomic_uint* peak [[buffer(7)]],
+                       device atomic_float* mom [[buffer(8)]], constant BlobArgs& a [[buffer(9)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= a.w || gid.y >= a.h) return;
+    const uint i = gid.y * a.w + gid.x;
+    if (img[i] <= a.threshold) return;
+    const int r = ccl_find(L, int(i));
+    atomic_fetch_add_explicit(&count[r], 1u, memory_order_relaxed);
+    atomic_fetch_min_explicit(&bx0[r], gid.x, memory_order_relaxed);
+    atomic_fetch_min_explicit(&by0[r], gid.y, memory_order_relaxed);
+    atomic_fetch_max_explicit(&bx1[r], gid.x, memory_order_relaxed);
+    atomic_fetch_max_explicit(&by1[r], gid.y, memory_order_relaxed);
+    atomic_fetch_max_explicit(&peak[r], uint(img[i]), memory_order_relaxed);
+    // Moments relative to the root pixel (small numbers: no cancellation in float).
+    const float dx = float(int(gid.x) - int(uint(r) % a.w)), dy = float(int(gid.y) - int(uint(r) / a.w));
+    atomic_fetch_add_explicit(&mom[5 * uint(r) + 0], dx, memory_order_relaxed);
+    atomic_fetch_add_explicit(&mom[5 * uint(r) + 1], dy, memory_order_relaxed);
+    atomic_fetch_add_explicit(&mom[5 * uint(r) + 2], dx * dx, memory_order_relaxed);
+    atomic_fetch_add_explicit(&mom[5 * uint(r) + 3], dx * dy, memory_order_relaxed);
+    atomic_fetch_add_explicit(&mom[5 * uint(r) + 4], dy * dy, memory_order_relaxed);
+}
+
+inline float sample_img(device const uchar* img, constant BlobArgs& a, float x, float y) {
+    const int sx = clamp(int(round(x)), 0, int(a.w) - 1), sy = clamp(int(round(y)), 0, int(a.h) - 1);
+    return float(img[uint(sy) * a.w + uint(sx)]);
+}
+
+kernel void blob_select(device const uchar* img [[buffer(0)]], device atomic_int* L [[buffer(1)]],
+                        device atomic_uint* count [[buffer(2)]], device atomic_uint* bx0 [[buffer(3)]], device atomic_uint* by0 [[buffer(4)]],
+                        device atomic_uint* bx1 [[buffer(5)]], device atomic_uint* by1 [[buffer(6)]], device atomic_uint* peak [[buffer(7)]],
+                        device atomic_float* mom [[buffer(8)]], device BlobOut* out [[buffer(9)]], device atomic_uint* n_out [[buffer(10)]],
+                        constant BlobArgs& a [[buffer(11)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= a.w || gid.y >= a.h) return;
+    const uint i = gid.y * a.w + gid.x;
+    if (img[i] <= a.threshold || atomic_load_explicit(&L[i], memory_order_relaxed) != int(i)) return;  // roots only
+    const uint x0 = atomic_load_explicit(&bx0[i], memory_order_relaxed), y0 = atomic_load_explicit(&by0[i], memory_order_relaxed);
+    const uint x1 = atomic_load_explicit(&bx1[i], memory_order_relaxed), y1 = atomic_load_explicit(&by1[i], memory_order_relaxed);
+    const uint px = atomic_load_explicit(&count[i], memory_order_relaxed), pk = atomic_load_explicit(&peak[i], memory_order_relaxed);
+    const float bw = float(x1 - x0 + 1), bh = float(y1 - y0 + 1);
+    // Same gates as the CPU detector (size, aspect, fill, room for the local background ring).
+    if (bw < float(a.min_diameter) || bh < float(a.min_diameter) || bw > float(a.max_diameter) || bh > float(a.max_diameter)) return;
+    if (max(bw, bh) > a.max_aspect * min(bw, bh)) return;
+    if (float(px) < a.min_fill * bw * bh * M_PI_F / 4.0f) return;
+    const int m = max(3, int(max(bw, bh)) / 2);
+    if (int(x0) - m < int(a.border) || int(y0) - m < int(a.border) || int(x1) + m >= int(a.w - a.border) || int(y1) + m >= int(a.h - a.border))
+        return;
+    // Ellipse of the blob from its second moments (a filled ellipse has variance (axis/2)^2).
+    const float n = float(px);
+    const float mx = atomic_load_explicit(&mom[5 * i + 0], memory_order_relaxed) / n;
+    const float my = atomic_load_explicit(&mom[5 * i + 1], memory_order_relaxed) / n;
+    const float cxx = atomic_load_explicit(&mom[5 * i + 2], memory_order_relaxed) / n - mx * mx;
+    const float cxy = atomic_load_explicit(&mom[5 * i + 3], memory_order_relaxed) / n - mx * my;
+    const float cyy = atomic_load_explicit(&mom[5 * i + 4], memory_order_relaxed) / n - my * my;
+    const float tr = 0.5f * (cxx + cyy), det = sqrt(max(0.0f, 0.25f * (cxx - cyy) * (cxx - cyy) + cxy * cxy));
+    const float l1 = tr + det, l2 = max(tr - det, 0.0625f);
+    const float ea = 2.0f * sqrt(l1) + 0.5f, eb = 2.0f * sqrt(l2) + 0.5f;  // + half a pixel: the threshold edge sits inside the half-level contour
+    if (ea / eb > a.max_axis_ratio * 1.2f) return;
+    const float th = 0.5f * atan2(2.0f * cxy, cxx - cyy);
+    const float ct = cos(th), st = sin(th);
+    const float cx = float(i % a.w) + mx, cy = float(i / a.w) + my;
+    // Background: a low sample on the surface outside the sticker (2.2x the disc).
+    float bg[16];
+    for (int k = 0; k < 16; ++k) {
+        const float t = 2.0f * M_PI_F * float(k) / 16.0f;
+        const float u = 2.2f * ea * cos(t), v = 2.2f * eb * sin(t);
+        bg[k] = sample_img(img, a, cx + ct * u - st * v, cy + st * u + ct * v);
+    }
+    for (int p = 0; p < 4; ++p)  // partial selection: 4th smallest
+        for (int q = p + 1; q < 16; ++q)
+            if (bg[q] < bg[p]) { const float tmp = bg[p]; bg[p] = bg[q]; bg[q] = tmp; }
+    const float level = bg[3] + a.ring_contrast * (float(pk) - bg[3]);
+    // The sticker's dark ring must surround the disc (laser speckle dots sit among bright neighbours).
+    int bright = 0;
+    for (int k = 0; k < 16; ++k) {
+        const float t = 2.0f * M_PI_F * float(k) / 16.0f;
+        const float u = a.ring_scale * ea * cos(t), v = a.ring_scale * eb * sin(t);
+        bright += sample_img(img, a, cx + ct * u - st * v, cy + st * u + ct * v) > level ? 1 : 0;
+    }
+    if (float(bright) > a.ring_max_bright * 16.0f) return;
+    const uint slot = atomic_fetch_add_explicit(n_out, 1u, memory_order_relaxed);
+    if (slot < a.max_blobs) out[slot] = BlobOut{x0, y0, x1, y1, px, pk};
+}
+)METAL"

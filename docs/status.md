@@ -39,7 +39,13 @@ the float GPU solve well conditioned and makes the degeneracy analysis independe
 scan started; the degeneracy/relocalisation thresholds were recalibrated for it.
 
 ## Known issues / next steps
-1. **Speed**: done. Frames stay GPU-resident from stereo through ICP, fusion and rendering (speckle filter, points/normals, balancing weights, raycasts, surface extraction and the live overlay are all GPU buffers; the CPU only touches them for relocalisation and fallbacks). Full frame path 8.6 ms (was 12.9 ms with CPU round trips, ~50 ms all-CPU).
+1. **CPU use** (`einstar-bench pipeline`, emulated frames with markers, recording on): 24.1 → 3.6 ms of CPU per frame across all threads. The work moved to the GPU:
+   - marker blob search: threshold, connected components, per-blob box, size, peak and moments, gates, and a dark-ring pre-check on the moment ellipse; about 100 candidates per frame reach the CPU's sub-pixel fit;
+   - camera previews: textures copied GPU to GPU;
+   - raw IR: the camera frames are used by the GPU in place (page-aligned image storage, no-copy buffers);
+   - recording: depth packing on the GPU, zstd level 1.
+   What remains on the CPU: the ellipse fits (~1.6 ms), zstd (~1 ms), tracker bookkeeping, marker hole filling, and relocalisation while lost.
+2. **Speed**: done. Frames stay GPU-resident from stereo through ICP, fusion and rendering (speckle filter, points/normals, balancing weights, raycasts, surface extraction and the live overlay are all GPU buffers; the CPU only touches them for relocalisation and fallbacks). Full frame path 8.6 ms (was 12.9 ms with CPU round trips, ~50 ms all-CPU).
 2. **Open-loop drift** on young models (synthetic sweep: ~0.03 deg/frame). Fix in the process step: keyframe pose graph + loop closure + re-fusion.
 3. **Surfaces of revolution** are geometrically ambiguous; depth-only tracking holds but may slide. Use markers (hybrid / global markers) or, later, texture.
 4. **Markers on real IR**: tuned on EXStar's calibration captures and synthetic stickers only. Real scans may need the detection threshold / ring test adjusted (live speckle brightness vs. retro-reflective return under the strobe is unknown until hardware). 3 mm markers are disabled by default (too close to speckle size).

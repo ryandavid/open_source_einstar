@@ -43,6 +43,16 @@ StereoFrontend::StereoFrontend(const RigCalibration& rig, StereoFrontendParams p
             half.cx = depth_k_.cx;
             half.cy = depth_k_.cy;
             (*m)->set_point_params(half, static_cast<float>(params_.min_depth_mm), static_cast<float>(params_.max_depth_mm), 4.0f);
+            depth_metal::BlobParams bp;
+            const auto& d = params_.marker_detect;
+            bp.threshold = static_cast<std::uint32_t>(d.threshold);
+            bp.min_diameter = static_cast<std::uint32_t>(std::ceil(d.min_diameter_px));
+            bp.max_diameter = static_cast<std::uint32_t>(d.max_diameter_px);
+            bp.max_aspect = static_cast<float>(d.max_aspect);
+            bp.min_fill = static_cast<float>(d.min_fill);
+            bp.border = static_cast<std::uint32_t>(d.border);
+            bp.max_axis_ratio = static_cast<float>(d.max_axis_ratio);
+            (*m)->set_blob_params(bp);
             metal_ = std::move(*m);
         } else if (params_.backend == StereoBackend::metal) {
             log::error("Metal stereo unavailable: {}", m ? "rectification setup failed" : m.error().message);
@@ -168,11 +178,27 @@ void fill_marker_hole(const FrameAccess& fa, const track::Intrinsics& k, const S
 
 }  // namespace
 
-void StereoFrontend::add_markers(const ImageU8& raw_left, const ImageU8& raw_right, DepthOutput& out) const {
+void StereoFrontend::add_markers(const ImageU8& raw_left, const ImageU8& raw_right, DepthOutput& out,
+                                 const std::array<std::vector<depth_metal::BlobBox>, 2>* gpu_blobs) const {
     Stopwatch sw;
     std::vector<markers::Ellipse> left, right;
-    tbb::parallel_invoke([&] { left = markers::detect_markers(raw_left.view(), params_.marker_detect); },
-                         [&] { right = markers::detect_markers(raw_right.view(), params_.marker_detect); });
+    if (gpu_blobs) {
+        // The GPU already found the candidate blobs: only the sub-pixel fits run here.
+        auto to_blobs = [](const std::vector<depth_metal::BlobBox>& in) {
+            std::vector<markers::Blob> b;
+            b.reserve(in.size());
+            for (const auto& g : in)
+                b.push_back({static_cast<int>(g.x0), static_cast<int>(g.y0), static_cast<int>(g.x1), static_cast<int>(g.y1),
+                             static_cast<int>(g.pixels), static_cast<int>(g.peak)});
+            return b;
+        };
+        out.marker_candidates = static_cast<int>((*gpu_blobs)[0].size() + (*gpu_blobs)[1].size());
+        left = markers::fit_blobs(raw_left.view(), to_blobs((*gpu_blobs)[0]), params_.marker_detect);
+        right = markers::fit_blobs(raw_right.view(), to_blobs((*gpu_blobs)[1]), params_.marker_detect);
+    } else {
+        tbb::parallel_invoke([&] { left = markers::detect_markers(raw_left.view(), params_.marker_detect); },
+                             [&] { right = markers::detect_markers(raw_right.view(), params_.marker_detect); });
+    }
     if (left.empty() || right.empty()) {
         for (const auto& e : left) out.unmatched_left.push_back(marker_stereo_->rectify_left(e.center));
         out.marker_ms = sw.elapsed_ms();
@@ -244,11 +270,19 @@ DepthOutput StereoFrontend::process(const ImageU8& raw_left, const ImageU8& raw_
     if (metal_) {
         // GPU path: the whole frame (points, normals, weights) stays resident on the GPU.
         std::lock_guard lock(metal_mutex_);
-        if (auto f = metal_->compute_frame_raw(raw_left.view(), raw_right.view(), &out.rectified_left, &out.rectified_right)) {
+        depth_metal::FrameRequest req;
+        req.preview_textures = params_.gpu_previews;
+        req.preview_images = params_.cpu_previews;
+        req.marker_blobs = params_.detect_markers;
+        if (auto f = metal_->compute_frame(raw_left, raw_right, req)) {
             out.frame.intrinsics = depth_k_;
-            out.frame.device = std::move(*f);
+            out.frame.device = std::move(f->frame);
+            out.rectified_left = std::move(f->rect_left);
+            out.rectified_right = std::move(f->rect_right);
+            out.preview_left = std::move(f->preview_left);
+            out.preview_right = std::move(f->preview_right);
             out.stereo_ms = sw.elapsed_ms();
-            if (params_.detect_markers) add_markers(raw_left, raw_right, out);
+            if (params_.detect_markers) add_markers(raw_left, raw_right, out, &f->blobs);
             return out;
         } else {
             log::warn("Metal stereo failed ({}); using CPU for this frame", f.error().message);

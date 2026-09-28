@@ -4,6 +4,8 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <new>
 #include <span>
 #include <type_traits>
 #include <vector>
@@ -36,6 +38,29 @@ struct ImageView {
     [[nodiscard]] constexpr bool contains(int x, int y) const { return x >= 0 && y >= 0 && x < width && y < height; }
 };
 
+// Page-aligned storage (16 KiB, the Apple Silicon page), rounded up to whole pages: the GPU can use an
+// image's memory in place (a no-copy Metal buffer) instead of copying it, e.g. raw camera frames.
+inline constexpr std::size_t kImagePageBytes = 16384;
+
+template <typename T>
+struct PageAlignedAllocator {
+    using value_type = T;
+    PageAlignedAllocator() = default;
+    template <typename U>
+    PageAlignedAllocator(const PageAlignedAllocator<U>&) noexcept {}
+    [[nodiscard]] T* allocate(std::size_t n) {
+        const std::size_t bytes = (n * sizeof(T) + kImagePageBytes - 1) / kImagePageBytes * kImagePageBytes;
+        void* p = std::aligned_alloc(kImagePageBytes, std::max(bytes, kImagePageBytes));
+        if (!p) throw std::bad_alloc();
+        return static_cast<T*>(p);
+    }
+    void deallocate(T* p, std::size_t) noexcept { std::free(p); }
+    template <typename U>
+    bool operator==(const PageAlignedAllocator<U>&) const noexcept {
+        return true;
+    }
+};
+
 // Owning, tightly packed 2D image.
 template <typename T>
 class Image {
@@ -64,7 +89,7 @@ public:
 private:
     int width_ = 0;
     int height_ = 0;
-    std::vector<T> pixels_;
+    std::vector<T, PageAlignedAllocator<T>> pixels_;
 };
 
 using ImageU8 = Image<std::uint8_t>;

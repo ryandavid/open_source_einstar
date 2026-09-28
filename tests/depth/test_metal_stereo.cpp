@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <filesystem>
 #include <print>
 
@@ -7,7 +8,10 @@
 #include "einstar/core/timing.hpp"
 #include "einstar/depth/point_image.hpp"
 #include "einstar/depth/stereo.hpp"
+#include "einstar/depth_metal/depth_packer.hpp"
 #include "einstar/depth_metal/metal_stereo.hpp"
+#include "einstar/markers/detect.hpp"
+#include "einstar/synth/demo.hpp"
 #include "einstar/synth/speckle_scene.hpp"
 
 using namespace einstar;
@@ -174,4 +178,95 @@ TEST_CASE("Metal stereo produces GPU-resident frames matching the CPU point conv
     CHECK(mismatch == 0);
     CHECK(nmis <= nvalid / 1000);
     CHECK(wmis <= valid / 1000);
+}
+
+TEST_CASE("compute_frame (raw images used in place, previews, blobs) matches the copying path; GPU packing matches the CPU") {
+    auto ctx = gpu::Context::create();
+    REQUIRE(ctx.has_value());
+    // The table scene with marker stickers, seen from above.
+    Pair pr = make_pair();
+    {
+        synth::Scene scene = synth::table_scene();
+        scene.markers = synth::scatter_markers(45, 5);
+        const SE3 T_lr = pr.rig.T_right_left.inverse();
+        const double half_toe = 0.5 * rotation_angle(pr.rig.T_right_left);
+        SE3 T = synth::look_at(Vec3(-160, -150, -230), Vec3(-80, 30, 20));
+        T.linear() = T.linear() * Eigen::AngleAxisd(half_toe, Vec3::UnitY()).toRotationMatrix();
+        synth::Projector proj = synth::speckle_projector();
+        proj.T_world_projector = T;
+        proj.T_world_projector.translation() = T * (0.5 * T_lr.translation());
+        proj.T_world_projector.linear() = T.linear() * Eigen::AngleAxisd(-half_toe, Vec3::UnitY()).toRotationMatrix();
+        synth::RenderParams rp;
+        rp.supersample = 1;
+        pr.left = synth::render_view(scene, proj, pr.rig.left, T, rp).image;
+        pr.right = synth::render_view(scene, proj, pr.rig.right, T * T_lr, rp).image;
+    }
+    const auto rect = calib::compute_rectification(pr.rig);
+    const auto ml = calib::build_remap(pr.rig.left, rect.R_left, rect.rectified);
+    const auto mr = calib::build_remap(pr.rig.right, rect.R_right, rect.rectified);
+    depth::StereoParams sp;
+    sp.pyramid_levels = 1;
+    const auto& g = rect.geometry;
+    sp.sgm.min_disparity = static_cast<int>(g.disparity_from_depth(700) / 4) - 2;
+    sp.sgm.num_disparities = static_cast<int>(g.disparity_from_depth(150) / 4) - sp.sgm.min_disparity + 4;
+    auto gpu = depth_metal::MetalStereo::create(*ctx, sp, ml.width / 2, ml.height / 2);
+    REQUIRE(gpu.has_value());
+    REQUIRE((*gpu)->set_rectification(ml, mr, pr.left.width(), pr.left.height()).has_value());
+    depth::RectifiedGeometry half = g;
+    half.f = g.f / 2;
+    half.cx = (g.cx + 0.5) / 2 - 0.5;
+    half.cy = (g.cy + 0.5) / 2 - 0.5;
+    (*gpu)->set_point_params(half, 150.0f, 700.0f, 4.0f);
+    (*gpu)->set_blob_params({});
+    REQUIRE(reinterpret_cast<std::uintptr_t>(pr.left.data()) % kImagePageBytes == 0);  // eligible for in-place use
+
+    ImageU8 rl, rr;
+    auto copied = (*gpu)->compute_frame_raw(pr.left.view(), pr.right.view(), &rl, &rr);
+    REQUIRE(copied.has_value());
+    std::vector<float> ref((*copied)->points_xyzw(), (*copied)->points_xyzw() + 4 * rl.size());
+    depth_metal::FrameRequest req;
+    req.preview_textures = req.preview_images = req.marker_blobs = true;
+    auto out = (*gpu)->compute_frame(pr.left, pr.right, req);
+    REQUIRE(out.has_value());
+    CHECK(std::equal(ref.begin(), ref.end(), out->frame->points_xyzw()));
+    CHECK(std::equal(rl.pixels().begin(), rl.pixels().end(), out->rect_left.pixels().begin()));
+    REQUIRE(out->preview_left);
+    CHECK(out->preview_left->width() == static_cast<NS::UInteger>(rl.width()));
+
+    // GPU blob candidates must include every blob the CPU detector accepts.
+    const auto cpu_left = markers::detect_markers(pr.left.view());
+    const auto gpu_left = markers::fit_blobs(pr.left.view(), [&] {
+        std::vector<markers::Blob> b;
+        for (const auto& x : out->blobs[0])
+            b.push_back({static_cast<int>(x.x0), static_cast<int>(x.y0), static_cast<int>(x.x1), static_cast<int>(x.y1), static_cast<int>(x.pixels),
+                         static_cast<int>(x.peak)});
+        return b;
+    }(), {});
+    std::println("blobs: {} GPU candidates of {} found; CPU detector {} markers, GPU path {}", out->blobs[0].size(), out->blobs_found[0],
+                 cpu_left.size(), gpu_left.size());
+    REQUIRE(cpu_left.size() >= 10);
+    CHECK(gpu_left.size() == cpu_left.size());
+
+    // Packing for recording: same bytes as the CPU quantisation (1/50 mm, delta along rows).
+    auto packer = depth_metal::DepthPacker::create(*ctx);
+    REQUIRE(packer.has_value());
+    auto packed = (*packer)->pack(out->frame);
+    packed->wait();
+    const auto bytes = packed->bytes();
+    const int w = out->frame->width(), h = out->frame->height();
+    const auto* d16 = reinterpret_cast<const std::uint16_t*>(bytes.data());
+    int off = 0, worst = 0;
+    for (int y = 0; y < h; ++y) {
+        std::uint16_t acc = 0;  // decode the row (deltas -> absolute), as the reader does
+        for (int x = 0; x < w; ++x) {
+            acc = static_cast<std::uint16_t>(acc + d16[y * w + x]);
+            const float z = out->frame->points_xyzw()[4 * (y * w + x) + 2];
+            const long q = z > 0 ? std::clamp(std::lround(static_cast<double>(z) * 50.0), 1L, 65535L) : 0;
+            const int d = std::abs(static_cast<int>(acc) - static_cast<int>(q));
+            off += d != 0;
+            worst = std::max(worst, d);
+        }
+    }
+    std::println("packing: {} of {} pixels differ from the CPU quantisation, by at most {} (1/50 mm)", off, w * h, worst);
+    CHECK(worst <= 1);  // float vs double rounding only
 }

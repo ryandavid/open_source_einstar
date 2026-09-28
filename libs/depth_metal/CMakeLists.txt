@@ -1,4 +1,4 @@
-add_library(einstar_depth_metal src/metal_stereo.cpp)
+add_library(einstar_depth_metal src/metal_stereo.cpp src/depth_packer.cpp)
 add_library(einstar::depth_metal ALIAS einstar_depth_metal)
 target_include_directories(einstar_depth_metal PUBLIC include PRIVATE src)
 target_link_libraries(einstar_depth_metal PUBLIC einstar::depth einstar::calib einstar::gpu)

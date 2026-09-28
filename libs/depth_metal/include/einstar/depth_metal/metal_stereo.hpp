@@ -3,7 +3,9 @@
 // Metal implementation of the stereo pipeline in libs/depth (same algorithm, same parameters).
 // All buffers use shared storage, so results are read by the CPU without copies.
 
+#include <array>
 #include <memory>
+#include <vector>
 #include <optional>
 
 #include "einstar/calib/rectify.hpp"
@@ -13,6 +15,40 @@
 #include "einstar/gpu/device_data.hpp"
 
 namespace einstar::depth_metal {
+
+// GPU marker blob search on the raw images (the per-pixel part of markers::detect_markers).
+struct BlobParams {
+    std::uint32_t threshold = 150;
+    std::uint32_t min_diameter = 3, max_diameter = 60;
+    float max_aspect = 4.0f;
+    float min_fill = 0.5f;
+    std::uint32_t border = 4;
+    float max_axis_ratio = 3.0f;
+    // Dark-ring pre-check on the blob's moment ellipse (a little more lenient than the CPU's test on
+    // the fitted ellipse, which follows).
+    float ring_scale = 1.4f;
+    float ring_contrast = 0.3f;
+    float ring_max_bright = 0.2f;
+    std::uint32_t max_blobs = 1024;
+};
+struct BlobBox {
+    std::uint32_t x0, y0, x1, y1, pixels, peak;
+};
+static_assert(sizeof(BlobBox) == 24);
+
+struct FrameRequest {
+    bool preview_textures = false;  // rectified pair as GPU textures (for display)
+    bool preview_images = false;    // rectified pair copied to CPU images
+    bool marker_blobs = false;      // needs set_blob_params()
+};
+
+struct FrameOutputs {
+    std::shared_ptr<gpu::MetalFrameData> frame;
+    gpu::Ref<MTL::Texture> preview_left, preview_right;  // R8Unorm, private storage
+    ImageU8 rect_left, rect_right;
+    std::array<std::vector<BlobBox>, 2> blobs;           // left, right candidates
+    std::array<std::uint32_t, 2> blobs_found{};          // before the max_blobs cap
+};
 
 struct StereoTimings {
     double gpu_ms = 0;      // GPU execution time of the command buffer
@@ -45,12 +81,18 @@ public:
                                                                    ImageView<const std::uint8_t> raw_right,
                                                                    ImageU8* rect_left = nullptr, ImageU8* rect_right = nullptr);
 
+    // Full GPU path with extras. Raw images whose storage is an einstar::Image (page aligned) are used
+    // by the GPU in place; nothing is copied.
+    void set_blob_params(const BlobParams& params);
+    Result<FrameOutputs> compute_frame(const ImageU8& raw_left, const ImageU8& raw_right, const FrameRequest& request);
+
     [[nodiscard]] const StereoTimings& last_timings() const { return timings_; }
 
 private:
     struct Impl;
     explicit MetalStereo(std::unique_ptr<Impl> impl);
-    Result<void> encode_and_run(bool from_raw, bool make_points, ImageU8* rect_left, ImageU8* rect_right);
+    Result<void> encode_and_run(bool from_raw, bool make_points, ImageU8* rect_left, ImageU8* rect_right,
+                                const FrameRequest* request = nullptr, FrameOutputs* outputs = nullptr);
     [[nodiscard]] depth::StereoResult read_result() const;
     std::unique_ptr<Impl> impl_;
     StereoTimings timings_;

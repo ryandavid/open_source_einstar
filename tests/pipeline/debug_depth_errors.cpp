@@ -12,7 +12,9 @@ using namespace einstar;
 int main(int argc, char** argv) {
     const auto rig = e2e::einstar_like_rig();
     const auto setup = e2e::make_scene();
-    pipeline::StereoFrontend fe(rig);
+    pipeline::StereoFrontendParams fp_cpu_previews;
+    fp_cpu_previews.cpu_previews = true;
+    pipeline::StereoFrontend fe(rig, fp_cpu_previews);
     long counts[4][3] = {};  // distance band x {total, >0.5 mm, >2 mm}
     long kind[3][3] = {};    // {interior, hole border, depth jump} x {total, >0.5, >2}
     long signed_hist[2] = {}, sil_hist[2] = {}, no_hit = 0;

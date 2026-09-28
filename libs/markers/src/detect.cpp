@@ -10,12 +10,6 @@
 namespace einstar::markers {
 namespace {
 
-struct Blob {
-    int x0, y0, x1, y1;  // inclusive box
-    int pixels = 0;
-    int peak = 0;
-};
-
 // Connected components (4-neighbourhood) of pixels above the threshold.
 std::vector<Blob> find_blobs(ImageView<const std::uint8_t> img, int thr) {
     const int w = img.width, h = img.height;
@@ -64,6 +58,8 @@ std::vector<Vec2> iso_points(ImageView<const std::uint8_t> img, int x0, int y0, 
 }
 
 }  // namespace
+
+std::vector<Blob> find_blobs_cpu(ImageView<const std::uint8_t> img, int threshold) { return find_blobs(img, threshold); }
 
 bool fit_ellipse(const std::vector<Vec2>& pts, Ellipse& out) {
     if (pts.size() < 6) return false;
@@ -140,10 +136,13 @@ bool fit_ellipse(const std::vector<Vec2>& pts, Ellipse& out) {
 }
 
 std::vector<Ellipse> detect_markers(ImageView<const std::uint8_t> img, const DetectParams& p) {
-    const auto blobs = find_blobs(img, p.threshold);
+    return fit_blobs(img, find_blobs(img, p.threshold), p);
+}
+
+std::vector<Ellipse> fit_blobs(ImageView<const std::uint8_t> img, const std::vector<Blob>& blobs, const DetectParams& p) {
     std::vector<Ellipse> found(blobs.size());
     std::vector<std::uint8_t> ok(blobs.size(), 0);
-    tbb::parallel_for(std::size_t{0}, blobs.size(), [&](std::size_t bi) {
+    auto fit_one = [&](std::size_t bi) {
         const Blob& b = blobs[bi];
         const int bw = b.x1 - b.x0 + 1, bh = b.y1 - b.y0 + 1;
         if (bw < p.min_diameter_px || bh < p.min_diameter_px || bw > p.max_diameter_px || bh > p.max_diameter_px) return;
@@ -206,7 +205,12 @@ std::vector<Ellipse> detect_markers(ImageView<const std::uint8_t> img, const Det
         e.peak = b.peak;
         found[bi] = e;
         ok[bi] = 1;
-    });
+    };
+    // Few blobs (the GPU pre-selects them): a thread pool would cost more than the work.
+    if (blobs.size() < 128)
+        for (std::size_t bi = 0; bi < blobs.size(); ++bi) fit_one(bi);
+    else
+        tbb::parallel_for(std::size_t{0}, blobs.size(), fit_one);
     std::vector<Ellipse> out;
     for (std::size_t i = 0; i < found.size(); ++i)
         if (ok[i]) out.push_back(found[i]);

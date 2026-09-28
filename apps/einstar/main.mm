@@ -40,6 +40,14 @@ struct PreviewTexture {
     id<MTLTexture> texture = nil;
     int width = 0, height = 0;
 
+    // GPU backend: the pipeline's texture is drawn as is (no CPU copy, no upload).
+    void set(const gpu::Ref<MTL::Texture>& t) {
+        if (!t) return;
+        texture = (__bridge id<MTLTexture>)t.get();
+        width = static_cast<int>(t->width());
+        height = static_cast<int>(t->height());
+    }
+
     void upload(id<MTLDevice> device, const ImageU8& img) {
         if (img.empty()) return;
         if (!texture || width != img.width() || height != img.height()) {
@@ -159,6 +167,7 @@ int main(int argc, char** argv) {
     render::RenderSettings settings;
     MouseState mouse;
     PreviewTexture preview_left, preview_right;
+    gpu::Ref<MTL::Texture> preview_left_ref, preview_right_ref;
     std::vector<pipeline::LiveUpdate::PreviewMarker> preview_markers;
     int align_mode = 1;  // hybrid
     int voxel_choice = 1;  // 0.3 / 0.5 / 1.0 mm
@@ -215,6 +224,13 @@ int main(int argc, char** argv) {
                 (*renderer)->set_markers(upd->markers);
                 (*renderer)->set_lines(upd->lines);
                 preview_left.upload(device, upd->ir_left);
+                if (upd->ir_left_tex) {
+                    // Keep the textures alive while ImGui draws them this frame.
+                    preview_left_ref = upd->ir_left_tex;
+                    preview_right_ref = upd->ir_right_tex;
+                    preview_left.set(preview_left_ref);
+                    preview_right.set(preview_right_ref);
+                }
                 preview_markers = std::move(upd->preview_markers);
                 if (upd->mesh) {
                     (*renderer)->set_mesh(upd->mesh->first, upd->mesh->second);

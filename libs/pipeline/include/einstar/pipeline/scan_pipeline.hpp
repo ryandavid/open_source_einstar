@@ -18,6 +18,7 @@
 #include "einstar/core/timing.hpp"
 #include "einstar/optim/marker_bundle.hpp"
 #include "einstar/session/session.hpp"
+#include "einstar/depth_metal/depth_packer.hpp"
 #include "einstar/pipeline/stereo_frontend.hpp"
 #include "einstar/render/types.hpp"
 #include "einstar/track/tracker.hpp"
@@ -77,7 +78,8 @@ struct LiveUpdate {
     std::optional<SE3> pose;
     std::optional<SE3> last_good_pose;              // for the lost-tracking ghost
     bool tracking_lost = false;
-    ImageU8 preview_left, preview_right;
+    ImageU8 preview_left, preview_right;                  // CPU backend
+    gpu::Ref<MTL::Texture> preview_left_tex, preview_right_tex;  // GPU backend (drawn directly)
     // Marker overlays: world discs (map + current frame) and preview-image ellipses (half-res rectified px).
     std::vector<render::MarkerInstance> markers;
     struct PreviewMarker {
@@ -195,6 +197,7 @@ private:
     std::atomic<std::uint64_t> frames_taken_{0};
     TimingStats marker_times_{64};
     std::string record_dir_;
+    std::unique_ptr<depth_metal::DepthPacker> packer_;  // GPU frames are packed for recording on the GPU
     std::unique_ptr<session::SessionWriter> recorder_;
     mutable std::mutex recorder_mutex_;
 

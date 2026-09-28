@@ -1,6 +1,8 @@
 #include "einstar/depth_metal/metal_stereo.hpp"
 
+#include <algorithm>
 #include <cstring>
+#include <optional>
 #include <mutex>
 #include <format>
 #include <vector>
@@ -24,6 +26,13 @@ struct LrArgs { std::uint32_t w, h; float max_diff; };
 struct RefineArgs { std::uint32_t w, h, cw, ch; std::int32_t radius, search_radius; float min_zncc; std::uint32_t subpixel; };
 struct CclArgs { std::uint32_t w, h; float max_diff; std::uint32_t min_size; };
 struct PointsArgs { std::uint32_t w, h; float f, cx, cy, baseline, min_depth, max_depth, max_jump; };
+struct BlobArgs {
+    std::uint32_t w, h, threshold, min_diameter, max_diameter;
+    float max_aspect, min_fill;
+    std::uint32_t border;
+    float max_axis_ratio, ring_scale, ring_contrast, ring_max_bright;
+    std::uint32_t max_blobs;
+};
 
 using gpu::Ref;
 
@@ -38,6 +47,14 @@ struct MetalStereo::Impl {
 
     Ref<MTL::ComputePipelineState> rectify, down, census, cost, path, wta_l, wta_r, lr, median, refine;
     Ref<MTL::ComputePipelineState> ccl_init, ccl_merge, ccl_count, ccl_filter, pts_kernel, nrm_kernel;
+    Ref<MTL::ComputePipelineState> blob_init, blob_merge, blob_stats, blob_select;
+    // Marker blob search (per side): labels, per-root count/box/peak, compacted candidates.
+    struct BlobBuffers { Ref<MTL::Buffer> L, count, x0, y0, x1, y1, peak, moments, out, n_out; };
+    std::array<BlobBuffers, 2> blob_bufs;
+    std::optional<BlobParams> blob_params;
+    // Raw inputs bound for this frame (the persistent upload buffers, or the caller's images wrapped in place).
+    MTL::Buffer* bound_raw_l = nullptr;
+    MTL::Buffer* bound_raw_r = nullptr;
     Ref<MTL::Buffer> labels, sizes;
     PointsArgs points_args{};
     bool have_points = false;
@@ -84,7 +101,9 @@ Result<std::unique_ptr<MetalStereo>> MetalStereo::create(std::shared_ptr<gpu::Co
                            std::pair{"median3", &im->median}, std::pair{"refine_slanted", &im->refine},
                            std::pair{"ccl_init", &im->ccl_init}, std::pair{"ccl_merge", &im->ccl_merge},
                            std::pair{"ccl_count", &im->ccl_count}, std::pair{"ccl_filter", &im->ccl_filter},
-                           std::pair{"disparity_points", &im->pts_kernel}, std::pair{"point_normals", &im->nrm_kernel}})
+                           std::pair{"disparity_points", &im->pts_kernel}, std::pair{"point_normals", &im->nrm_kernel},
+                           std::pair{"blob_init", &im->blob_init}, std::pair{"blob_merge", &im->blob_merge},
+                           std::pair{"blob_stats", &im->blob_stats}, std::pair{"blob_select", &im->blob_select}})
         if (auto r = make(n, *slot); !r) return std::unexpected(r.error());
 
     const int levels = params.pyramid_levels;
@@ -138,6 +157,7 @@ Result<void> MetalStereo::set_rectification(const calib::RemapTable& left, const
     pack(right, im.map_r.get());
     im.raw_l = im.buf(static_cast<std::size_t>(raw_w * raw_h));
     im.raw_r = im.buf(static_cast<std::size_t>(raw_w * raw_h));
+    if (im.blob_params) set_blob_params(*im.blob_params);
     return {};
 }
 
@@ -195,6 +215,64 @@ Result<std::shared_ptr<gpu::MetalFrameData>> MetalStereo::compute_frame_raw(Imag
     });
 }
 
+void MetalStereo::set_blob_params(const BlobParams& params) {
+    auto& im = *impl_;
+    im.blob_params = params;
+    if (im.raw_w == 0) return;  // buffers are sized when the rectification (raw size) is known
+    const auto n = static_cast<std::size_t>(im.raw_w * im.raw_h);
+    for (auto& b : im.blob_bufs) {
+        if (b.L && b.L->length() >= n * 4 && b.out->length() >= params.max_blobs * sizeof(BlobBox)) continue;
+        b = {im.buf(n * 4), im.buf(n * 4), im.buf(n * 4), im.buf(n * 4), im.buf(n * 4), im.buf(n * 4), im.buf(n * 4), im.buf(n * 20),
+             im.buf(params.max_blobs * sizeof(BlobBox)), im.buf(4)};
+    }
+}
+
+Result<FrameOutputs> MetalStereo::compute_frame(const ImageU8& raw_left, const ImageU8& raw_right, const FrameRequest& request) {
+    auto& im = *impl_;
+    if (!im.have_points) return make_error(Errc::invalid_argument, "set_point_params() not called");
+    if (!im.map_l) return make_error(Errc::invalid_argument, "set_rectification() not called");
+    if (raw_left.width() != im.raw_w || raw_left.height() != im.raw_h || raw_right.width() != im.raw_w || raw_right.height() != im.raw_h)
+        return make_error(Errc::invalid_argument, "raw size mismatch");
+    if (request.marker_blobs && !im.blob_params) return make_error(Errc::invalid_argument, "set_blob_params() not called");
+    if (request.marker_blobs) set_blob_params(*im.blob_params);  // (sizes buffers on first use)
+    {
+        std::lock_guard lock(im.pool_mutex);
+        if (!im.pool.empty()) {
+            im.current = std::move(im.pool.back());
+            im.pool.pop_back();
+        } else {
+            const auto n = static_cast<std::size_t>(im.w * im.h);
+            im.current = {im.buf(n * 16), im.buf(n * 16), im.buf(n * 4)};
+        }
+    }
+    // einstar::Image storage is page aligned and padded to whole pages: wrap it, do not copy.
+    auto wrap = [&](const ImageU8& img) -> Ref<MTL::Buffer> {
+        const auto addr = reinterpret_cast<std::uintptr_t>(img.data());
+        if (addr % kImagePageBytes != 0) return {};
+        const std::size_t len = (img.size() + kImagePageBytes - 1) / kImagePageBytes * kImagePageBytes;
+        return Ref<MTL::Buffer>(im.ctx->device()->newBuffer(img.data(), len, MTL::ResourceStorageModeShared, nullptr));
+    };
+    Ref<MTL::Buffer> wl = wrap(raw_left), wr = wrap(raw_right);
+    auto copy = [&](const ImageU8& src, MTL::Buffer* dst) { std::memcpy(dst->contents(), src.data(), src.size()); };
+    if (!wl) copy(raw_left, im.raw_l.get());
+    if (!wr) copy(raw_right, im.raw_r.get());
+    im.bound_raw_l = wl ? wl.get() : im.raw_l.get();
+    im.bound_raw_r = wr ? wr.get() : im.raw_r.get();
+    FrameOutputs out;
+    const auto r = encode_and_run(true, true, request.preview_images ? &out.rect_left : nullptr, request.preview_images ? &out.rect_right : nullptr,
+                                  &request, &out);
+    im.bound_raw_l = im.bound_raw_r = nullptr;
+    if (!r) return std::unexpected(r.error());
+    auto bufs = std::move(im.current);
+    Impl* owner = impl_.get();
+    auto keep = std::make_shared<Impl::FrameBuffers>(bufs);
+    out.frame = std::make_shared<gpu::MetalFrameData>(im.w, im.h, bufs.points, bufs.normals, bufs.weights, [owner, keep] {
+        std::lock_guard lock(owner->pool_mutex);
+        if (owner->pool.size() < 4) owner->pool.push_back(*keep);
+    });
+    return out;
+}
+
 Result<depth::StereoResult> MetalStereo::compute_raw(ImageView<const std::uint8_t> raw_left, ImageView<const std::uint8_t> raw_right,
                                                      ImageU8* rect_left, ImageU8* rect_right) {
     auto& im = *impl_;
@@ -225,7 +303,8 @@ depth::StereoResult MetalStereo::read_result() const {
     return res;
 }
 
-Result<void> MetalStereo::encode_and_run(bool from_raw, bool make_points, ImageU8* rect_left, ImageU8* rect_right) {
+Result<void> MetalStereo::encode_and_run(bool from_raw, bool make_points, ImageU8* rect_left, ImageU8* rect_right,
+                                         const FrameRequest* request, FrameOutputs* outputs) {
     auto& im = *impl_;
     Stopwatch total;
     const auto& sp = im.p.sgm;
@@ -244,12 +323,55 @@ Result<void> MetalStereo::encode_and_run(bool from_raw, bool make_points, ImageU
         const RectifyArgs ra{static_cast<std::uint32_t>(im.raw_w), static_cast<std::uint32_t>(im.raw_h),
                              static_cast<std::uint32_t>(im.full_w), static_cast<std::uint32_t>(im.full_h),
                              static_cast<std::uint32_t>(im.w), static_cast<std::uint32_t>(im.h)};
+        MTL::Buffer* raw[2] = {im.bound_raw_l ? im.bound_raw_l : im.raw_l.get(), im.bound_raw_r ? im.bound_raw_r : im.raw_r.get()};
         for (int side = 0; side < 2; ++side) {
-            enc->setBuffer(side ? im.raw_r.get() : im.raw_l.get(), 0, 0);
+            enc->setBuffer(raw[side], 0, 0);
             enc->setBuffer(side ? im.map_r.get() : im.map_l.get(), 0, 1);
             enc->setBuffer(side ? im.img_r[0].get() : im.img_l[0].get(), 0, 2);
             enc->setBytes(&ra, sizeof(ra), 3);
             dispatch2d(im.rectify.get(), im.w, im.h);
+        }
+    }
+    const bool blobs = from_raw && request && request->marker_blobs && im.blob_params;
+    if (blobs) {
+        // Marker blob search on both raw images (independent of the stereo below).
+        const auto& bp = *im.blob_params;
+        const BlobArgs ba{static_cast<std::uint32_t>(im.raw_w), static_cast<std::uint32_t>(im.raw_h), bp.threshold, bp.min_diameter,
+                          bp.max_diameter, bp.max_aspect, bp.min_fill, bp.border, bp.max_axis_ratio, bp.ring_scale, bp.ring_contrast,
+                          bp.ring_max_bright, bp.max_blobs};
+        MTL::Buffer* raw[2] = {im.bound_raw_l ? im.bound_raw_l : im.raw_l.get(), im.bound_raw_r ? im.bound_raw_r : im.raw_r.get()};
+        for (int side = 0; side < 2; ++side) {
+            const auto& b = im.blob_bufs[static_cast<std::size_t>(side)];
+            *static_cast<std::uint32_t*>(b.n_out->contents()) = 0;
+            auto bind_stats = [&] {
+                enc->setBuffer(raw[side], 0, 0);
+                enc->setBuffer(b.L.get(), 0, 1);
+                enc->setBuffer(b.count.get(), 0, 2);
+                enc->setBuffer(b.x0.get(), 0, 3);
+                enc->setBuffer(b.y0.get(), 0, 4);
+                enc->setBuffer(b.x1.get(), 0, 5);
+                enc->setBuffer(b.y1.get(), 0, 6);
+                enc->setBuffer(b.peak.get(), 0, 7);
+                enc->setBuffer(b.moments.get(), 0, 8);
+            };
+            bind_stats();
+            enc->setBytes(&ba, sizeof(ba), 9);
+            dispatch2d(im.blob_init.get(), im.raw_w, im.raw_h);
+            enc->memoryBarrier(MTL::BarrierScopeBuffers);
+            enc->setBuffer(raw[side], 0, 0);
+            enc->setBuffer(b.L.get(), 0, 1);
+            enc->setBytes(&ba, sizeof(ba), 2);
+            dispatch2d(im.blob_merge.get(), im.raw_w, im.raw_h);
+            enc->memoryBarrier(MTL::BarrierScopeBuffers);
+            bind_stats();
+            enc->setBytes(&ba, sizeof(ba), 9);
+            dispatch2d(im.blob_stats.get(), im.raw_w, im.raw_h);
+            enc->memoryBarrier(MTL::BarrierScopeBuffers);
+            bind_stats();
+            enc->setBuffer(b.out.get(), 0, 9);
+            enc->setBuffer(b.n_out.get(), 0, 10);
+            enc->setBytes(&ba, sizeof(ba), 11);
+            dispatch2d(im.blob_select.get(), im.raw_w, im.raw_h);
         }
     }
     for (int l = 0; l < levels; ++l) {
@@ -389,6 +511,22 @@ Result<void> MetalStereo::encode_and_run(bool from_raw, bool make_points, ImageU
         dispatch2d(im.nrm_kernel.get(), fw, fh);
     }
     enc->endEncoding();
+    if (request && request->preview_textures && outputs) {
+        // Previews stay on the GPU: copy the rectified pair into textures for display.
+        auto* td = MTL::TextureDescriptor::texture2DDescriptor(MTL::PixelFormatR8Unorm, static_cast<NS::UInteger>(fw),
+                                                               static_cast<NS::UInteger>(fh), false);
+        td->setStorageMode(MTL::StorageModePrivate);
+        td->setUsage(MTL::TextureUsageShaderRead);
+        td->setSwizzle(MTL::TextureSwizzleChannels(MTL::TextureSwizzleRed, MTL::TextureSwizzleRed, MTL::TextureSwizzleRed, MTL::TextureSwizzleOne));
+        outputs->preview_left = Ref<MTL::Texture>(im.ctx->device()->newTexture(td));
+        outputs->preview_right = Ref<MTL::Texture>(im.ctx->device()->newTexture(td));
+        MTL::BlitCommandEncoder* be = cmd->blitCommandEncoder();
+        for (int side = 0; side < 2; ++side)
+            be->copyFromBuffer((side ? im.img_r : im.img_l)[0].get(), 0, static_cast<NS::UInteger>(fw), static_cast<NS::UInteger>(fw * fh),
+                               MTL::Size(static_cast<NS::UInteger>(fw), static_cast<NS::UInteger>(fh), 1),
+                               (side ? outputs->preview_right : outputs->preview_left).get(), 0, 0, MTL::Origin(0, 0, 0));
+        be->endEncoding();
+    }
     cmd->commit();
     cmd->waitUntilCompleted();
     timings_.gpu_ms = (cmd->GPUEndTime() - cmd->GPUStartTime()) * 1000.0;
@@ -404,6 +542,19 @@ Result<void> MetalStereo::encode_and_run(bool from_raw, bool make_points, ImageU
     if (rect_right) {
         *rect_right = ImageU8(fw, fh);
         std::memcpy(rect_right->data(), im.img_r[0]->contents(), n);
+    }
+    if (blobs && outputs) {
+        for (int side = 0; side < 2; ++side) {
+            const auto& b = im.blob_bufs[static_cast<std::size_t>(side)];
+            const std::uint32_t found = *static_cast<const std::uint32_t*>(b.n_out->contents());
+            const std::uint32_t kept = std::min(found, im.blob_params->max_blobs);
+            const auto* src = static_cast<const BlobBox*>(b.out->contents());
+            auto& dst = outputs->blobs[static_cast<std::size_t>(side)];
+            dst.assign(src, src + kept);
+            // Candidate order depends on GPU scheduling: sort for reproducible results.
+            std::ranges::sort(dst, [](const BlobBox& p, const BlobBox& q) { return p.y0 != q.y0 ? p.y0 < q.y0 : p.x0 < q.x0; });
+            outputs->blobs_found[static_cast<std::size_t>(side)] = found;
+        }
     }
     timings_.total_ms = total.elapsed_ms();
     return {};

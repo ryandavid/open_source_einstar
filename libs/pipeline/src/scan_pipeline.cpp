@@ -376,7 +376,23 @@ void ScanPipeline::record(const track::TrackResult& r, const DepthOutput& depth)
         const auto it = ids.find(static_cast<int>(m));
         rec.markers.push_back({mk.position, mk.normal, mk.diameter, it == ids.end() ? -1 : it->second, mk.left_rect, mk.right_rect});
     }
-    session::capture_depth(depth.frame, rec.depth, rec.confidence);
+    const auto* dev = dynamic_cast<const gpu::MetalFrameData*>(depth.frame.device.get());
+    if (dev && !packer_)
+        if (auto ctx = gpu::Context::create())
+            if (auto pk = depth_metal::DepthPacker::create(*ctx)) packer_ = std::move(*pk);
+    if (dev && packer_) {
+        // Quantisation and delta coding on the GPU; the recording thread waits for it and compresses.
+        auto packed = packer_->pack(std::dynamic_pointer_cast<const gpu::MetalFrameData>(depth.frame.device));
+        auto pi = std::make_shared<session::PackedImages>();
+        pi->width = packed->width;
+        pi->height = packed->height;
+        pi->bytes = packed->bytes();
+        pi->ready = [packed] { packed->wait(); };
+        pi->owner = packed;
+        rec.packed = std::move(pi);
+    } else {
+        session::capture_depth(depth.frame, rec.depth, rec.confidence);
+    }
     recorder_->write(std::move(rec));
     stats_.recorded_frames = recorder_->frames_written() + recorder_->backlog();
 }
@@ -589,6 +605,8 @@ void ScanPipeline::process(usb::FrameGroup&& group) {
     fill_marker_overlays(r, *depth, up);
     up.preview_left = std::move(depth->rectified_left);
     up.preview_right = std::move(depth->rectified_right);
+    up.preview_left_tex = std::move(depth->preview_left);
+    up.preview_right_tex = std::move(depth->preview_right);
     up.stats = stats_;
     sink_(std::move(up));
 }

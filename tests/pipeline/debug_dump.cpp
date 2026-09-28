@@ -48,7 +48,9 @@ int main(int argc, char** argv) {
     const auto r = synth::render_view(scene, proj, rig.right, T_wr, rp);
     pgm(out + "/raw_left.pgm", l.image);
     pgm(out + "/raw_right.pgm", r.image);
-    pipeline::StereoFrontend fe(rig);
+    pipeline::StereoFrontendParams fp_cpu_previews;
+    fp_cpu_previews.cpu_previews = true;
+    pipeline::StereoFrontend fe(rig, fp_cpu_previews);
     const auto d = fe.process(l.image, r.image);
     pgm(out + "/rect_left.pgm", d.rectified_left);
     pgm(out + "/rect_right.pgm", d.rectified_right);

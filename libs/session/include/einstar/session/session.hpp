@@ -16,6 +16,8 @@
 #include <cstdint>
 #include <deque>
 #include <fstream>
+#include <functional>
+#include <span>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -54,6 +56,16 @@ struct FrameMarker {
     Vec2 left_rect = Vec2::Constant(-1), right_rect = Vec2::Constant(-1);
 };
 
+// A frame's depth and confidence already in the file's uncompressed layout (u16 depth in 1/50 mm,
+// delta-coded along rows, then u8 confidence), e.g. produced on the GPU. The writer calls `ready()`
+// (which may block until the GPU finished) before reading `bytes`.
+struct PackedImages {
+    int width = 0, height = 0;
+    std::function<void()> ready;
+    std::span<const std::uint8_t> bytes;
+    std::shared_ptr<void> owner;  // keeps `bytes` alive
+};
+
 struct FrameRecord {
     std::uint64_t index = 0;
     double timestamp_s = 0;
@@ -62,6 +74,7 @@ struct FrameRecord {
     std::vector<FrameMarker> markers;
     ImageF32 depth;       // mm, 0 = none
     ImageF32 confidence;  // 0..1 (empty = unknown)
+    std::shared_ptr<PackedImages> packed;  // writing only: used instead of depth/confidence when set
 
     [[nodiscard]] bool accepted() const { return (flags & frame_accepted) != 0; }
     // Points, normals and weights for fusion / registration.

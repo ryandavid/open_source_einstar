@@ -1,6 +1,12 @@
 // Stage-by-stage timing of the depth + tracking path (CPU reference vs GPU once ported).
 #include <filesystem>
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <mutex>
+#include <thread>
+#include <sys/resource.h>
+#include <time.h>
 #include <format>
 #include <functional>
 #include <print>
@@ -13,6 +19,8 @@
 #include "einstar/depth/stereo.hpp"
 #include "einstar/fixtures/exstar_project.hpp"
 #include "einstar/pipeline/stereo_frontend.hpp"
+#include "einstar/pipeline/scan_pipeline.hpp"
+#include "einstar/synth/demo.hpp"
 #include "einstar/synth/speckle_scene.hpp"
 #include "einstar/track/icp.hpp"
 #include "einstar/track/tracker.hpp"
@@ -33,68 +41,111 @@ static void time_it(const char* name, int n, const std::function<void()>& f) {
     std::println("{:28} median {:7.2f} ms  p95 {:7.2f} ms", name, st.median(), st.percentile(0.95));
 }
 
-// Full per-frame path (frontend + tracker) on pre-rendered emulated frames of a sweep.
+static double process_cpu_ms() {
+    rusage u{};
+    getrusage(RUSAGE_SELF, &u);
+    return (static_cast<double>(u.ru_utime.tv_sec) + static_cast<double>(u.ru_stime.tv_sec)) * 1e3 +
+           (static_cast<double>(u.ru_utime.tv_usec) + static_cast<double>(u.ru_stime.tv_usec)) * 1e-3;
+}
+
+static double thread_cpu_ms() {
+    timespec ts{};
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return static_cast<double>(ts.tv_sec) * 1e3 + static_cast<double>(ts.tv_nsec) * 1e-6;
+}
+
+// Full live path on pre-rendered emulator frames (table scene with marker stickers): wall time and
+// CPU time per frame, with the scan pipeline running as in the app (tracking, overlays, recording).
 static void bench_pipeline(const RigCalibration& rig) {
     const SE3 T_lr = rig.T_right_left.inverse();
-    synth::Scene scene;
-    scene.primitives.push_back(synth::Plane{Vec3(0, 70, 0), Vec3(0, -1, 0)});
-    scene.primitives.push_back(synth::Sphere{Vec3(-80, 20, 20), 45.0});
-    SE3 B = SE3::Identity();
-    B.linear() = Eigen::AngleAxisd(0.5, Vec3::UnitY()).toRotationMatrix();
-    B.translation() = Vec3(-10, 45, 40);
-    scene.primitives.push_back(synth::Box{B, Vec3(25, 25, 18)});
-    synth::Projector proj;
-    proj.model.fx = proj.model.fy = 800;
-    proj.model.cx = 640;
-    proj.model.cy = 400;
-    proj.pattern = synth::DotPattern::random(1280, 800, 9000, 3.5, 11);
+    synth::Scene scene = synth::table_scene();
+    scene.markers = synth::scatter_markers(45, 5);
+    const synth::Projector proj = synth::speckle_projector();
     const double half_toe = 0.5 * rotation_angle(rig.T_right_left);
-    std::vector<std::pair<ImageU8, ImageU8>> frames;
-    for (int f = 0; f < 40; ++f) {
+    const int n = 60;
+    std::vector<usb::FrameGroup> groups;
+    for (int f = 0; f < n; ++f) {
         const double t = 0.05 * f;
-        const Vec3 eye(-190 + 55 * t, -130 - 12 * t, -240);
-        const Vec3 target(-100 + 30 * t, 25, 10 + 10 * t);
-        const Vec3 fwd = (target - eye).normalized();
-        const Vec3 right = -Vec3(0, 1, 0).cross(fwd).normalized();
-        SE3 T = SE3::Identity();
-        T.linear().col(0) = right;
-        T.linear().col(1) = fwd.cross(right);
-        T.linear().col(2) = fwd;
-        T.translation() = eye;
+        SE3 T = synth::look_at(Vec3(-190 + 55 * t, -130 - 12 * t, -240), Vec3(-100 + 30 * t, 25, 10 + 10 * t));
         T.linear() = T.linear() * Eigen::AngleAxisd(half_toe, Vec3::UnitY()).toRotationMatrix();
         synth::Projector p = proj;
         p.T_world_projector = T;
         p.T_world_projector.translation() = T * (0.5 * T_lr.translation());
+        p.T_world_projector.linear() = T.linear() * Eigen::AngleAxisd(-half_toe, Vec3::UnitY()).toRotationMatrix();
         synth::RenderParams rp;
         rp.supersample = 1;
         rp.seed = static_cast<std::uint32_t>(f);
-        frames.emplace_back(synth::render_view(scene, p, rig.left, T, rp).image,
-                            synth::render_view(scene, p, rig.right, T * T_lr, rp).image);
-    }
-    pipeline::StereoFrontend fe(rig);
-    auto ctx = gpu::Context::create();
-    auto vol = track_metal::MetalTsdfVolume::create(*ctx);
-    auto icp = track_metal::MetalIcp::create(*ctx);
-    track::Tracker tracker({}, std::move(*vol));
-    tracker.set_icp_solver((*icp)->as_function());
-    TimingStats st(64), tt(64), total(64);
-    for (std::size_t i = 0; i < frames.size(); ++i) {
-        Stopwatch sw;
-        auto d = fe.process(frames[i].first, frames[i].second);
-        const double s_ms = sw.elapsed_ms();
-        d.frame.timestamp_s = 0.068 * static_cast<double>(i);
-        d.frame.index = i;
-        const auto r = tracker.process(d.frame);
-        if (i >= 5) {
-            st.add(s_ms);
-            tt.add(r.ms);
-            total.add(sw.elapsed_ms());
+        usb::FrameGroup g;
+        g.frame_id = static_cast<std::uint32_t>(f);
+        g.timestamp = static_cast<std::uint64_t>(f) * 68000;
+        for (int sensor = 0; sensor < 2; ++sensor) {
+            usb::StreamFrame sf;
+            sf.sensor = sensor;
+            sf.frame_id = g.frame_id;
+            sf.pixels = synth::render_view(scene, p, sensor ? rig.right : rig.left, sensor ? T * T_lr : T, rp).image;
+            g.sensors[static_cast<std::size_t>(sensor)] = std::move(sf);
         }
+        groups.push_back(std::move(g));
     }
-    std::println("== full frame path (GPU, emulated sweep, {} frames) ==", frames.size());
-    std::println("{:28} median {:7.2f} ms  p95 {:7.2f} ms", "frontend", st.median(), st.percentile(0.95));
-    std::println("{:28} median {:7.2f} ms  p95 {:7.2f} ms", "tracker", tt.median(), tt.percentile(0.95));
-    std::println("{:28} median {:7.2f} ms  p95 {:7.2f} ms", "total", total.median(), total.percentile(0.95));
+
+    // Frontend alone: wall vs CPU time of the calling thread (GPU waits do not burn CPU).
+    {
+        pipeline::StereoFrontend fe(rig);
+        TimingStats wall(64), cpu(64);
+        double candidates = 0;
+        for (int f = 0; f < n; ++f) {
+            Stopwatch sw;
+            const double c0 = thread_cpu_ms();
+            auto d = fe.process(groups[static_cast<std::size_t>(f)]);
+            if (d) candidates += d->marker_candidates;
+            if (f >= 5) {
+                wall.add(sw.elapsed_ms());
+                cpu.add(thread_cpu_ms() - c0);
+            }
+        }
+        std::println("== frontend (stereo + markers), {} frames ==", n);
+        std::println("{:28} median {:7.2f} ms  p95 {:7.2f} ms", "wall", wall.median(), wall.percentile(0.95));
+        std::println("{:28} median {:7.2f} ms  p95 {:7.2f} ms", "calling-thread CPU", cpu.median(), cpu.percentile(0.95));
+        std::println("{:28} {:.1f} per frame (both images)", "marker fit candidates", candidates / n);
+    }
+
+    // Whole pipeline as in the app; variants show where the CPU time goes.
+    auto run = [&](const char* name, bool record, bool markers) {
+        const auto dir = std::filesystem::temp_directory_path() / "einstar_bench_recording";
+        std::filesystem::remove_all(dir);
+        pipeline::ScanPipelineParams pp;
+        pp.block_when_full = true;
+        pipeline::StereoFrontendParams fp;
+        fp.detect_markers = markers;
+        std::atomic<int> done{0};
+        pipeline::ScanPipeline pipe(std::make_unique<pipeline::StereoFrontend>(rig, fp), pp, [&](pipeline::LiveUpdate&&) { ++done; });
+        if (record) pipe.set_recording_directory(dir.string());
+        pipe.start();
+        auto wait_all = [&](int count) {
+            (void)pipe.flush_recording();  // ordered after every frame pushed so far
+            while (done.load() < count) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        };
+        for (int f = 0; f < 5; ++f) {  // warm-up: pipelines, sensor order
+            auto g = groups[static_cast<std::size_t>(f)];
+            pipe.push(std::move(g));
+        }
+        wait_all(5);
+        const double c0 = process_cpu_ms();
+        Stopwatch sw;
+        for (int f = 5; f < n; ++f) {
+            auto g = groups[static_cast<std::size_t>(f)];
+            pipe.push(std::move(g));
+        }
+        wait_all(n);
+        const double wall = sw.elapsed_ms(), cpu = process_cpu_ms() - c0;
+        pipe.stop();
+        std::filesystem::remove_all(dir);
+        std::println("{:34} wall {:6.2f} ms/frame, process CPU {:6.2f} ms/frame", name, wall / (n - 5), cpu / (n - 5));
+    };
+    std::println("== scan pipeline ({} frames) ==", n - 5);
+    run("full (markers, recording)", true, true);
+    run("no recording", false, true);
+    run("no recording, no markers", false, false);
 }
 
 int main(int argc, char** argv) {

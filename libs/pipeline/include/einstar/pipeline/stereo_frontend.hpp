@@ -25,6 +25,8 @@ struct StereoFrontendParams {
     depth::RefineParams refine;
     depth::SpeckleParams speckle{100, 1.0f};
     bool detect_markers = true;
+    bool gpu_previews = true;   // rectified pair as GPU textures (Metal backend)
+    bool cpu_previews = false;  // rectified pair copied to CPU images as well (debugging tools)
     markers::DetectParams marker_detect;
     markers::StereoParams marker_stereo{.require_prior = true};
     // Fill the depth hole under each stereo marker from a plane fitted to the surrounding surface.
@@ -36,12 +38,14 @@ struct StereoFrontendParams {
 
 struct DepthOutput {
     track::DepthFrame frame;
-    ImageU8 rectified_left;   // half resolution, for previews
+    ImageU8 rectified_left;   // half resolution; CPU backend, or on request (cpu_previews)
     ImageU8 rectified_right;
+    gpu::Ref<MTL::Texture> preview_left, preview_right;  // GPU backend: the same images as textures
     std::vector<markers::Marker3D> markers;  // also in frame.markers (same order)
     std::vector<Vec2> unmatched_left;       // rectified full-resolution centres of left detections without a match
     double stereo_ms = 0;
     double marker_ms = 0;
+    int marker_candidates = 0;  // blobs that reached the sub-pixel fit (both images)
 };
 
 class StereoFrontend {
@@ -64,7 +68,8 @@ public:
     [[nodiscard]] const markers::MarkerStereo& marker_stereo() const { return *marker_stereo_; }
 
 private:
-    void add_markers(const ImageU8& raw_left, const ImageU8& raw_right, DepthOutput& out) const;
+    void add_markers(const ImageU8& raw_left, const ImageU8& raw_right, DepthOutput& out,
+                     const std::array<std::vector<depth_metal::BlobBox>, 2>* gpu_blobs = nullptr) const;
 
     StereoFrontendParams params_;
     calib::StereoRectification rect_;

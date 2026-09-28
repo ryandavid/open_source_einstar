@@ -24,7 +24,7 @@ constexpr std::uint32_t kHead = tag("HEAD");
 constexpr std::uint32_t kFrame = tag("FRAM");
 constexpr std::uint32_t kGlobal = tag("GMRK");
 constexpr double kDepthScale = 50.0;  // u16 units per mm (0.02 mm, up to 1310 mm)
-constexpr int kZstdLevel = 3;
+constexpr int kZstdLevel = 1;  // ~2x faster than 3 for 2% larger files (recording runs every frame)
 
 struct Writer {
     std::vector<std::uint8_t> b;
@@ -89,6 +89,14 @@ SE3 get_pose(Reader& r) {
 }
 
 // Depth as horizontally delta-coded u16 (smooth surfaces compress far better), then confidence.
+std::vector<std::uint8_t> compress(std::span<const std::uint8_t> raw) {
+    std::vector<std::uint8_t> out(ZSTD_compressBound(raw.size()));
+    const std::size_t sz = ZSTD_compress(out.data(), out.size(), raw.data(), raw.size(), kZstdLevel);
+    if (ZSTD_isError(sz)) return {};
+    out.resize(sz);
+    return out;
+}
+
 std::vector<std::uint8_t> encode_images(const ImageF32& depth, const ImageF32& conf) {
     const int w = depth.width(), h = depth.height();
     const auto n = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
@@ -106,11 +114,7 @@ std::vector<std::uint8_t> encode_images(const ImageF32& depth, const ImageF32& c
     if (!conf.empty())
         for (std::size_t i = 0; i < n; ++i)
             raw[n * 2 + i] = static_cast<std::uint8_t>(std::clamp(std::lround(conf.data()[i] * 255.0f), 0L, 255L));
-    std::vector<std::uint8_t> out(ZSTD_compressBound(raw.size()));
-    const std::size_t sz = ZSTD_compress(out.data(), out.size(), raw.data(), raw.size(), kZstdLevel);
-    if (ZSTD_isError(sz)) return {};
-    out.resize(sz);
-    return out;
+    return compress(raw);
 }
 
 bool decode_images(const std::uint8_t* data, std::size_t size, int w, int h, bool has_conf, ImageF32& depth, ImageF32& conf) {
@@ -314,10 +318,21 @@ void SessionWriter::run() {
             p.put_vec(m.left_rect);
             p.put_vec(m.right_rect);
         }
-        const auto blob = encode_images(frame->depth, frame->confidence);
-        p.put(static_cast<std::int32_t>(frame->depth.width()));
-        p.put(static_cast<std::int32_t>(frame->depth.height()));
-        p.put(static_cast<std::uint32_t>(frame->confidence.empty() ? 0 : 1));
+        std::vector<std::uint8_t> blob;
+        int w = frame->depth.width(), h = frame->depth.height();
+        bool conf = !frame->confidence.empty();
+        if (frame->packed) {
+            frame->packed->ready();
+            blob = compress(frame->packed->bytes);
+            w = frame->packed->width;
+            h = frame->packed->height;
+            conf = true;
+        } else {
+            blob = encode_images(frame->depth, frame->confidence);
+        }
+        p.put(static_cast<std::int32_t>(w));
+        p.put(static_cast<std::int32_t>(h));
+        p.put(static_cast<std::uint32_t>(conf ? 1 : 0));
         p.put(static_cast<std::uint64_t>(blob.size()));
         p.b.insert(p.b.end(), blob.begin(), blob.end());
         write_record(kFrame, p.b);

@@ -256,6 +256,8 @@ void AppState::on_live_update(pipeline::LiveUpdate&& u) {
     up.frame_points = std::move(u.frame_points);
     if (u.frame_buffer) up.frame_gpu = GpuPoints{std::move(u.frame_buffer), u.frame_buffer_count};
     up.ir_left = std::move(u.preview_left);
+    up.ir_left_tex = std::move(u.preview_left_tex);
+    up.ir_right_tex = std::move(u.preview_right_tex);
     up.ir_right = std::move(u.preview_right);
     up.markers = std::move(u.markers);
     up.preview_markers = std::move(u.preview_markers);
@@ -314,6 +316,8 @@ void AppState::on_live_update(pipeline::LiveUpdate&& u) {
     pending_->frame_gpu = std::move(up.frame_gpu);
     pending_->lines = std::move(up.lines);
     pending_->ir_left = std::move(up.ir_left);
+    pending_->ir_left_tex = std::move(up.ir_left_tex);
+    pending_->ir_right_tex = std::move(up.ir_right_tex);
     pending_->ir_right = std::move(up.ir_right);
     pending_->markers = std::move(up.markers);
     pending_->preview_markers = std::move(up.preview_markers);
