@@ -1,0 +1,5 @@
+add_library(einstar_markers src/detect.cpp src/stereo.cpp src/marker_map.cpp)
+add_library(einstar::markers ALIAS einstar_markers)
+target_include_directories(einstar_markers PUBLIC include)
+target_link_libraries(einstar_markers PUBLIC einstar::core einstar::calib PRIVATE TBB::tbb)
+einstar_target_defaults(einstar_markers)

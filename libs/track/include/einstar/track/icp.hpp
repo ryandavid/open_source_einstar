@@ -12,6 +12,12 @@
 
 namespace einstar::track {
 
+// A marker observed in the frame (camera coordinates) associated with a map marker (world).
+struct IcpMarker {
+    Vec3 p_camera;
+    Vec3 q_world;
+};
+
 struct IcpParams {
     int levels = 3;                       // source subsampling 4, 2, 1
     std::array<int, 3> iterations{15, 10, 8};
@@ -29,6 +35,11 @@ struct IcpParams {
     // Degeneracy-aware update: eigen-directions of the (unit-scaled) Hessian weaker than this
     // fraction of the strongest are not updated from the data; they keep the prediction.
     double degenerate_direction_ratio = 1e-4;
+    // Optional point-to-point marker terms solved jointly with the surface. Each marker counts like
+    // `marker_weight` unit-weight surface correspondences, so markers pin the directions the surface
+    // cannot (sliding on symmetric parts) without overriding well-constrained geometry.
+    std::vector<IcpMarker> markers;
+    double marker_weight = 200.0;
 };
 
 struct IcpResult {
@@ -42,6 +53,7 @@ struct IcpResult {
     int degenerate_directions = 0;        // directions held by the prediction in the final solve
     Mat6 degenerate_basis = Mat6::Zero(); // first `degenerate_directions` columns, in unit-scaled twist coords about `center`
     Vec3 center = Vec3::Zero();           // linearisation point (world): centroid of the observed surface
+    double marker_rms_mm = 0;             // residual of the marker terms at the final pose (0 if none)
     bool converged = false;
 };
 

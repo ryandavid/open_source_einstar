@@ -186,16 +186,31 @@ IcpResult icp_point_to_plane(const DepthFrame& frame, const RaycastResult& model
                 },
                 [](Normal6 a, const Normal6& b) { return a += b; });
 
-            if (sys.n < 50) {
+            if (sys.n < 50 && p.markers.size() < 3) {
                 res.converged = false;
                 res.correspondences = sys.n;
                 return res;
             }
+            // Joint marker terms: r = T p - q, J = [I, -hat(Tp - c)] (twist about the centroid).
+            Mat6 A_sys = sys.A;
+            Vec6 b_sys = sys.b;
+            double marker_ss = 0;
+            for (const auto& m : p.markers) {
+                const Vec3 pw = T * m.p_camera;
+                const Vec3 r = pw - m.q_world;
+                Eigen::Matrix<double, 3, 6> J;
+                J.leftCols<3>().setIdentity();
+                J.rightCols<3>() = -hat(pw - c);
+                A_sys.noalias() += p.marker_weight * J.transpose() * J;
+                b_sys.noalias() -= p.marker_weight * J.transpose() * r;
+                marker_ss += r.squaredNorm();
+            }
+            if (!p.markers.empty()) res.marker_rms_mm = std::sqrt(marker_ss / static_cast<double>(p.markers.size()));
             // Solve in unit-scaled coordinates (rotations as displacement at a 100 mm lever arm).
             Vec6 scale;
             scale << 1, 1, 1, 0.01, 0.01, 0.01;  // x = S xs; xs rotations are mm of displacement at 100 mm
-            const Mat6 As = scale.asDiagonal() * sys.A * scale.asDiagonal();
-            const Vec6 bs = scale.cwiseProduct(sys.b);
+            const Mat6 As = scale.asDiagonal() * A_sys * scale.asDiagonal();
+            const Vec6 bs = scale.cwiseProduct(b_sys);
             // Step back to the prediction, expressed as a twist about the centroid.
             const Vec6 prior_s = twist_to_center(se3_log(T_init * T.inverse()), c).cwiseQuotient(scale);
 
@@ -230,7 +245,7 @@ IcpResult icp_point_to_plane(const DepthFrame& frame, const RaycastResult& model
             T = se3_exp(twist_from_center(dx, c)) * T;
 
             if (level == 0 && it == iters - 1) {
-                res.min_eigenvalue_ratio = eigen_ratio(sys.A);
+                res.min_eigenvalue_ratio = eigen_ratio(A_sys);
                 res.correspondences = sys.n;
                 res.candidates = sys.considered;
                 res.rms_mm = std::sqrt(sys.sq / std::max(1.0, static_cast<double>(sys.n)));
@@ -239,7 +254,7 @@ IcpResult icp_point_to_plane(const DepthFrame& frame, const RaycastResult& model
             }
             if (dx.head<3>().norm() < 1e-4 && dx.tail<3>().norm() < 1e-6) {
                 if (level == 0) {
-                    res.min_eigenvalue_ratio = eigen_ratio(sys.A);
+                    res.min_eigenvalue_ratio = eigen_ratio(A_sys);
                     res.correspondences = sys.n;
                     res.candidates = sys.considered;
                     res.rms_mm = std::sqrt(sys.sq / std::max(1.0, static_cast<double>(sys.n)));

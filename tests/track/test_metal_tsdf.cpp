@@ -193,3 +193,32 @@ TEST_CASE("Metal ICP on a GPU-resident frame matches the CPU solver") {
     CHECK(rotation_angle(d) * 180 / M_PI < 0.002);
     CHECK(std::abs(cpu.correspondences - gpu.correspondences) <= cpu.correspondences / 200);
 }
+
+TEST_CASE("joint marker terms: Metal ICP matches the CPU solver") {
+    auto ctx = gpu::Context::create();
+    REQUIRE(ctx.has_value());
+    auto icp = track_metal::MetalIcp::create(*ctx);
+    REQUIRE(icp.has_value());
+    TsdfVolume vol;
+    vol.integrate(make_depth_frame(render_depth(SE3::Identity(), kK), kK), SE3::Identity());
+    const auto model = vol.raycast(SE3::Identity(), kK.scaled(0.5));
+    Vec6 xi;
+    xi << 3.0, -2.0, 1.5, 0.015, -0.02, 0.012;
+    const SE3 pose1 = se3_exp(xi);
+    auto frame = make_depth_frame(render_depth(pose1, kK), kK);
+    frame.index = 99;
+    IcpParams ip;
+    for (const Vec3 q : {Vec3(-40, -30, 292), Vec3(35, -25, 305), Vec3(-20, 40, 297), Vec3(50, 35, 310), Vec3(0, 0, 315)})
+        ip.markers.push_back({pose1.inverse() * q, q});
+    const auto cpu = icp_point_to_plane(frame, model, SE3::Identity(), SE3::Identity(), ip);
+    const auto gpu = (*icp)->solve(frame, model, SE3::Identity(), SE3::Identity(), ip);
+    REQUIRE((cpu.converged && gpu.converged));
+    const SE3 d = cpu.T_world_camera.inverse() * gpu.T_world_camera;
+    const SE3 e = pose1.inverse() * gpu.T_world_camera;
+    std::println("markers joint icp: gpu-cpu {:.4f} mm {:.5f} deg; err {:.4f} mm; marker rms cpu {:.4f} gpu {:.4f}", translation_norm(d),
+                 rotation_angle(d) * 180 / M_PI, translation_norm(e), cpu.marker_rms_mm, gpu.marker_rms_mm);
+    CHECK(translation_norm(d) < 0.01);
+    CHECK(rotation_angle(d) * 180 / M_PI < 0.002);
+    CHECK(translation_norm(e) < 0.05);
+    CHECK(std::abs(cpu.marker_rms_mm - gpu.marker_rms_mm) < 0.01);
+}

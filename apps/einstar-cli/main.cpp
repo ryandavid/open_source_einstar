@@ -32,7 +32,7 @@ namespace {
 int usage() {
     std::println(stderr,
                  "usage: einstar-cli probe [--verbose] | sim-probe | calib <dir> |\n"
-                 "       track-fixture <project.ir_E10_prj> [--start N] [--count N] [--skip K] [--stl ref.stl] [--cpu] [--quiet]");
+                 "       track-fixture <project.ir_E10_prj> [--start N] [--count N] [--skip K] [--stl ref.stl] [--cpu] [--mode geometry|hybrid|markers] [--quiet]");
     return 2;
 }
 
@@ -167,13 +167,18 @@ int track_fixture(const char* path, std::span<char*> args) {
     if (!has_flag(args, "--cpu") && !has_flag(args, "--cpu-icp"))
         if (auto ctx = gpu::Context::create())
             if (auto g = track_metal::MetalIcp::create(*ctx)) gpu_icp = std::move(*g);
-    std::println("volume: {}, icp: {}", volume ? "Metal" : "CPU", gpu_icp ? "Metal" : "CPU");
-    track::Tracker tracker({}, std::move(volume));
+    track::TrackerParams tp;
+    std::string mode = "hybrid";
+    for (std::size_t a = 0; a + 1 < args.size(); ++a)
+        if (std::string_view(args[a]) == "--mode") mode = args[a + 1];
+    tp.mode = mode == "geometry" ? track::AlignMode::geometry : mode == "markers" ? track::AlignMode::markers : track::AlignMode::hybrid;
+    std::println("volume: {}, icp: {}, mode: {}", volume ? "Metal" : "CPU", gpu_icp ? "Metal" : "CPU", mode);
+    track::Tracker tracker(tp, std::move(volume));
     if (gpu_icp) tracker.set_icp_solver(gpu_icp->as_function());
     std::vector<double> t_err, r_err, ms, rpe_t, rpe_r, eigs;
     std::optional<SE3> prev_ours, prev_theirs;
     int gross = 0;
-    int accepted = 0, lost = 0, reloc = 0, degenerate = 0, processed = 0;
+    int accepted = 0, lost = 0, reloc = 0, degenerate = 0, processed = 0, marker_frames = 0;
     const SE3* first_ref = nullptr;
     SE3 ref0, prev_ref;
     bool diverged = false;
@@ -189,6 +194,7 @@ int track_fixture(const char* path, std::span<char*> args) {
         auto frame = track::make_depth_frame(f->depth, k);
         frame.index = static_cast<std::uint64_t>(i);
         frame.timestamp_s = static_cast<double>(i - start) * frame_dt;
+        for (const auto& m : f->markers) frame.markers.push_back({m.position, m.normal, m.diameter, -1});
         if (!first_ref) {
             ref0 = f->T_world_camera;
             first_ref = &ref0;
@@ -214,6 +220,7 @@ int track_fixture(const char* path, std::span<char*> args) {
         }
         ms.push_back(r.ms);
         if (r.icp.converged) eigs.push_back(r.icp.min_eigenvalue_ratio);
+        if (r.marker_pose) ++marker_frames;
         if (r.accepted) {
             if (prev_ours && prev_theirs) {
                 const SE3 ours = prev_ours->inverse() * r.T_world_camera;
@@ -282,8 +289,9 @@ int track_fixture(const char* path, std::span<char*> args) {
         std::ranges::sort(v);
         return v[static_cast<std::size_t>(p * static_cast<double>(v.size() - 1))];
     };
-    std::println("\nframes {} (skip {}), accepted {} ({:.1f}%), lost {}, relocalised {}, degenerate {}", processed, skip,
-                 accepted, 100.0 * accepted / std::max(1, processed), lost, reloc, degenerate);
+    std::println("\nframes {} (skip {}), accepted {} ({:.1f}%), lost {}, relocalised {}, degenerate {}, marker-posed {}", processed, skip,
+                 accepted, 100.0 * accepted / std::max(1, processed), lost, reloc, degenerate, marker_frames);
+    std::println("marker map: {} markers", tracker.marker_map().size());
     std::println("pose vs EXStar: translation median {:.2f} mm p95 {:.2f} mm, rotation median {:.3f} deg p95 {:.3f} deg",
                  pct(t_err, 0.5), pct(t_err, 0.95), pct(r_err, 0.5), pct(r_err, 0.95));
     std::println("relative pose error per frame: translation median {:.3f} mm p95 {:.3f} mm, rotation median {:.4f} deg p95 {:.4f} deg",

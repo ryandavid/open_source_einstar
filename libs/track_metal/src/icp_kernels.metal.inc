@@ -19,7 +19,8 @@ struct IcpState {
     float inlier_ratio;
     float coverage;
     float eig_ratio;
-    float pad[2];
+    float marker_rms;
+    float pad;
     float basis[36];   // column-major 6x6, first degenerate_dirs columns valid
     float hessian[36]; // unit-scaled Hessian of the final solve (row-major), for diagnostics
 };
@@ -41,6 +42,9 @@ struct SolveArgs {
     float lambda_r;
     float degenerate_ratio;
     float c[4];
+    uint marker_count;       // joint point-to-point marker terms (camera p, world q pairs)
+    float marker_weight;
+    float pad2[2];
 };
 
 constant uint kP = 32;   // floats per partial record: 21 A + 6 b + sq + n + considered + on_model + pad
@@ -253,7 +257,7 @@ inline float4x4 inverse_rigid(float4x4 T) {
 }
 
 kernel void icp_solve(device IcpState* st [[buffer(0)]], device const float* partials [[buffer(1)]],
-                      constant SolveArgs& a [[buffer(2)]], uint lidx [[thread_index_in_threadgroup]],
+                      constant SolveArgs& a [[buffer(2)]], device const float4* markers [[buffer(3)]], uint lidx [[thread_index_in_threadgroup]],
                       uint tgsize [[threads_per_threadgroup]], uint lane [[thread_index_in_simdgroup]],
                       uint simd_id [[simdgroup_index_in_threadgroup]], uint nsimd [[simdgroups_per_threadgroup]]) {
     if (st->failed || st->level_done) return;
@@ -277,7 +281,7 @@ kernel void icp_solve(device IcpState* st [[buffer(0)]], device const float* par
     if (lidx != 0) return;
 
     const float n = totals[28];
-    if (n < 50) {
+    if (n < 50 && a.marker_count < 3) {
         st->failed = 1;
         st->correspondences = int(n);
         return;
@@ -290,6 +294,34 @@ kernel void icp_solve(device IcpState* st [[buffer(0)]], device const float* par
         for (int c0 = r; c0 < 6; ++c0) { Ao[r][c0] = totals[k]; Ao[c0][r] = totals[k]; ++k; }
     for (int j = 0; j < 6; ++j) bo[j] = totals[21 + j];
     const float3 c = float3(a.c[0], a.c[1], a.c[2]);
+    // Joint marker terms: r = T p - q, J = [I, -hat(Tp - c)].
+    float marker_ss = 0;
+    {
+        const float4x4 Tm = load4(st->T);
+        for (uint m = 0; m < a.marker_count; ++m) {
+            const float3 pw = (Tm * float4(markers[2 * m].xyz, 1)).xyz;
+            const float3 r = pw - markers[2 * m + 1].xyz;
+            marker_ss += dot(r, r);
+            const float3 d = pw - c;
+            // J rows: [e_k, -(d x e_k)^T] i.e. rotation part = -hat(d) row k
+            float J[3][6];
+            const float3x3 Hd = hat(d);
+            for (int k = 0; k < 3; ++k) {
+                for (int j = 0; j < 3; ++j) J[k][j] = k == j ? 1.0f : 0.0f;
+                for (int j = 0; j < 3; ++j) J[k][3 + j] = -Hd[j][k];  // -hat(d)(row k, col j); Metal is [col][row]
+            }
+            for (int i = 0; i < 6; ++i) {
+                for (int j = 0; j < 6; ++j) {
+                    float s2 = 0;
+                    for (int k = 0; k < 3; ++k) s2 += J[k][i] * J[k][j];
+                    Ao[i][j] += a.marker_weight * s2;
+                }
+                float sb = 0;
+                for (int k = 0; k < 3; ++k) sb += J[k][i] * r[k];
+                bo[i] -= a.marker_weight * sb;
+            }
+        }
+    }
     // Unit-scaled system (rotations as displacement at 100 mm).
     const float sc[6] = {1, 1, 1, 0.01f, 0.01f, 0.01f};
     Mat6 As, Ar, E, V;
@@ -348,6 +380,7 @@ kernel void icp_solve(device IcpState* st [[buffer(0)]], device const float* par
         st->inlier_ratio = totals[30] > 0 ? n / totals[30] : 0.0f;
         st->coverage = totals[29] > 0 ? totals[30] / totals[29] : 0.0f;
         st->eig_ratio = ev[5] > 0 ? ev[0] / ev[5] : 0.0f;
+        st->marker_rms = a.marker_count ? sqrt(marker_ss / float(a.marker_count)) : 0.0f;
         st->degenerate_dirs = degenerate;
         for (int i = 0; i < 36; ++i) st->basis[i] = basis[i];
         for (int i = 0; i < 6; ++i)

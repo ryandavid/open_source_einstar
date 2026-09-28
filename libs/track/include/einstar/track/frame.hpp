@@ -32,6 +32,8 @@ struct MarkerPoint {
     Vec3 normal;
     double diameter = 6.0;
     int id = -1;    // global id if known
+    Vec2 left_rect = Vec2::Constant(-1);   // rectified full-resolution image centres (for bundle adjustment)
+    Vec2 right_rect = Vec2::Constant(-1);
 };
 
 // One depth frame ready for tracking: organised points/normals in the camera frame.

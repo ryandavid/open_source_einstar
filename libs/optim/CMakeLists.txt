@@ -1,0 +1,5 @@
+add_library(einstar_optim src/marker_bundle.cpp)
+add_library(einstar::optim ALIAS einstar_optim)
+target_include_directories(einstar_optim PUBLIC include)
+target_link_libraries(einstar_optim PUBLIC einstar::core einstar::depth PRIVATE Ceres::ceres)
+einstar_target_defaults(einstar_optim)

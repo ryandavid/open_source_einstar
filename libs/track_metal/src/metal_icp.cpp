@@ -23,7 +23,7 @@ struct IcpState {
     std::uint32_t failed, level_done, stats_written;
     std::int32_t correspondences, candidates, degenerate_dirs;
     float rms, inlier_ratio, coverage, eig_ratio;
-    float pad[2];
+    float marker_rms, pad;
     float basis[36];
     float hessian[36];
 };
@@ -41,9 +41,12 @@ struct SolveArgs {
     std::uint32_t num_partials, final_level, last_iter;
     float lambda_t, lambda_r, degenerate_ratio;
     float c[4];
+    std::uint32_t marker_count;
+    float marker_weight;
+    float pad2[2];
 };
 // Layouts must match icp_kernels.metal.inc exactly (all members are 4-byte scalars).
-static_assert(sizeof(SolveArgs) == 40);
+static_assert(sizeof(SolveArgs) == 56);
 static_assert(sizeof(AccArgs) == 128);
 static_assert(sizeof(IcpState) == 464);
 
@@ -71,7 +74,7 @@ struct MetalIcp::Impl {
     std::shared_ptr<gpu::Context> ctx;
     Ref<MTL::ComputePipelineState> level_begin, accumulate, solve, bal_hist, bal_bins, bal_apply;
     Ref<MTL::Buffer> hist, w_bin;
-    Ref<MTL::Buffer> state, partials;
+    Ref<MTL::Buffer> state, partials, markers;
     Ref<MTL::Buffer> src_pts, src_nrm, src_w, mdl_pts, mdl_nrm;
     std::size_t src_n = 0, mdl_n = 0;
     // Cache of the last uploaded frame (the tracker calls ICP several times per frame).
@@ -219,6 +222,19 @@ track::IcpResult MetalIcp::solve(const track::DepthFrame& frame, const track::Ra
     const Vec3 c = track::icp_center(frame, T_init);
     res.center = c;
 
+    // Marker pairs (camera p, world q) as float4 pairs.
+    const auto marker_count = static_cast<std::uint32_t>(std::min<std::size_t>(p.markers.size(), 256));
+    if (!im.markers) im.markers = im.ctx->buffer(256 * 32);
+    {
+        auto* mk4 = static_cast<float*>(im.markers->contents());
+        for (std::uint32_t m = 0; m < marker_count; ++m) {
+            const auto& mm = p.markers[m];
+            mk4[8 * m + 0] = static_cast<float>(mm.p_camera.x()), mk4[8 * m + 1] = static_cast<float>(mm.p_camera.y());
+            mk4[8 * m + 2] = static_cast<float>(mm.p_camera.z()), mk4[8 * m + 3] = 1;
+            mk4[8 * m + 4] = static_cast<float>(mm.q_world.x()), mk4[8 * m + 5] = static_cast<float>(mm.q_world.y());
+            mk4[8 * m + 6] = static_cast<float>(mm.q_world.z()), mk4[8 * m + 7] = 1;
+        }
+    }
     IcpState st{};
     store(st.T, T_init);
     store(st.T_init, T_init);
@@ -278,10 +294,13 @@ track::IcpResult MetalIcp::solve(const track::DepthFrame& frame, const track::Ra
             sa.lambda_r = static_cast<float>(s2 / (sr_mm * sr_mm));
             sa.degenerate_ratio = static_cast<float>(p.degenerate_direction_ratio);
             sa.c[0] = aa.c[0], sa.c[1] = aa.c[1], sa.c[2] = aa.c[2];
+            sa.marker_count = marker_count;
+            sa.marker_weight = static_cast<float>(p.marker_weight);
             enc->setComputePipelineState(im.solve.get());
             enc->setBuffer(im.state.get(), 0, 0);
             enc->setBuffer(im.partials.get(), 0, 1);
             enc->setBytes(&sa, sizeof(sa), 2);
+            enc->setBuffer(im.markers.get(), 0, 3);
             enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(256, 1, 1));
             enc->memoryBarrier(MTL::BarrierScopeBuffers);
         }
@@ -311,6 +330,7 @@ track::IcpResult MetalIcp::solve(const track::DepthFrame& frame, const track::Ra
     res.inlier_ratio = st.inlier_ratio;
     res.coverage = st.coverage;
     res.min_eigenvalue_ratio = st.eig_ratio;
+    res.marker_rms_mm = st.marker_rms;
     res.degenerate_directions = st.degenerate_dirs;
     for (int col = 0; col < 6; ++col)
         for (int row = 0; row < 6; ++row) res.degenerate_basis(row, col) = st.basis[col * 6 + row];

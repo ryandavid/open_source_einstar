@@ -8,10 +8,11 @@
 namespace einstar::track {
 
 Tracker::Tracker(TrackerParams params, std::unique_ptr<Volume> volume)
-    : params_(params), volume_(volume ? std::move(volume) : std::make_unique<TsdfVolume>(params.tsdf)) {}
+    : params_(params), volume_(volume ? std::move(volume) : std::make_unique<TsdfVolume>(params.tsdf)), map_(params.marker_map) {}
 
 void Tracker::reset() {
     volume_->clear();
+    map_.clear();
     state_ = TrackState::initializing;
     have_velocity_ = false;
 }
@@ -96,14 +97,32 @@ TrackResult Tracker::process(const DepthFrame& frame) {
     TrackResult out;
     const double t = frame.timestamp_s;
 
+    std::vector<Vec3> fm;
+    std::vector<double> fd;
+    const bool use_markers = params_.mode != AlignMode::geometry && frame.markers.size() >= 3;
+    if (use_markers)
+        for (const auto& m : frame.markers) {
+            fm.push_back(m.position);
+            fd.push_back(m.diameter);
+        }
+    out.markers_seen = static_cast<int>(fm.size());
+
     if (state_ == TrackState::initializing) {
         last_pose_ = prev_pose_ = initial_pose_.value_or(SE3::Identity());
-        volume_->integrate(frame, last_pose_);
+        if (params_.fuse_surface) volume_->integrate(frame, last_pose_);
+        if (use_markers) {
+            map_.update(fm, fd, last_pose_, {});
+            for (std::size_t i = 0; i < fm.size(); ++i)
+                if (auto slot = map_.nearest(last_pose_ * fm[i], params_.marker_map.merge_radius_mm))
+                    out.marker_ids.emplace_back(static_cast<int>(i), map_.markers()[static_cast<std::size_t>(*slot)].id);
+        }
         last_time_ = prev_time_ = t;
         state_ = TrackState::tracking;
         out.state = state_;
         out.T_world_camera = last_pose_;
-        out.accepted = out.integrated = true;
+        out.accepted = true;
+        out.integrated = params_.fuse_surface;
+        out.marker_pose = use_markers;
         out.ms = sw.elapsed_ms();
         return out;
     }
@@ -120,8 +139,21 @@ TrackResult Tracker::process(const DepthFrame& frame) {
         seeds.push_back(last_pose_);
     }
 
+    // Marker pose: associate with the prediction, or relocalise against the whole map.
+    std::optional<markers::PoseEstimate> mpose;
+    if (use_markers && !map_.empty()) {
+        if (state_ != TrackState::lost) mpose = map_.track(fm, seeds.front());
+        if (!mpose) mpose = map_.relocalize(fm, reloc_seed_++);
+        if (mpose && static_cast<int>(mpose->inliers.size()) < params_.min_marker_inliers) mpose.reset();
+        if (mpose) seeds.insert(seeds.begin(), mpose->T_world_camera);
+    }
+
     IcpParams icp = params_.icp;
-    if (state_ == TrackState::lost) {
+    if (mpose) {
+        icp.marker_weight = params_.marker_weight;
+        for (const auto& c : mpose->inliers) icp.markers.push_back({c.p_camera, c.q_world});
+    }
+    if (state_ == TrackState::lost && !mpose) {
         // Relocalisation near the last good pose: wider gates, more iterations.
         icp.max_distance_mm *= 3.0f;
         icp.iterations = {20, 10, 6};
@@ -135,13 +167,25 @@ TrackResult Tracker::process(const DepthFrame& frame) {
         // A second pass re-rendered from the refined pose tightens associations after large motion.
         if (r.converged && translation_norm(seed.inverse() * r.T_world_camera) > 2.0) {
             const RaycastResult model2 = volume_->raycast(r.T_world_camera, mk);
-            IcpParams fine = params_.icp;
+            IcpParams fine = icp;
             fine.levels = 1;
             const IcpResult r2 = icp_(frame, model2, r.T_world_camera, r.T_world_camera, fine);
             if (r2.converged) r = r2;
         }
-        const bool strict = state_ == TrackState::lost || state_ == TrackState::confirming;
-        const auto verdict = check(r, last_pose_, state_ == TrackState::lost ? 0.5 : dt, strict);
+        const bool strict = (state_ == TrackState::lost || state_ == TrackState::confirming) && !mpose;
+        auto verdict = check(r, last_pose_, state_ == TrackState::lost ? 0.5 : dt, strict);
+        // Markers are an independent identity check: a pose they agree with is accepted even when the
+        // surface overlap alone would be too weak (new areas, featureless or symmetric parts).
+        if (mpose && r.converged && r.marker_rms_mm <= params_.max_marker_rms_mm &&
+            static_cast<int>(icp.markers.size()) >= params_.min_marker_inliers)
+            verdict.reset();
+        if (params_.mode == AlignMode::markers && mpose && (!r.converged || r.marker_rms_mm > params_.max_marker_rms_mm)) {
+            // Markers-only mode: fall back to the marker pose when the surface disagrees.
+            r.T_world_camera = mpose->T_world_camera;
+            r.converged = true;
+            r.marker_rms_mm = mpose->rms_mm;
+            verdict.reset();
+        }
         if (!verdict) {
             if (!best || r.rms_mm < best->rms_mm) best = r;
             break;
@@ -187,7 +231,12 @@ TrackResult Tracker::process(const DepthFrame& frame) {
     degenerate_center_ = best->center;
 
     lost_frames_ = 0;
-    if (state_ == TrackState::lost || state_ == TrackState::confirming) {
+    out.marker_pose = mpose.has_value();
+    if (mpose && (state_ == TrackState::lost || state_ == TrackState::confirming)) {
+        // Marker constellations identify the location unambiguously: no confirmation window needed.
+        out.relocalized = state_ == TrackState::lost;
+        confirm_count_ = 0;
+    } else if (state_ == TrackState::lost || state_ == TrackState::confirming) {
         // Candidate relocalisation: follow it, but do not fuse until confirmed.
         if (state_ == TrackState::lost) confirm_count_ = 0;
         ++confirm_count_;
@@ -209,8 +258,25 @@ TrackResult Tracker::process(const DepthFrame& frame) {
     out.accepted = true;
     // Degenerate frames (pose partly held by the motion prior) are fused with reduced weight so
     // they extend the model without reshaping what is already well observed.
-    volume_->integrate(frame, out.T_world_camera, out.degenerate ? params_.degenerate_weight : 1.0f, out.degenerate);
-    out.integrated = true;
+    if (params_.fuse_surface) {
+        volume_->integrate(frame, out.T_world_camera, out.degenerate ? params_.degenerate_weight : 1.0f, out.degenerate);
+        out.integrated = true;
+    }
+    if (use_markers) {
+        auto at_pose = map_.track(fm, out.T_world_camera);
+        std::vector<markers::Correspondence> matched;
+        if (at_pose) {
+            // Associate at the accepted pose (do not re-fit: the joint solution is the pose).
+            for (const auto& c : at_pose->inliers)
+                if ((out.T_world_camera * c.p_camera - c.q_world).norm() <= params_.marker_map.match_radius_mm) matched.push_back(c);
+        }
+        out.markers_matched = static_cast<int>(matched.size());
+        map_.update(fm, fd, out.T_world_camera, matched);
+        // Report ids after the update (new markers now have ids too).
+        for (std::size_t i = 0; i < fm.size(); ++i)
+            if (auto slot = map_.nearest(out.T_world_camera * fm[i], params_.marker_map.merge_radius_mm))
+                out.marker_ids.emplace_back(static_cast<int>(i), map_.markers()[static_cast<std::size_t>(*slot)].id);
+    }
     prev_pose_ = last_pose_;
     prev_time_ = last_time_;
     have_velocity_ = true;
