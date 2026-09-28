@@ -30,8 +30,8 @@ int main(int argc, char** argv) {
         e2e::render_sensor(setup, rig, e2e::truth_pose(id), 1, id * 3 + 1, r);
         const auto el = markers::detect_markers(l.view()), er = markers::detect_markers(r.view());
         auto out = fe.process(l, r);
-        if (std::getenv("DUMP")) {
-            std::FILE* f = std::fopen(std::format("/private/tmp/claude-501/-Users-ryan-src-einstar/d8f66da3-007b-4e0b-b746-cad454860749/scratchpad/left_{}.pgm", id).c_str(), "wb");
+        if (const char* dir = std::getenv("DUMP_DIR")) {  // writes <dir>/left_<id>.pgm
+            std::FILE* f = std::fopen(std::format("{}/left_{}.pgm", dir, id).c_str(), "wb");
             std::fprintf(f, "P5 %d %d 255\n", l.width(), l.height());
             std::fwrite(l.data(), 1, static_cast<std::size_t>(l.width() * l.height()), f);
             std::fclose(f);
