@@ -54,7 +54,7 @@ struct LiveUpdate {
 // Keeps extracted surface points per brick so only changed bricks are re-extracted.
 class ModelPointCache {
 public:
-    void update(const track::TsdfVolume& volume);
+    void update(const track::Volume& volume);
     [[nodiscard]] std::vector<render::PointVertex> flatten() const;
     [[nodiscard]] std::size_t size() const { return total_; }
     void clear();
@@ -66,6 +66,8 @@ private:
     std::unordered_map<track::BrickCoord, std::vector<render::PointVertex>, Key> bricks_;
     std::uint32_t last_frame_ = 0;
     std::size_t total_ = 0;
+    bool use_full_ = false;
+    std::vector<render::PointVertex> full_;
 };
 
 struct ScanPipelineParams {
@@ -76,6 +78,7 @@ struct ScanPipelineParams {
     bool block_when_full = false;
     double model_refresh_s = 0.25;   // how often the full model snapshot is re-published
     int frame_point_step = 2;        // subsampling of the current-frame overlay
+    bool gpu_volume = true;          // Metal TSDF when available, CPU reference otherwise
 };
 
 class ScanPipeline {

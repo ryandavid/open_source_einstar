@@ -22,6 +22,7 @@
 #include "einstar/fixtures/exstar_project.hpp"
 #include "einstar/sim/sim_transport.hpp"
 #include "einstar/track/tracker.hpp"
+#include "einstar/track_metal/metal_tsdf.hpp"
 
 using namespace einstar;
 
@@ -30,7 +31,7 @@ namespace {
 int usage() {
     std::println(stderr,
                  "usage: einstar-cli probe [--verbose] | sim-probe | calib <dir> |\n"
-                 "       track-fixture <project.ir_E10_prj> [--start N] [--count N] [--skip K] [--stl ref.stl] [--quiet]");
+                 "       track-fixture <project.ir_E10_prj> [--start N] [--count N] [--skip K] [--stl ref.stl] [--cpu] [--quiet]");
     return 2;
 }
 
@@ -156,7 +157,13 @@ int track_fixture(const char* path, std::span<char*> args) {
     std::vector<double> fit_median;
     int fit_bad = 0, fit_checked = 0;
 
-    track::Tracker tracker;
+    std::unique_ptr<track::Volume> volume;
+    if (!has_flag(args, "--cpu")) {
+        if (auto ctx = gpu::Context::create())
+            if (auto v = track_metal::MetalTsdfVolume::create(*ctx)) volume = std::move(*v);
+    }
+    std::println("volume: {}", volume ? "Metal" : "CPU");
+    track::Tracker tracker({}, std::move(volume));
     std::vector<double> t_err, r_err, ms, rpe_t, rpe_r;
     std::optional<SE3> prev_ours, prev_theirs;
     int gross = 0;

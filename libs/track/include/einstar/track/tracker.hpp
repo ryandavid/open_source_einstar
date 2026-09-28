@@ -5,6 +5,7 @@
 // silently (rejected frames are reported with a reason).
 
 #include <deque>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -59,14 +60,15 @@ struct TrackResult {
 
 class Tracker {
 public:
-    explicit Tracker(TrackerParams params = {});
+    // Uses the CPU TSDF unless a volume (e.g. the Metal one) is supplied.
+    explicit Tracker(TrackerParams params = {}, std::unique_ptr<Volume> volume = nullptr);
 
     TrackResult process(const DepthFrame& frame);
     // Seed the pose of the first frame (e.g. from markers); otherwise identity.
     void set_initial_pose(const SE3& T) { initial_pose_ = T; }
 
-    [[nodiscard]] TsdfVolume& volume() { return volume_; }
-    [[nodiscard]] const TsdfVolume& volume() const { return volume_; }
+    [[nodiscard]] Volume& volume() { return *volume_; }
+    [[nodiscard]] const Volume& volume() const { return *volume_; }
     [[nodiscard]] TrackState state() const { return state_; }
     [[nodiscard]] const SE3& last_good_pose() const { return last_pose_; }
     void reset();
@@ -77,7 +79,7 @@ private:
     [[nodiscard]] std::optional<std::string> check(const IcpResult& r, const SE3& from, double dt, bool strict) const;
 
     TrackerParams params_;
-    TsdfVolume volume_;
+    std::unique_ptr<Volume> volume_;
     TrackState state_ = TrackState::initializing;
     std::optional<SE3> initial_pose_;
     SE3 last_pose_ = SE3::Identity();

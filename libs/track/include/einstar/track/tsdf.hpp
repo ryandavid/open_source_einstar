@@ -63,27 +63,47 @@ struct SurfacePoint {
     float weight;
 };
 
-class TsdfVolume {
+// Fused surface model. Implemented on the CPU (TsdfVolume, the reference) and in Metal.
+class Volume {
 public:
-    explicit TsdfVolume(TsdfParams params = {});
+    virtual ~Volume() = default;
 
     // Fuses a frame observed from camera pose T_world_camera.
     // `extend_only`: only voxels never observed before are written (poses of weakly-constrained frames
     // may extend the model but must not reshape it).
-    void integrate(const DepthFrame& frame, const SE3& T_world_camera, float weight_scale = 1.0f, bool extend_only = false);
+    virtual void integrate(const DepthFrame& frame, const SE3& T_world_camera, float weight_scale = 1.0f,
+                           bool extend_only = false) = 0;
 
     // Renders the model from a camera (vertex + normal maps in world coordinates).
-    [[nodiscard]] RaycastResult raycast(const SE3& T_world_camera, const Intrinsics& k) const;
+    [[nodiscard]] virtual RaycastResult raycast(const SE3& T_world_camera, const Intrinsics& k) const = 0;
 
-    // Zero-crossing surface points of bricks touched since `since_frame` (for incremental display).
-    [[nodiscard]] std::vector<SurfacePoint> extract_points(std::uint32_t since_frame = 0, float min_weight = 0.5f) const;
-    [[nodiscard]] std::vector<BrickCoord> bricks_updated_since(std::uint32_t frame) const;
-    [[nodiscard]] std::vector<SurfacePoint> extract_points(const std::vector<BrickCoord>& bricks, float min_weight = 0.5f) const;
+    // Zero-crossing surface points of bricks touched since `since_frame` (0 = everything).
+    [[nodiscard]] virtual std::vector<SurfacePoint> extract_points(std::uint32_t since_frame = 0, float min_weight = 0.5f) const = 0;
+    [[nodiscard]] virtual std::vector<BrickCoord> bricks_updated_since(std::uint32_t frame) const = 0;
+    [[nodiscard]] virtual std::vector<SurfacePoint> extract_points(const std::vector<BrickCoord>& bricks, float min_weight = 0.5f) const = 0;
+    // True when extracting the whole surface is cheap enough to do for every display refresh.
+    [[nodiscard]] virtual bool fast_full_extraction() const { return false; }
 
-    [[nodiscard]] std::size_t brick_count() const;
-    [[nodiscard]] std::uint32_t frame_counter() const { return frame_counter_; }
-    [[nodiscard]] const TsdfParams& params() const { return params_; }
-    void clear();
+    [[nodiscard]] virtual std::size_t brick_count() const = 0;
+    [[nodiscard]] virtual std::uint32_t frame_counter() const = 0;
+    [[nodiscard]] virtual const TsdfParams& params() const = 0;
+    virtual void clear() = 0;
+};
+
+class TsdfVolume final : public Volume {
+public:
+    explicit TsdfVolume(TsdfParams params = {});
+
+    void integrate(const DepthFrame& frame, const SE3& T_world_camera, float weight_scale = 1.0f, bool extend_only = false) override;
+    [[nodiscard]] RaycastResult raycast(const SE3& T_world_camera, const Intrinsics& k) const override;
+    [[nodiscard]] std::vector<SurfacePoint> extract_points(std::uint32_t since_frame = 0, float min_weight = 0.5f) const override;
+    [[nodiscard]] std::vector<BrickCoord> bricks_updated_since(std::uint32_t frame) const override;
+    [[nodiscard]] std::vector<SurfacePoint> extract_points(const std::vector<BrickCoord>& bricks, float min_weight = 0.5f) const override;
+
+    [[nodiscard]] std::size_t brick_count() const override;
+    [[nodiscard]] std::uint32_t frame_counter() const override { return frame_counter_; }
+    [[nodiscard]] const TsdfParams& params() const override { return params_; }
+    void clear() override;
 
     // Trilinear SDF sample in mm (nullopt if unobserved).
     [[nodiscard]] std::optional<float> sample_sdf(const Vec3f& world) const;

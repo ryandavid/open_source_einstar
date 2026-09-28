@@ -7,10 +7,11 @@
 
 namespace einstar::track {
 
-Tracker::Tracker(TrackerParams params) : params_(params), volume_(params.tsdf) {}
+Tracker::Tracker(TrackerParams params, std::unique_ptr<Volume> volume)
+    : params_(params), volume_(volume ? std::move(volume) : std::make_unique<TsdfVolume>(params.tsdf)) {}
 
 void Tracker::reset() {
-    volume_.clear();
+    volume_->clear();
     state_ = TrackState::initializing;
     have_velocity_ = false;
 }
@@ -65,11 +66,11 @@ std::optional<std::string> Tracker::check(const IcpResult& r, const SE3& from, d
 }
 
 std::optional<SE3> Tracker::global_candidate(const DepthFrame& frame) {
-    const std::size_t bricks = volume_.brick_count();
+    const std::size_t bricks = volume_->brick_count();
     if (feature_model_.empty() ||
         static_cast<double>(bricks) > static_cast<double>(feature_model_bricks_) * (1.0 + params_.feature_model_rebuild_growth)) {
         OrientedCloud model;
-        for (const auto& sp : volume_.extract_points(0, 1.0f)) {
+        for (const auto& sp : volume_->extract_points(0, 1.0f)) {
             model.points.push_back(sp.position);
             model.normals.push_back(sp.normal);
         }
@@ -96,7 +97,7 @@ TrackResult Tracker::process(const DepthFrame& frame) {
 
     if (state_ == TrackState::initializing) {
         last_pose_ = prev_pose_ = initial_pose_.value_or(SE3::Identity());
-        volume_.integrate(frame, last_pose_);
+        volume_->integrate(frame, last_pose_);
         last_time_ = prev_time_ = t;
         state_ = TrackState::tracking;
         out.state = state_;
@@ -128,11 +129,11 @@ TrackResult Tracker::process(const DepthFrame& frame) {
     std::optional<IcpResult> best;
     std::string last_reason = "no seed";
     for (const SE3& seed : seeds) {
-        const RaycastResult model = volume_.raycast(seed, mk);
+        const RaycastResult model = volume_->raycast(seed, mk);
         IcpResult r = icp_point_to_plane(frame, model, seed, seed, icp);
         // A second pass re-rendered from the refined pose tightens associations after large motion.
         if (r.converged && translation_norm(seed.inverse() * r.T_world_camera) > 2.0) {
-            const RaycastResult model2 = volume_.raycast(r.T_world_camera, mk);
+            const RaycastResult model2 = volume_->raycast(r.T_world_camera, mk);
             IcpParams fine = params_.icp;
             fine.levels = 1;
             const IcpResult r2 = icp_point_to_plane(frame, model2, r.T_world_camera, r.T_world_camera, fine);
@@ -152,7 +153,7 @@ TrackResult Tracker::process(const DepthFrame& frame) {
     if (!best && state_ == TrackState::lost && params_.global_relocalization &&
         (lost_frames_ % std::max(1, params_.global_reloc_every)) == 0) {
         if (auto seed = global_candidate(frame)) {
-            const RaycastResult model = volume_.raycast(*seed, mk);
+            const RaycastResult model = volume_->raycast(*seed, mk);
             const IcpResult r = icp_point_to_plane(frame, model, *seed, *seed, params_.icp);
             const auto verdict = check(r, *seed, 0.1, true);  // motion gate is meaningless here
             if (!verdict) best = r;
@@ -206,7 +207,7 @@ TrackResult Tracker::process(const DepthFrame& frame) {
     out.accepted = true;
     // Degenerate frames (pose partly held by the motion prior) are fused with reduced weight so
     // they extend the model without reshaping what is already well observed.
-    volume_.integrate(frame, out.T_world_camera, out.degenerate ? params_.degenerate_weight : 1.0f, out.degenerate);
+    volume_->integrate(frame, out.T_world_camera, out.degenerate ? params_.degenerate_weight : 1.0f, out.degenerate);
     out.integrated = true;
     prev_pose_ = last_pose_;
     prev_time_ = last_time_;

@@ -1,10 +1,38 @@
 #include "einstar/pipeline/scan_pipeline.hpp"
 
 #include "einstar/core/log.hpp"
+#include "einstar/gpu/context.hpp"
+#include "einstar/track_metal/metal_tsdf.hpp"
+
+#include <algorithm>
 
 namespace einstar::pipeline {
 
-void ModelPointCache::update(const track::TsdfVolume& volume) {
+namespace {
+
+render::PointVertex to_vertex(const track::SurfacePoint& p) {
+    // Shade by confidence: well-observed surface is lighter, thin coverage is tinted blue.
+    const float w = std::clamp(p.weight / 8.0f, 0.0f, 1.0f);
+    const auto grey = static_cast<std::uint8_t>(150 + 70 * w);
+    const render::Rgba8 col{static_cast<std::uint8_t>(grey - static_cast<std::uint8_t>(40 * (1 - w))),
+                            static_cast<std::uint8_t>(grey - static_cast<std::uint8_t>(20 * (1 - w))), grey, 255};
+    return {p.position.x(), p.position.y(), p.position.z(), p.normal.x(), p.normal.y(), p.normal.z(), col};
+}
+
+}  // namespace
+
+void ModelPointCache::update(const track::Volume& volume) {
+    if (volume.fast_full_extraction()) {
+        // GPU volume: re-extracting everything is cheaper than per-brick bookkeeping.
+        const auto pts = volume.extract_points(0);
+        full_.clear();
+        full_.reserve(pts.size());
+        for (const auto& p : pts) full_.push_back(to_vertex(p));
+        total_ = full_.size();
+        use_full_ = true;
+        return;
+    }
+    use_full_ = false;
     const auto dirty = volume.bricks_updated_since(last_frame_);
     last_frame_ = volume.frame_counter();
     if (dirty.empty()) return;
@@ -15,19 +43,13 @@ void ModelPointCache::update(const track::TsdfVolume& volume) {
         total_ -= slot.size();
         slot.clear();
         slot.reserve(pts.size());
-        for (const auto& p : pts) {
-            // Shade by confidence: well-observed surface is lighter, thin coverage is tinted blue.
-            const float w = std::clamp(p.weight / 8.0f, 0.0f, 1.0f);
-            const auto grey = static_cast<std::uint8_t>(150 + 70 * w);
-            const render::Rgba8 col{static_cast<std::uint8_t>(grey - static_cast<std::uint8_t>(40 * (1 - w))),
-                                    static_cast<std::uint8_t>(grey - static_cast<std::uint8_t>(20 * (1 - w))), grey, 255};
-            slot.push_back({p.position.x(), p.position.y(), p.position.z(), p.normal.x(), p.normal.y(), p.normal.z(), col});
-        }
+        for (const auto& p : pts) slot.push_back(to_vertex(p));
         total_ += slot.size();
     }
 }
 
 std::vector<render::PointVertex> ModelPointCache::flatten() const {
+    if (use_full_) return full_;
     std::vector<render::PointVertex> out;
     out.reserve(total_);
     for (const auto& [c, pts] : bricks_) out.insert(out.end(), pts.begin(), pts.end());
@@ -36,12 +58,29 @@ std::vector<render::PointVertex> ModelPointCache::flatten() const {
 
 void ModelPointCache::clear() {
     bricks_.clear();
+    full_.clear();
     last_frame_ = 0;
     total_ = 0;
 }
 
+namespace {
+
+std::unique_ptr<track::Volume> make_volume(const ScanPipelineParams& p) {
+    if (!p.gpu_volume) return nullptr;
+    auto ctx = gpu::Context::create();
+    if (!ctx) return nullptr;
+    auto v = track_metal::MetalTsdfVolume::create(*ctx, p.tracker.tsdf);
+    if (!v) {
+        log::warn("Metal TSDF unavailable ({}); using the CPU volume", v.error().message);
+        return nullptr;
+    }
+    return std::move(*v);
+}
+
+}  // namespace
+
 ScanPipeline::ScanPipeline(std::unique_ptr<StereoFrontend> frontend, ScanPipelineParams params, Sink sink)
-    : frontend_(std::move(frontend)), params_(params), sink_(std::move(sink)), tracker_(params.tracker) {}
+    : frontend_(std::move(frontend)), params_(params), sink_(std::move(sink)), tracker_(params.tracker, make_volume(params)) {}
 
 ScanPipeline::~ScanPipeline() { stop(); }
 

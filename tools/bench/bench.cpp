@@ -12,6 +12,7 @@
 #include "einstar/synth/speckle_scene.hpp"
 #include "einstar/track/icp.hpp"
 #include "einstar/track/tsdf.hpp"
+#include "einstar/track_metal/metal_tsdf.hpp"
 
 using namespace einstar;
 
@@ -100,5 +101,19 @@ int main() {
     time_it("make_depth_frame", 20, [&] { (void)track::make_depth_frame((*proj_f)->read_frame(60)->depth, k); });
     const auto dirty = vol.bricks_updated_since(vol.frame_counter() - 1);
     time_it("extract dirty bricks", 10, [&] { (void)vol.extract_points(dirty); });
+
+    std::println("== tracking, Metal volume ==");
+    auto ctx = gpu::Context::create();
+    auto mv = track_metal::MetalTsdfVolume::create(*ctx);
+    if (!mv) return 1;
+    for (std::size_t i = 0; i < 60; ++i) {
+        auto f = (*proj_f)->read_frame(i);
+        (*mv)->integrate(track::make_depth_frame(f->depth, k), f->T_world_camera);
+    }
+    std::println("model bricks {}", (*mv)->brick_count());
+    time_it("raycast 320x256", 20, [&] { model = (*mv)->raycast(pose, k.scaled(0.5)); });
+    time_it("icp (3 levels)", 20, [&] { (void)track::icp_point_to_plane(df, model, pose, pose, {}); });
+    time_it("integrate", 20, [&] { (*mv)->integrate(df, pose); });
+    time_it("extract all", 10, [&] { (void)(*mv)->extract_points(0); });
     return 0;
 }
