@@ -69,27 +69,33 @@ kernel void census(device const uchar* img [[buffer(0)]], device ulong* out [[bu
 // ---- matching cost volume [y][x][k], u16 ----
 struct CostArgs { uint w; uint h; uint nd; int min_disp; ushort invalid_cost; };
 
+// Census costs are at most 25 (5x5) and every path value at most cost + P2, so both fit a byte:
+// half the memory traffic of the (bandwidth-bound) aggregation, same integers.
 kernel void cost_volume(device const ulong* cl [[buffer(0)]], device const ulong* cr [[buffer(1)]],
-                        device ushort* cost [[buffer(2)]], constant CostArgs& a [[buffer(3)]],
+                        device uchar* cost [[buffer(2)]], constant CostArgs& a [[buffer(3)]],
                         uint3 gid [[thread_position_in_grid]]) {
     const uint k = gid.x, x = gid.y, y = gid.z;
     if (k >= a.nd || x >= a.w || y >= a.h) return;
     const int xr = int(x) - (a.min_disp + int(k));
-    ushort c = a.invalid_cost;
-    if (xr >= 0) c = ushort(popcount(cl[y * a.w + x] ^ cr[y * a.w + uint(xr)]));
-    cost[(ulong(y) * a.w + x) * a.nd + k] = c;
+    uint c = a.invalid_cost;
+    if (xr >= 0) c = popcount(cl[y * a.w + x] ^ cr[y * a.w + uint(xr)]);
+    cost[(ulong(y) * a.w + x) * a.nd + k] = uchar(c);
 }
 
 // ---- SGM path aggregation: one threadgroup per scanline, one thread per disparity ----
+// (Measured alternatives: one SIMD group per line with disparity blocks per lane, double-buffered
+// single-barrier steps, and one-step-ahead prefetch were all no faster or slower on Apple GPUs; the
+// kernel is bound by its arithmetic volume.)
 struct PathArgs {
     uint w; uint h; uint nd;
     int dx; int dy;
     int p1; int p2; uint adaptive; uint slant;
+    uint first;  // the first direction writes the sums (no clearing pass, no read)
 };
 
 constant uint kMaxD = 512;
 
-kernel void sgm_path(device const ushort* cost [[buffer(0)]], device ushort* sum [[buffer(1)]],
+kernel void sgm_path(device const uchar* cost [[buffer(0)]], device ushort* sum [[buffer(1)]],
                      device const uchar* guide [[buffer(2)]], constant PathArgs& a [[buffer(3)]],
                      uint line [[threadgroup_position_in_grid]], uint k [[thread_index_in_threadgroup]],
                      uint tg_size [[threads_per_threadgroup]], uint lane [[thread_index_in_simdgroup]],
@@ -115,11 +121,11 @@ kernel void sgm_path(device const ushort* cost [[buffer(0)]], device ushort* sum
     }
     const bool active = k < a.nd;
 
-    ushort mine = active ? cost[(ulong(y) * a.w + uint(x)) * a.nd + k] : ushort(0xFFFF);
+    ushort mine = active ? ushort(cost[(ulong(y) * a.w + uint(x)) * a.nd + k]) : ushort(0xFFFF);
     if (active) {
         prev[k] = mine;
         const ulong si = (ulong(y) * a.w + uint(x)) * a.nd + k;
-        sum[si] = ushort(sum[si] + mine);
+        sum[si] = a.first ? mine : ushort(sum[si] + mine);
     }
     // min reduction
     ushort m = simd_min(mine);
@@ -142,7 +148,7 @@ kernel void sgm_path(device const ushort* cost [[buffer(0)]], device ushort* sum
         const int pm = prev_min_shared;
         ushort cur = 0xFFFF;
         if (active) {
-            const ushort c = cost[(ulong(y) * a.w + uint(x)) * a.nd + k];
+            const ushort c = ushort(cost[(ulong(y) * a.w + uint(x)) * a.nd + k]);
             int best = min(int(prev[k]), pm + p2);
             if (k > 0) best = min(best, int(prev[k - 1]) + a.p1);
             if (k + 1 < a.nd) best = min(best, int(prev[k + 1]) + a.p1);
@@ -152,7 +158,7 @@ kernel void sgm_path(device const ushort* cost [[buffer(0)]], device ushort* sum
             }
             cur = ushort(int(c) + best - pm);
             const ulong si = (ulong(y) * a.w + uint(x)) * a.nd + k;
-            sum[si] = ushort(sum[si] + cur);
+            sum[si] = a.first ? cur : ushort(sum[si] + cur);
         }
         ushort mn = simd_min(cur);
         threadgroup_barrier(mem_flags::mem_threadgroup);  // everyone has read prev
@@ -256,29 +262,12 @@ kernel void median3(device const float* in [[buffer(0)]], device float* out [[bu
 }
 
 // ---- slanted-window ZNCC refinement to the next finer level ----
-struct RefineArgs { uint w; uint h; uint cw; uint ch; int radius; int search_radius; float min_zncc; uint subpixel; };
+// Number of disparity candidates (2 * search_radius / 0.5 + 1), specialised at pipeline creation so the
+// per-candidate accumulators unroll into registers.
+constant uint kRefineCandidates [[function_constant(0)]];
+constant int kMaxRefineCandidates = 17;
 
-inline float zncc_slanted(device const uchar* a, device const uchar* b, int W, int x, int y, float d, float gx, float gy, int r) {
-    float sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
-    const int n = (2 * r + 1) * (2 * r + 1);
-    for (int v = -r; v <= r; ++v) {
-        device const uchar* ra = a + (y + v) * W;
-        device const uchar* rb = b + (y + v) * W;
-        for (int u = -r; u <= r; ++u) {
-            const float xb = float(x + u) - (d + gx * float(u) + gy * float(v));
-            const int x0 = int(floor(xb));
-            if (x0 < 0 || x0 + 1 >= W) return -2.0f;
-            const float f = xb - float(x0);
-            const float ib = float(rb[x0]) * (1.0f - f) + float(rb[x0 + 1]) * f;
-            const float ia = ra[x + u];
-            sa += ia; sb += ib; saa += ia * ia; sbb += ib * ib; sab += ia * ib;
-        }
-    }
-    const float va = saa - sa * sa / n;
-    const float vb = sbb - sb * sb / n;
-    if (va < 1e-6f || vb < 1e-6f) return -1.0f;
-    return (sab - sa * sb / n) / sqrt(va * vb);
-}
+struct RefineArgs { uint w; uint h; uint cw; uint ch; int radius; int search_radius; float min_zncc; uint subpixel; };
 
 kernel void refine_slanted(device const uchar* left [[buffer(0)]], device const uchar* right [[buffer(1)]],
                            device const float* coarse [[buffer(2)]], device float* out_disp [[buffer(3)]],
@@ -309,20 +298,50 @@ kernel void refine_slanted(device const uchar* left [[buffer(0)]], device const 
     gy = clamp(gy, -0.9f, 0.9f);
     const float step = 0.5f;
     const float center = 2.0f * d0;
-    const int nd = min(127, int(2 * a.search_radius / step) + 1);
     const float lo = center - float(a.search_radius);
-    float scores[128];
-    float best = -2.0f;
+    // All candidates in one pass over the window (each candidate accumulates in the same order as a
+    // per-candidate loop, so the scores are identical).
+    const int ncand = int(kRefineCandidates);
+    float sa = 0, saa = 0, sb[kMaxRefineCandidates], sbb[kMaxRefineCandidates], sab[kMaxRefineCandidates];
+    uint dead = 0;  // candidates whose window leaves the image
+    for (int k = 0; k < ncand; ++k) { sb[k] = 0; sbb[k] = 0; sab[k] = 0; if (lo + step * float(k) < 0) dead |= 1u << k; }
+    const int W = int(a.w);
+    for (int v = -r; v <= r; ++v) {
+        device const uchar* ra = left + (y + v) * W;
+        device const uchar* rb = right + (y + v) * W;
+        for (int u = -r; u <= r; ++u) {
+            const float ia = ra[x + u];
+            sa += ia; saa += ia * ia;
+            for (int k = 0; k < ncand; ++k) {
+                const float d = lo + step * float(k);
+                const float xb = float(x + u) - (d + gx * float(u) + gy * float(v));
+                const int x0 = int(floor(xb));
+                if (x0 < 0 || x0 + 1 >= W) { dead |= 1u << k; continue; }
+                const float f = xb - float(x0);
+                const float ib = float(rb[x0]) * (1.0f - f) + float(rb[x0 + 1]) * f;
+                sb[k] += ib; sbb[k] += ib * ib; sab[k] += ia * ib;
+            }
+        }
+    }
+    const float n = float((2 * r + 1) * (2 * r + 1));
+    const float va = saa - sa * sa / n;
+    // Only the best score and its two neighbours are needed (for the subpixel fit).
+    float best = -2.0f, best_prev = -2.0f, best_next = -2.0f, prev = -2.0f;
     int best_k = -1;
-    for (int k = 0; k < nd; ++k) {
-        const float d = lo + step * float(k);
-        scores[k] = d < 0 ? -2.0f : zncc_slanted(left, right, int(a.w), x, y, d, gx, gy, r);
-        if (scores[k] > best) { best = scores[k]; best_k = k; }
+    for (int k = 0; k < ncand; ++k) {
+        float sc = -2.0f;
+        if (!(dead & (1u << k))) {
+            const float vb = sbb[k] - sb[k] * sb[k] / n;
+            sc = (va < 1e-6f || vb < 1e-6f) ? -1.0f : (sab[k] - sa * sb[k] / n) / sqrt(va * vb);
+        }
+        if (k == best_k + 1) best_next = sc;
+        if (sc > best) { best = sc; best_k = k; best_prev = prev; best_next = -2.0f; }
+        prev = sc;
     }
     if (best_k < 0 || best < a.min_zncc) return;
     float d = lo + step * float(best_k);
-    if (a.subpixel && best_k > 0 && best_k + 1 < nd && scores[best_k - 1] > -2.0f && scores[best_k + 1] > -2.0f)
-        d += step * subpixel_offset(1.0f - scores[best_k - 1], 1.0f - best, 1.0f - scores[best_k + 1]);
+    if (a.subpixel && best_k > 0 && best_k + 1 < ncand && best_prev > -2.0f && best_next > -2.0f)
+        d += step * subpixel_offset(1.0f - best_prev, 1.0f - best, 1.0f - best_next);
     out_disp[i] = d;
     out_conf[i] = best;
 }
@@ -392,6 +411,8 @@ kernel void ccl_count(device const float* disp [[buffer(0)]], device atomic_int*
     if (disp[i] < 0) return;
     const int root = ccl_find(L, int(i));
     atomic_fetch_add_explicit(&sizes[root], 1u, memory_order_relaxed);
+    // Flatten: a root is a valid ancestor for concurrent finds, and ccl_filter then needs one load.
+    atomic_store_explicit(&L[i], root, memory_order_relaxed);
 }
 
 kernel void ccl_filter(device float* disp [[buffer(0)]], device float* conf [[buffer(1)]], device atomic_int* L [[buffer(2)]],
@@ -400,7 +421,7 @@ kernel void ccl_filter(device float* disp [[buffer(0)]], device float* conf [[bu
     if (gid.x >= a.w || gid.y >= a.h) return;
     const uint i = gid.y * a.w + gid.x;
     if (disp[i] < 0) { conf[i] = 0.0f; return; }
-    const int root = ccl_find(L, int(i));
+    const int root = atomic_load_explicit(&L[i], memory_order_relaxed);  // flattened by ccl_count
     if (atomic_load_explicit(&sizes[root], memory_order_relaxed) < a.min_size) {
         disp[i] = kInvalid;
         conf[i] = 0.0f;
@@ -468,7 +489,9 @@ kernel void blob_init(device const uchar* img [[buffer(0)]], device atomic_int* 
                       device atomic_float* mom [[buffer(8)]], constant BlobArgs& a [[buffer(9)]], uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= a.w || gid.y >= a.h) return;
     const uint i = gid.y * a.w + gid.x;
-    atomic_store_explicit(&L[i], img[i] > a.threshold ? int(i) : -1, memory_order_relaxed);
+    const bool fg = img[i] > a.threshold;
+    atomic_store_explicit(&L[i], fg ? int(i) : -1, memory_order_relaxed);
+    if (!fg) return;  // only foreground pixels can be roots, and stats are only read at roots
     atomic_store_explicit(&count[i], 0u, memory_order_relaxed);
     atomic_store_explicit(&bx0[i], 0xFFFFFFFFu, memory_order_relaxed);
     atomic_store_explicit(&by0[i], 0xFFFFFFFFu, memory_order_relaxed);

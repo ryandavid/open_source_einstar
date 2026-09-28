@@ -4,10 +4,13 @@
 // does not need the offline `metal` compiler (only the Command Line Tools are required).
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
+#include <span>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 
 #include <Metal/Metal.hpp>
 
@@ -47,6 +50,9 @@ public:
     // Compiles (and caches by name) a library from Metal source.
     Result<MTL::Library*> library(std::string_view name, std::string_view source);
     Result<Ref<MTL::ComputePipelineState>> compute_pipeline(MTL::Library* lib, std::string_view function);
+    // Specialises `uint` function constants ([[function_constant(index)]]) at pipeline creation.
+    Result<Ref<MTL::ComputePipelineState>> compute_pipeline(MTL::Library* lib, std::string_view function,
+                                                            std::span<const std::pair<int, std::uint32_t>> uint_constants);
 
     [[nodiscard]] Ref<MTL::Buffer> buffer(std::size_t bytes, MTL::ResourceOptions options = MTL::ResourceStorageModeShared);
 

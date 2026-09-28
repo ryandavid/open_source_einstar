@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "einstar/core/timing.hpp"
+#include "einstar/gpu/profile.hpp"
 
 namespace einstar::depth_metal {
 namespace {
@@ -20,7 +21,7 @@ struct Size2 { std::uint32_t w, h; };
 struct RectifyArgs { std::uint32_t src_w, src_h, full_w, full_h, out_w, out_h; };
 struct CensusArgs { std::uint32_t w, h; std::int32_t rx, ry; };
 struct CostArgs { std::uint32_t w, h, nd; std::int32_t min_disp; std::uint16_t invalid_cost; std::uint16_t pad; };
-struct PathArgs { std::uint32_t w, h, nd; std::int32_t dx, dy, p1, p2; std::uint32_t adaptive, slant; };
+struct PathArgs { std::uint32_t w, h, nd; std::int32_t dx, dy, p1, p2; std::uint32_t adaptive, slant, first; };
 struct WtaArgs { std::uint32_t w, h, nd; std::int32_t min_disp; float uniqueness; std::uint32_t subpixel; };
 struct LrArgs { std::uint32_t w, h; float max_diff; };
 struct RefineArgs { std::uint32_t w, h, cw, ch; std::int32_t radius, search_radius; float min_zncc; std::uint32_t subpixel; };
@@ -86,6 +87,9 @@ Result<std::unique_ptr<MetalStereo>> MetalStereo::create(std::shared_ptr<gpu::Co
     if (params.sgm.num_disparities > 512) return make_error(Errc::invalid_argument, "Metal SGM supports up to 512 disparities");
     if (params.sgm.census_radius_x * 2 + 1 > 9 || params.sgm.census_radius_y * 2 + 1 > 7)
         return make_error(Errc::invalid_argument, "census window too large for 64 bits");
+    // Byte-sized cost volume and path values: census cost + P2 must stay below 256.
+    if ((2 * params.sgm.census_radius_x + 1) * (2 * params.sgm.census_radius_y + 1) + params.sgm.p2 > 255)
+        return make_error(Errc::invalid_argument, "census window + P2 exceed the byte-sized SGM costs");
     auto lib = im->ctx->library("stereo", kSource);
     if (!lib) return std::unexpected(lib.error());
     auto make = [&](const char* name, Ref<MTL::ComputePipelineState>& out) -> Result<void> {
@@ -98,13 +102,22 @@ Result<std::unique_ptr<MetalStereo>> MetalStereo::create(std::shared_ptr<gpu::Co
                            std::pair{"census", &im->census}, std::pair{"cost_volume", &im->cost},
                            std::pair{"sgm_path", &im->path}, std::pair{"wta_left", &im->wta_l},
                            std::pair{"wta_right", &im->wta_r}, std::pair{"lr_check", &im->lr},
-                           std::pair{"median3", &im->median}, std::pair{"refine_slanted", &im->refine},
+                           std::pair{"median3", &im->median},
                            std::pair{"ccl_init", &im->ccl_init}, std::pair{"ccl_merge", &im->ccl_merge},
                            std::pair{"ccl_count", &im->ccl_count}, std::pair{"ccl_filter", &im->ccl_filter},
                            std::pair{"disparity_points", &im->pts_kernel}, std::pair{"point_normals", &im->nrm_kernel},
                            std::pair{"blob_init", &im->blob_init}, std::pair{"blob_merge", &im->blob_merge},
                            std::pair{"blob_stats", &im->blob_stats}, std::pair{"blob_select", &im->blob_select}})
         if (auto r = make(n, *slot); !r) return std::unexpected(r.error());
+    {
+        const auto candidates = static_cast<std::uint32_t>(4 * params.refine.search_radius + 1);  // 0.5 px steps
+        if (params.refine.search_radius < 1 || candidates > 17)
+            return make_error(Errc::invalid_argument, "Metal stereo: refine search radius must be 1..4");
+        const std::pair<int, std::uint32_t> constants[] = {{0, candidates}};
+        auto p = im->ctx->compute_pipeline(*lib, "refine_slanted", constants);
+        if (!p) return std::unexpected(p.error());
+        im->refine = std::move(*p);
+    }
 
     const int levels = params.pyramid_levels;
     im->lw.push_back(width);
@@ -126,7 +139,7 @@ Result<std::unique_ptr<MetalStereo>> MetalStereo::create(std::shared_ptr<gpu::Co
     const auto cpx = static_cast<std::size_t>(cw * ch);
     im->census_l = im->buf(cpx * 8);
     im->census_r = im->buf(cpx * 8);
-    im->cost_vol = im->buf(cpx * static_cast<std::size_t>(im->nd) * 2);
+    im->cost_vol = im->buf(cpx * static_cast<std::size_t>(im->nd));  // bytes (see cost_volume)
     im->sum_vol = im->buf(cpx * static_cast<std::size_t>(im->nd) * 2);
     im->rdisp = im->buf(cpx * 4);
     const auto fpx = static_cast<std::size_t>(width * height);
@@ -332,6 +345,7 @@ Result<void> MetalStereo::encode_and_run(bool from_raw, bool make_points, ImageU
             dispatch2d(im.rectify.get(), im.w, im.h);
         }
     }
+    gpu::profile::split(im.ctx->queue(), cmd, enc, "stereo/rectify");
     const bool blobs = from_raw && request && request->marker_blobs && im.blob_params;
     if (blobs) {
         // Marker blob search on both raw images (independent of the stereo below).
@@ -374,6 +388,7 @@ Result<void> MetalStereo::encode_and_run(bool from_raw, bool make_points, ImageU
             dispatch2d(im.blob_select.get(), im.raw_w, im.raw_h);
         }
     }
+    gpu::profile::split(im.ctx->queue(), cmd, enc, "stereo/marker blobs");
     for (int l = 0; l < levels; ++l) {
         const Size2 s{static_cast<std::uint32_t>(im.lw[static_cast<std::size_t>(l)]), static_cast<std::uint32_t>(im.lh[static_cast<std::size_t>(l)])};
         for (int side = 0; side < 2; ++side) {
@@ -383,6 +398,7 @@ Result<void> MetalStereo::encode_and_run(bool from_raw, bool make_points, ImageU
             dispatch2d(im.down.get(), im.lw[static_cast<std::size_t>(l + 1)], im.lh[static_cast<std::size_t>(l + 1)]);
         }
     }
+    gpu::profile::split(im.ctx->queue(), cmd, enc, "stereo/pyramid");
     // --- SGM at the coarsest level ---
     const auto top = static_cast<std::size_t>(levels);
     const int cw = im.lw[top], ch = im.lh[top];
@@ -403,29 +419,30 @@ Result<void> MetalStereo::encode_and_run(bool from_raw, bool make_points, ImageU
     enc->setBytes(&co, sizeof(co), 3);
     enc->dispatchThreads(MTL::Size(static_cast<NS::UInteger>(im.nd), static_cast<NS::UInteger>(cw), static_cast<NS::UInteger>(ch)),
                          MTL::Size(64, 4, 1));
-    enc->endEncoding();
-    // Zero the aggregated sums, then accumulate each path direction in turn.
-    MTL::BlitCommandEncoder* blit = cmd->blitCommandEncoder();
-    blit->fillBuffer(im.sum_vol.get(), NS::Range(0, im.sum_vol->length()), 0);
-    blit->endEncoding();
-    enc = cmd->computeCommandEncoder();
+    gpu::profile::split(im.ctx->queue(), cmd, enc, "stereo/census+cost");
+    enc->memoryBarrier(MTL::BarrierScopeBuffers);
+    // Accumulate each path direction in turn (the first one initialises the sums).
     struct Dir { int dx, dy; };
     std::vector<Dir> dirs = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
     if (sp.eight_paths) dirs.insert(dirs.end(), {{1, 1}, {-1, -1}, {1, -1}, {-1, 1}});
-    const NS::UInteger tg = static_cast<NS::UInteger>((im.nd + 31) / 32 * 32);
-    for (const Dir d : dirs) {
+
+    for (std::size_t di = 0; di < dirs.size(); ++di) {
+        const Dir d = dirs[di];
         const PathArgs pa{static_cast<std::uint32_t>(cw), static_cast<std::uint32_t>(ch), static_cast<std::uint32_t>(im.nd),
-                          d.dx, d.dy, sp.p1, sp.p2, sp.adaptive_p2 ? 1u : 0u, sp.slant_steps ? 1u : 0u};
+                          d.dx, d.dy, sp.p1, sp.p2, sp.adaptive_p2 ? 1u : 0u, sp.slant_steps ? 1u : 0u,
+                          di == 0 ? 1u : 0u};
         const int lines = d.dy == 0 ? ch : d.dx == 0 ? cw : ch + cw - 1;
         enc->setComputePipelineState(im.path.get());
         enc->setBuffer(im.cost_vol.get(), 0, 0);
         enc->setBuffer(im.sum_vol.get(), 0, 1);
         enc->setBuffer(im.img_l[top].get(), 0, 2);
         enc->setBytes(&pa, sizeof(pa), 3);
+        const NS::UInteger tg = static_cast<NS::UInteger>((im.nd + 31) / 32 * 32);
         enc->dispatchThreadgroups(MTL::Size(static_cast<NS::UInteger>(lines), 1, 1), MTL::Size(tg, 1, 1));
         // Directions accumulate into the same sums: serialise them.
         enc->memoryBarrier(MTL::BarrierScopeBuffers);
     }
+    gpu::profile::split(im.ctx->queue(), cmd, enc, "stereo/sgm paths");
     const WtaArgs wa{static_cast<std::uint32_t>(cw), static_cast<std::uint32_t>(ch), static_cast<std::uint32_t>(im.nd),
                      sp.min_disparity, sp.uniqueness, im.p.subpixel ? 1u : 0u};
     enc->setBuffer(im.sum_vol.get(), 0, 0);
@@ -442,6 +459,7 @@ Result<void> MetalStereo::encode_and_run(bool from_raw, bool make_points, ImageU
     enc->setBuffer(im.rdisp.get(), 0, 1);
     enc->setBytes(&la, sizeof(la), 2);
     dispatch2d(im.lr.get(), cw, ch);
+    gpu::profile::split(im.ctx->queue(), cmd, enc, "stereo/wta+lr");
 
     // --- coarse-to-fine refinement ---
     for (int l = levels - 1; l >= 0; --l) {
@@ -464,6 +482,7 @@ Result<void> MetalStereo::encode_and_run(bool from_raw, bool make_points, ImageU
         enc->setBytes(&rf, sizeof(rf), 5);
         dispatch2d(im.refine.get(), im.lw[lf], im.lh[lf]);
     }
+    gpu::profile::split(im.ctx->queue(), cmd, enc, "stereo/median+refine");
     // --- speckle removal: connected components on the GPU (same rule as depth::remove_speckles) ---
     const int fw = im.lw[0], fh = im.lh[0];
     if (im.p.speckle.max_region_size > 0) {
@@ -494,6 +513,7 @@ Result<void> MetalStereo::encode_and_run(bool from_raw, bool make_points, ImageU
         enc->setBytes(&cc, sizeof(cc), 4);
         dispatch2d(im.ccl_filter.get(), fw, fh);
     }
+    gpu::profile::split(im.ctx->queue(), cmd, enc, "stereo/speckle ccl");
     // --- points / normals / weights ---
     if (make_points) {
         enc->memoryBarrier(MTL::BarrierScopeBuffers);
@@ -511,6 +531,11 @@ Result<void> MetalStereo::encode_and_run(bool from_raw, bool make_points, ImageU
         dispatch2d(im.nrm_kernel.get(), fw, fh);
     }
     enc->endEncoding();
+    if (gpu::profile::enabled()) {
+        // Close out the last stage on its own so the previews blit is timed separately.
+        gpu::profile::commit_and_wait(cmd, make_points ? "stereo/points+normals" : "stereo/tail");
+        cmd = im.ctx->queue()->commandBuffer();
+    }
     if (request && request->preview_textures && outputs) {
         // Previews stay on the GPU: copy the rectified pair into textures for display.
         auto* td = MTL::TextureDescriptor::texture2DDescriptor(MTL::PixelFormatR8Unorm, static_cast<NS::UInteger>(fw),
@@ -527,8 +552,7 @@ Result<void> MetalStereo::encode_and_run(bool from_raw, bool make_points, ImageU
                                (side ? outputs->preview_right : outputs->preview_left).get(), 0, 0, MTL::Origin(0, 0, 0));
         be->endEncoding();
     }
-    cmd->commit();
-    cmd->waitUntilCompleted();
+    gpu::profile::commit_and_wait(cmd, "stereo/previews");
     timings_.gpu_ms = (cmd->GPUEndTime() - cmd->GPUStartTime()) * 1000.0;
     timings_.speckle_ms = 0;
     const bool failed = cmd->status() == MTL::CommandBufferStatusError;

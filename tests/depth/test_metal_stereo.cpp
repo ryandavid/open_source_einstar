@@ -150,8 +150,15 @@ TEST_CASE("Metal stereo produces GPU-resident frames matching the CPU point conv
     pp.max_depth = 700.0f;
     const auto ref = depth::disparity_to_points(disp->disparity, disp->confidence, half, pp);
 
+    // Several frames in a row: exercises the buffer pool, and state that must not leak between frames
+    // (e.g. the SGM sums are initialised by the first path, not cleared).
     auto frame = (*gpu)->compute_frame_raw(pr.left.view(), pr.right.view());
-    for (int i = 0; i < 3; ++i) frame = (*gpu)->compute_frame_raw(pr.left.view(), pr.right.view());  // exercise the pool
+    for (int i = 0; i < 3; ++i) frame = (*gpu)->compute_frame_raw(pr.left.view(), pr.right.view());
+    {
+        auto again = (*gpu)->compute_raw(pr.left.view(), pr.right.view());
+        REQUIRE(again.has_value());
+        CHECK(std::equal(again->disparity.pixels().begin(), again->disparity.pixels().end(), disp->disparity.pixels().begin()));
+    }
     REQUIRE(frame.has_value());
     const auto t = (*gpu)->last_timings();
     const float* p = (*frame)->points_xyzw();

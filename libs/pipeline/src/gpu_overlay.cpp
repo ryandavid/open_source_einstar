@@ -1,5 +1,7 @@
 #include "gpu_overlay.hpp"
 
+#include "einstar/gpu/profile.hpp"
+
 #include <cstring>
 
 namespace einstar::pipeline {
@@ -74,8 +76,7 @@ GpuOverlay::Points GpuOverlay::frame_points(const gpu::MetalFrameData& f, const 
     enc->setBytes(&a, sizeof(a), 4);
     enc->dispatchThreads(MTL::Size(static_cast<NS::UInteger>(gw), static_cast<NS::UInteger>(gh), 1), MTL::Size(16, 16, 1));
     enc->endEncoding();
-    cmd->commit();
-    cmd->waitUntilCompleted();
+    gpu::profile::commit_and_wait(cmd, "overlay/frame points");
     pool->release();
     out.count = std::min<std::size_t>(*static_cast<std::uint32_t*>(counter_->contents()), cap);
     return out;

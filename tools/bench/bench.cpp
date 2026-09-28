@@ -19,6 +19,7 @@
 #include "einstar/depth/stereo.hpp"
 #include "einstar/fixtures/exstar_project.hpp"
 #include "einstar/pipeline/stereo_frontend.hpp"
+#include "einstar/gpu/profile.hpp"
 #include "einstar/pipeline/scan_pipeline.hpp"
 #include "einstar/synth/demo.hpp"
 #include "einstar/synth/speckle_scene.hpp"
@@ -130,6 +131,7 @@ static void bench_pipeline(const RigCalibration& rig) {
             pipe.push(std::move(g));
         }
         wait_all(5);
+        gpu::profile::reset();
         const double c0 = process_cpu_ms();
         Stopwatch sw;
         for (int f = 5; f < n; ++f) {
@@ -141,6 +143,7 @@ static void bench_pipeline(const RigCalibration& rig) {
         pipe.stop();
         std::filesystem::remove_all(dir);
         std::println("{:34} wall {:6.2f} ms/frame, process CPU {:6.2f} ms/frame", name, wall / (n - 5), cpu / (n - 5));
+        if (gpu::profile::enabled()) std::print("{}", gpu::profile::report(n - 5));
     };
     std::println("== scan pipeline ({} frames) ==", n - 5);
     run("full (markers, recording)", true, true);
@@ -248,11 +251,13 @@ int main(int argc, char** argv) {
             track::IcpParams ip;
             ip.iterations = iters;
             TimingStats gt(20);
+            double its = 0;
             time_it(std::format("gpu icp iters {}/{}/{}", iters[0], iters[1], iters[2]).c_str(), 20, [&] {
                 (void)(*gicp)->solve(df, model, pose, pose, ip);
                 gt.add((*gicp)->last_gpu_ms());
+                its = (*gicp)->last_iterations();
             });
-            std::println("{:28} gpu-side median {:.2f} ms", "", gt.median());
+            std::println("{:28} gpu-side median {:.2f} ms, {} iterations ran", "", gt.median(), its);
         }
     }
     return 0;

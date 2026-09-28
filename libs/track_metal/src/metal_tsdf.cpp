@@ -7,6 +7,7 @@
 #include <functional>
 
 #include "einstar/core/log.hpp"
+#include "einstar/gpu/profile.hpp"
 #include "einstar/gpu/device_data.hpp"
 
 namespace einstar::track_metal {
@@ -87,7 +88,7 @@ struct MetalTsdfVolume::Impl {
     MetalTsdfOptions opt;
     Ref<MTL::ComputePipelineState> init_voxels, allocate, integrate, raycast, extract, extract_render;
     mutable std::size_t render_capacity = 0;
-    Ref<MTL::Buffer> keys, values, coords, brick_count, stamps, visible_count, visible, voxels, last_update;
+    Ref<MTL::Buffer> keys, values, coords, brick_count, stamps, visible_count, visible, voxels, last_update, occupancy;
     // per-frame inputs
     Ref<MTL::Buffer> points, weights;
     std::size_t frame_pixels = 0;
@@ -109,14 +110,13 @@ struct MetalTsdfVolume::Impl {
         return a;
     }
 
-    void run(const std::function<void(MTL::ComputeCommandEncoder*)>& encode) const {
+    void run(const char* label, const std::function<void(MTL::ComputeCommandEncoder*)>& encode) const {
         NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
         MTL::CommandBuffer* cmd = ctx->queue()->commandBuffer();
         MTL::ComputeCommandEncoder* enc = cmd->computeCommandEncoder();
         encode(enc);
         enc->endEncoding();
-        cmd->commit();
-        cmd->waitUntilCompleted();
+        gpu::profile::commit_and_wait(cmd, label);
         if (cmd->status() == MTL::CommandBufferStatusError) log::error("Metal TSDF command buffer failed");
         pool->release();
     }
@@ -167,6 +167,7 @@ Result<std::unique_ptr<MetalTsdfVolume>> MetalTsdfVolume::create(std::shared_ptr
     im->visible = im->ctx->buffer(cap * 4);
     im->voxels = im->ctx->buffer(cap * 512 * 4);
     im->last_update = im->ctx->buffer(cap * 4);
+    im->occupancy = im->ctx->buffer((256ull * 256 * 128) / 8);  // see occupancy_index in the kernels
     im->ext_count = im->ctx->buffer(4);
     if (!im->voxels) return make_error(Errc::unsupported, "could not allocate the brick pool");
     auto vol = std::unique_ptr<MetalTsdfVolume>(new MetalTsdfVolume(std::move(im), params));
@@ -181,8 +182,9 @@ void MetalTsdfVolume::clear() {
     std::memset(im.values->contents(), 0xFF, im.values->length());
     std::memset(im.stamps->contents(), 0, im.stamps->length());
     std::memset(im.last_update->contents(), 0, im.last_update->length());
+    std::memset(im.occupancy->contents(), 0, im.occupancy->length());
     *static_cast<std::uint32_t*>(im.brick_count->contents()) = 0;
-    im.run([&](MTL::ComputeCommandEncoder* enc) {
+    im.run("tsdf/init_voxels", [&](MTL::ComputeCommandEncoder* enc) {
         enc->setComputePipelineState(im.init_voxels.get());
         enc->setBuffer(im.voxels.get(), 0, 0);
         enc->dispatchThreads(MTL::Size(im.opt.brick_capacity * 512ull, 1, 1), MTL::Size(256, 1, 1));
@@ -250,7 +252,7 @@ void MetalTsdfVolume::integrate(const track::DepthFrame& frame, const SE3& T_wor
     const auto& k = frame.intrinsics;
     const CameraArgs cam = camera_args(T_world_camera, k.fx, k.fy, k.cx, k.cy, w, h);
     *static_cast<std::uint32_t*>(im.visible_count->contents()) = 0;
-    im.run([&](MTL::ComputeCommandEncoder* enc) {
+    im.run("tsdf/allocate", [&](MTL::ComputeCommandEncoder* enc) {
         enc->setComputePipelineState(im.allocate.get());
         enc->setBuffer(points_buf, 0, 0);
         enc->setBuffer(im.keys.get(), 0, 1);
@@ -262,12 +264,13 @@ void MetalTsdfVolume::integrate(const track::DepthFrame& frame, const SE3& T_wor
         enc->setBuffer(im.visible.get(), 0, 7);
         enc->setBytes(&a, sizeof(a), 8);
         enc->setBytes(&cam, sizeof(cam), 9);
+        enc->setBuffer(im.occupancy.get(), 0, 10);
         enc->dispatchThreads(MTL::Size(static_cast<NS::UInteger>(w), static_cast<NS::UInteger>(h), 1), MTL::Size(16, 16, 1));
     });
     const std::uint32_t visible = std::min(*static_cast<std::uint32_t*>(im.visible_count->contents()), im.opt.brick_capacity);
     if (pool_exhausted()) log::warn("Metal TSDF brick pool exhausted ({} bricks); new surface is not stored", im.opt.brick_capacity);
     if (visible == 0) return;
-    im.run([&](MTL::ComputeCommandEncoder* enc) {
+    im.run("tsdf/integrate", [&](MTL::ComputeCommandEncoder* enc) {
         enc->setComputePipelineState(im.integrate.get());
         enc->setBuffer(points_buf, 0, 0);
         enc->setBuffer(weights_buf, 0, 1);
@@ -289,7 +292,7 @@ track::RaycastResult MetalTsdfVolume::raycast(const SE3& T_world_camera, const t
     auto normals = im.ctx->buffer(n * 16);
     const VolumeArgs a = im.args(params_, frame_);
     const CameraArgs cam = camera_args(T_world_camera, k.fx, k.fy, k.cx, k.cy, k.width, k.height);
-    im.run([&](MTL::ComputeCommandEncoder* enc) {
+    im.run("tsdf/raycast", [&](MTL::ComputeCommandEncoder* enc) {
         enc->setComputePipelineState(im.raycast.get());
         enc->setBuffer(im.keys.get(), 0, 0);
         enc->setBuffer(im.values.get(), 0, 1);
@@ -298,6 +301,7 @@ track::RaycastResult MetalTsdfVolume::raycast(const SE3& T_world_camera, const t
         enc->setBuffer(normals.get(), 0, 4);
         enc->setBytes(&a, sizeof(a), 5);
         enc->setBytes(&cam, sizeof(cam), 6);
+        enc->setBuffer(im.occupancy.get(), 0, 7);
         enc->dispatchThreads(MTL::Size(static_cast<NS::UInteger>(k.width), static_cast<NS::UInteger>(k.height), 1), MTL::Size(16, 16, 1));
     });
     track::RaycastResult out;
@@ -324,7 +328,7 @@ std::vector<track::SurfacePoint> MetalTsdfVolume::extract_points(std::uint32_t s
         *static_cast<std::uint32_t*>(im.ext_count->contents()) = 0;
         const auto cap32 = static_cast<std::uint32_t>(im.ext_capacity);
         const std::uint32_t use_list = 0;
-        im.run([&](MTL::ComputeCommandEncoder* enc) {
+        im.run("tsdf/extract", [&](MTL::ComputeCommandEncoder* enc) {
             enc->setComputePipelineState(im.extract.get());
             enc->setBuffer(im.keys.get(), 0, 0);
             enc->setBuffer(im.values.get(), 0, 1);
@@ -368,7 +372,7 @@ MetalTsdfVolume::RenderPoints MetalTsdfVolume::extract_render_points(float min_w
         out.buffer = im.ctx->buffer(cap * kVertex);
         *static_cast<std::uint32_t*>(im.ext_count->contents()) = 0;
         const auto cap32 = static_cast<std::uint32_t>(cap);
-        im.run([&](MTL::ComputeCommandEncoder* enc) {
+        im.run("tsdf/extract_render", [&](MTL::ComputeCommandEncoder* enc) {
             enc->setComputePipelineState(im.extract_render.get());
             enc->setBuffer(im.keys.get(), 0, 0);
             enc->setBuffer(im.values.get(), 0, 1);
@@ -422,7 +426,7 @@ std::vector<track::SurfacePoint> MetalTsdfVolume::extract_points(const std::vect
     *static_cast<std::uint32_t*>(im.ext_count->contents()) = 0;
     const auto cap32 = static_cast<std::uint32_t>(im.ext_capacity);
     const std::uint32_t use_list = 1;
-    im.run([&](MTL::ComputeCommandEncoder* enc) {
+    im.run("tsdf/extract", [&](MTL::ComputeCommandEncoder* enc) {
         enc->setComputePipelineState(im.extract.get());
         enc->setBuffer(im.keys.get(), 0, 0);
         enc->setBuffer(im.values.get(), 0, 1);

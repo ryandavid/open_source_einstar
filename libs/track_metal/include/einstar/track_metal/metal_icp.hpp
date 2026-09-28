@@ -23,12 +23,14 @@ public:
     [[nodiscard]] track::IcpFunction as_function();
 
     [[nodiscard]] double last_gpu_ms() const { return last_gpu_ms_; }
+    [[nodiscard]] std::uint32_t last_iterations() const { return last_iterations_; }  // solves that ran
 
 private:
     struct Impl;
     explicit MetalIcp(std::unique_ptr<Impl> impl);
     std::unique_ptr<Impl> impl_;
     double last_gpu_ms_ = 0;
+    std::uint32_t last_iterations_ = 0;
 };
 
 }  // namespace einstar::track_metal

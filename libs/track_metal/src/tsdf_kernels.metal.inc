@@ -58,23 +58,47 @@ inline int lookup(device const atomic_uint* keys, device const atomic_int* value
     return -1;
 }
 
+// Coarse occupancy: one bit per 8x8x8 bricks over the packable brick range (256 x 256 x 128 bits,
+// 1 MiB), set when a brick is inserted. A clear bit means every brick lookup in that block misses, so
+// the raycast crosses empty space with a well-cached bitmap read instead of a random hash probe.
+inline bool occupancy_index(int3 b, thread uint& word, thread uint& bit) {
+    uint key;
+    if (!pack_key(b, key)) return false;
+    const uint sx = uint(b.x + 1024) >> 3, sy = uint(b.y + 1024) >> 3, sz = uint(b.z + 512) >> 3;
+    const uint idx = (sz * 256u + sy) * 256u + sx;
+    word = idx >> 5;
+    bit = 1u << (idx & 31u);
+    return true;
+}
+
 inline int floor_div8(int a) { return a >= 0 ? a / 8 : -((-a + 7) / 8); }
 
-// Voxel fetch by global voxel coordinate with a one-entry brick cache.
+// Voxel fetch by global voxel coordinate with a two-entry (most recent first) brick cache: samples
+// that straddle a brick boundary alternate between two bricks, which would thrash a single entry.
 struct VoxelReader {
     device const atomic_uint* keys;
     device const atomic_int* values;
     device const half2* voxels;
     uint mask;
-    int3 cached;
-    int brick;
+    int3 c0 = int3(INT_MIN), c1 = int3(INT_MIN);
+    int b0 = -1, b1 = -1;
+
+    int brick_at(int3 b) {
+        if (all(b == c0)) return b0;
+        const int3 tc = c0;
+        const int tb = b0;
+        if (all(b == c1)) {
+            c0 = c1; b0 = b1;
+        } else {
+            c0 = b; b0 = lookup(keys, values, mask, b);
+        }
+        c1 = tc; b1 = tb;
+        return b0;
+    }
 
     bool get(int3 g, thread float& sdf, thread float& w) {
         const int3 b = int3(floor_div8(g.x), floor_div8(g.y), floor_div8(g.z));
-        if (any(b != cached)) {
-            cached = b;
-            brick = lookup(keys, values, mask, b);
-        }
+        const int brick = brick_at(b);
         if (brick < 0) return false;
         const int3 l = g - b * kBrick;
         const half2 v = voxels[uint(brick) * 512u + uint((l.z * kBrick + l.y) * kBrick + l.x)];
@@ -123,7 +147,7 @@ inline void mark_visible(int brick, device atomic_uint* stamps, device atomic_ui
 
 inline void insert_or_find(int3 b, device atomic_uint* keys, device atomic_int* values, device int4* coords,
                            device atomic_uint* brick_count, device atomic_uint* stamps, device atomic_uint* visible_count,
-                           device uint* visible, constant VolumeArgs& a) {
+                           device uint* visible, device atomic_uint* occupancy, constant VolumeArgs& a) {
     uint key;
     if (!pack_key(b, key)) return;
     uint i = hash_key(key, a.table_mask);
@@ -134,6 +158,8 @@ inline void insert_or_find(int3 b, device atomic_uint* keys, device atomic_int* 
         while (k == kEmpty) {
             uint expected = kEmpty;
             if (atomic_compare_exchange_weak_explicit(&keys[i], &expected, key, memory_order_relaxed, memory_order_relaxed)) {
+                uint word, bit;
+                if (occupancy_index(b, word, bit)) atomic_fetch_or_explicit(&occupancy[word], bit, memory_order_relaxed);
                 const uint idx = atomic_fetch_add_explicit(brick_count, 1u, memory_order_relaxed);
                 if (idx >= a.brick_capacity) {
                     atomic_store_explicit(&values[i], -2, memory_order_relaxed);  // pool exhausted
@@ -161,7 +187,7 @@ kernel void allocate(device const float4* points [[buffer(0)]], device atomic_ui
                      device atomic_uint* brick_count [[buffer(4)]], device atomic_uint* stamps [[buffer(5)]],
                      device atomic_uint* visible_count [[buffer(6)]], device uint* visible [[buffer(7)]],
                      constant VolumeArgs& a [[buffer(8)]], constant CameraArgs& cam [[buffer(9)]],
-                     uint2 gid [[thread_position_in_grid]]) {
+                     device atomic_uint* occupancy [[buffer(10)]], uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= cam.w || gid.y >= cam.h) return;
     const float3 pc = points[gid.y * cam.w + gid.x].xyz;
     if (pc.z < a.min_depth || pc.z > a.max_depth) return;
@@ -174,7 +200,7 @@ kernel void allocate(device const float4* points [[buffer(0)]], device atomic_ui
         const int3 b = int3(floor((pw + float(s) * a.trunc * ray) / brick_mm));
         if (all(b == last)) continue;
         last = b;
-        insert_or_find(b, keys, values, coords, brick_count, stamps, visible_count, visible, a);
+        insert_or_find(b, keys, values, coords, brick_count, stamps, visible_count, visible, occupancy, a);
     }
 }
 
@@ -215,12 +241,13 @@ struct RaycastArgs { float min_depth; float max_depth; };
 kernel void raycast(device const atomic_uint* keys [[buffer(0)]], device const atomic_int* values [[buffer(1)]],
                     device const half2* voxels [[buffer(2)]], device float4* out_points [[buffer(3)]],
                     device float4* out_normals [[buffer(4)]], constant VolumeArgs& a [[buffer(5)]],
-                    constant CameraArgs& cam [[buffer(6)]], uint2 gid [[thread_position_in_grid]]) {
+                    constant CameraArgs& cam [[buffer(6)]], device const uint* occupancy [[buffer(7)]],
+                    uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= cam.w || gid.y >= cam.h) return;
     const uint i = gid.y * cam.w + gid.x;
     out_points[i] = float4(0);
     out_normals[i] = float4(0);
-    VoxelReader r{keys, values, voxels, a.table_mask, int3(INT_MIN), -1};
+    VoxelReader r{keys, values, voxels, a.table_mask};
     const float3 dir_c = float3((float(gid.x) - cam.cx) / cam.fx, (float(gid.y) - cam.cy) / cam.fy, 1.0f);
     const float dir_norm = length(dir_c);
     const float3 dir = (cam.T_wc * float4(dir_c / dir_norm, 0)).xyz;
@@ -236,7 +263,10 @@ kernel void raycast(device const atomic_uint* keys [[buffer(0)]], device const a
         const float3 g = p * inv_voxel;
         // Skip unallocated bricks in one jump to the brick exit.
         const int3 b = int3(floor(p / brick_mm));
-        if (lookup(keys, values, a.table_mask, b) < 0) {
+        // Through the reader's brick cache: marching inside a brick costs no hash probe.
+        uint word, bit;
+        const bool maybe = occupancy_index(b, word, bit) && (occupancy[word] & bit) != 0;
+        if (!maybe || r.brick_at(b) < 0) {
             const float3 lo = float3(b) * brick_mm, hi = lo + brick_mm;
             const float3 tx = select((lo - p) / dir, (hi - p) / dir, dir > 0);
             float exit = min(min(dir.x != 0 ? tx.x : 1e9f, dir.y != 0 ? tx.y : 1e9f), dir.z != 0 ? tx.z : 1e9f);
@@ -290,7 +320,7 @@ kernel void extract(device const atomic_uint* keys [[buffer(0)]], device const a
     const float sdf = float(v.x), w = float(v.y);
     if (w < a.min_weight || abs(sdf) > 0.5f * a.voxel / a.trunc) return;
     const int3 g = coords[brick].xyz * kBrick + int3(lid);
-    VoxelReader r{keys, values, voxels, a.table_mask, int3(INT_MIN), -1};
+    VoxelReader r{keys, values, voxels, a.table_mask};
     float sx0, sx1, sy0, sy1, sz0, sz1, ww;
     if (!r.get(g - int3(1, 0, 0), sx0, ww) || !r.get(g + int3(1, 0, 0), sx1, ww) || !r.get(g - int3(0, 1, 0), sy0, ww) ||
         !r.get(g + int3(0, 1, 0), sy1, ww) || !r.get(g - int3(0, 0, 1), sz0, ww) || !r.get(g + int3(0, 0, 1), sz1, ww))
@@ -323,7 +353,7 @@ kernel void extract_render(device const atomic_uint* keys [[buffer(0)]], device 
     const float sdf = float(v.x), w = float(v.y);
     if (w < a.min_weight || abs(sdf) > 0.5f * a.voxel / a.trunc) return;
     const int3 g = coords[brick].xyz * kBrick + int3(lid);
-    VoxelReader r{keys, values, voxels, a.table_mask, int3(INT_MIN), -1};
+    VoxelReader r{keys, values, voxels, a.table_mask};
     float sx0, sx1, sy0, sy1, sz0, sz1, ww;
     if (!r.get(g - int3(1, 0, 0), sx0, ww) || !r.get(g + int3(1, 0, 0), sx1, ww) || !r.get(g - int3(0, 1, 0), sy0, ww) ||
         !r.get(g + int3(0, 1, 0), sy1, ww) || !r.get(g - int3(0, 0, 1), sz0, ww) || !r.get(g + int3(0, 0, 1), sz1, ww))

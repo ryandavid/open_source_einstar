@@ -20,7 +20,7 @@ struct IcpState {
     float coverage;
     float eig_ratio;
     float marker_rms;
-    float pad;
+    uint iterations;   // solves that ran (all levels)
     float basis[36];   // column-major 6x6, first degenerate_dirs columns valid
     float hessian[36]; // unit-scaled Hessian of the final solve (row-major), for diagnostics
 };
@@ -62,7 +62,22 @@ inline void store4(device float* m, float4x4 t) {
         for (int r = 0; r < 4; ++r) m[c * 4 + r] = t[c][r];
 }
 
-kernel void icp_level_begin(device IcpState* st [[buffer(0)]]) { st->level_done = 0; }
+// Indirect dispatch arguments of one level: the accumulate grid, then the solve (one threadgroup). Once
+// the level converges (or ICP fails) the solve zeroes them, so the remaining iterations launch nothing.
+struct LevelDispatch { uint acc[3]; uint solve[3]; };
+
+inline void stop_level(device LevelDispatch* disp) {
+    disp->acc[0] = 0;
+    disp->solve[0] = 0;
+}
+
+kernel void icp_level_begin(device IcpState* st [[buffer(0)]], device LevelDispatch* disp [[buffer(1)]],
+                            constant uint2& groups [[buffer(2)]]) {
+    st->level_done = 0;
+    const uint on = st->failed ? 0u : 1u;
+    disp->acc[0] = groups.x * on; disp->acc[1] = groups.y; disp->acc[2] = 1;
+    disp->solve[0] = on; disp->solve[1] = 1; disp->solve[2] = 1;
+}
 
 kernel void icp_accumulate(device const float4* src_pts [[buffer(0)]], device const float4* src_nrm [[buffer(1)]],
                            device const float* src_w [[buffer(2)]], device const float4* mdl_pts [[buffer(3)]],
@@ -140,46 +155,53 @@ kernel void icp_accumulate(device const float4* src_pts [[buffer(0)]], device co
 // ---- small dense linear algebra for the solve thread ----
 typedef float Mat6[6][6];
 
-inline void jacobi6(thread Mat6& A, thread Mat6& V, thread float* ev) {
-    for (int i = 0; i < 6; ++i)
-        for (int j = 0; j < 6; ++j) V[i][j] = i == j ? 1.0f : 0.0f;
+// Cyclic Jacobi on a symmetric 6x6 held in threadgroup memory (row-major), run by one SIMD group:
+// every rotation's row / column / eigenvector updates are spread over lanes 0..5. Same rotations in
+// the same order as the serial version, so the results are identical; the serial chain of dependent
+// float operations was the most expensive step of each ICP iteration.
+inline void jacobi6_simd(threadgroup float* A, threadgroup float* V, threadgroup float* ev, uint lane) {
+    if (lane < 6)
+        for (int j = 0; j < 6; ++j) V[lane * 6 + uint(j)] = lane == uint(j) ? 1.0f : 0.0f;
+    simdgroup_barrier(mem_flags::mem_threadgroup);
     for (int sweep = 0; sweep < 20; ++sweep) {
-        float off = 0;
-        for (int p = 0; p < 6; ++p)
-            for (int q = p + 1; q < 6; ++q) off += A[p][q] * A[p][q];
-        if (off < 1e-20f) break;
+        float off = 0, diag = 0;
+        for (int p = 0; p < 6; ++p) {
+            diag += A[p * 6 + p] * A[p * 6 + p];
+            for (int q = p + 1; q < 6; ++q) off += A[p * 6 + q] * A[p * 6 + q];
+        }
+        // Relative to the matrix scale: an absolute threshold is never reached by large Hessians in
+        // float (it ran all 20 sweeps).
+        if (off <= 1e-14f * diag || off < 1e-30f) break;  // uniform: every lane reads the same values
         for (int p = 0; p < 6; ++p)
             for (int q = p + 1; q < 6; ++q) {
-                if (abs(A[p][q]) < 1e-30f) continue;
-                const float theta = (A[q][q] - A[p][p]) / (2 * A[p][q]);
+                const float apq = A[p * 6 + q];
+                if (abs(apq) < 1e-30f) continue;
+                const float theta = (A[q * 6 + q] - A[p * 6 + p]) / (2 * apq);
                 // Note: sign(0) is 0 in Metal, which would stall pairs with equal diagonals.
                 const float t = theta >= 0 ? 1.0f / (theta + sqrt(theta * theta + 1)) : -1.0f / (-theta + sqrt(theta * theta + 1));
-                const float c = 1 / sqrt(t * t + 1), s = t * c;
-                for (int k = 0; k < 6; ++k) {
-                    const float akp = A[k][p], akq = A[k][q];
-                    A[k][p] = c * akp - s * akq;
-                    A[k][q] = s * akp + c * akq;
+                const float c = 1 / sqrt(t * t + 1), sn = t * c;
+                simdgroup_barrier(mem_flags::mem_threadgroup);  // everyone has read A before it changes
+                if (lane < 6) {
+                    const uint k = lane;
+                    const float akp = A[k * 6 + uint(p)], akq = A[k * 6 + uint(q)];
+                    A[k * 6 + uint(p)] = c * akp - sn * akq;
+                    A[k * 6 + uint(q)] = sn * akp + c * akq;
                 }
-                for (int k = 0; k < 6; ++k) {
-                    const float apk = A[p][k], aqk = A[q][k];
-                    A[p][k] = c * apk - s * aqk;
-                    A[q][k] = s * apk + c * aqk;
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                if (lane < 6) {
+                    const uint k = lane;
+                    const float apk = A[uint(p) * 6 + k], aqk = A[uint(q) * 6 + k];
+                    A[uint(p) * 6 + k] = c * apk - sn * aqk;
+                    A[uint(q) * 6 + k] = sn * apk + c * aqk;
+                    const float vkp = V[k * 6 + uint(p)], vkq = V[k * 6 + uint(q)];
+                    V[k * 6 + uint(p)] = c * vkp - sn * vkq;
+                    V[k * 6 + uint(q)] = sn * vkp + c * vkq;
                 }
-                for (int k = 0; k < 6; ++k) {
-                    const float vkp = V[k][p], vkq = V[k][q];
-                    V[k][p] = c * vkp - s * vkq;
-                    V[k][q] = s * vkp + c * vkq;
-                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
             }
     }
-    for (int i = 0; i < 6; ++i) ev[i] = A[i][i];
-    // sort ascending (eigenvectors are columns of V)
-    for (int i = 0; i < 6; ++i)
-        for (int j = i + 1; j < 6; ++j)
-            if (ev[j] < ev[i]) {
-                const float t = ev[i]; ev[i] = ev[j]; ev[j] = t;
-                for (int k = 0; k < 6; ++k) { const float tv = V[k][i]; V[k][i] = V[k][j]; V[k][j] = tv; }
-            }
+    if (lane < 6) ev[lane] = A[lane * 6 + lane];
+    simdgroup_barrier(mem_flags::mem_threadgroup);
 }
 
 inline bool cholesky_solve6(thread Mat6& A, thread float* b, thread float* x) {
@@ -257,7 +279,8 @@ inline float4x4 inverse_rigid(float4x4 T) {
 }
 
 kernel void icp_solve(device IcpState* st [[buffer(0)]], device const float* partials [[buffer(1)]],
-                      constant SolveArgs& a [[buffer(2)]], device const float4* markers [[buffer(3)]], uint lidx [[thread_index_in_threadgroup]],
+                      constant SolveArgs& a [[buffer(2)]], device const float4* markers [[buffer(3)]],
+                      device LevelDispatch* disp [[buffer(4)]], uint lidx [[thread_index_in_threadgroup]],
                       uint tgsize [[threads_per_threadgroup]], uint lane [[thread_index_in_simdgroup]],
                       uint simd_id [[simdgroup_index_in_threadgroup]], uint nsimd [[simdgroups_per_threadgroup]]) {
     if (st->failed || st->level_done) return;
@@ -278,24 +301,36 @@ kernel void icp_solve(device IcpState* st [[buffer(0)]], device const float* par
         totals[lidx] = v;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lidx != 0) return;
-
+    if (simd_id != 0) return;  // one SIMD group from here: lane 0 runs the serial parts, all lanes the eigen solve
+    threadgroup float tgE[36], tgV[36], tgEv[6];
+    threadgroup int tg_abort;
+    if (lane == 0) tg_abort = 0;
+    // Locals of the serial part (lane 0 computes them; declared for all lanes).
+    Mat6 Ao, As, Ar, E, V;
+    float bo[6], bs[6], rhs[6], xs[6], ev[6], prior_s[6];
+    const float sc[6] = {1, 1, 1, 0.01f, 0.01f, 0.01f};
+    const float3 c = float3(a.c[0], a.c[1], a.c[2]);
     const float n = totals[28];
+    float marker_ss = 0;
+    float4x4 T;
+    if (lane == 0) {
+    ++st->iterations;
     if (n < 50 && a.marker_count < 3) {
         st->failed = 1;
         st->correspondences = int(n);
-        return;
+        stop_level(disp);
+        tg_abort = 1;
     }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (tg_abort) return;
+    if (lane == 0) {
     // Normal equations about the centroid c (same convention as the CPU solver).
-    Mat6 Ao;
-    float bo[6];
     int k = 0;
     for (int r = 0; r < 6; ++r)
         for (int c0 = r; c0 < 6; ++c0) { Ao[r][c0] = totals[k]; Ao[c0][r] = totals[k]; ++k; }
     for (int j = 0; j < 6; ++j) bo[j] = totals[21 + j];
-    const float3 c = float3(a.c[0], a.c[1], a.c[2]);
     // Joint marker terms: r = T p - q, J = [I, -hat(Tp - c)].
-    float marker_ss = 0;
     {
         const float4x4 Tm = load4(st->T);
         for (uint m = 0; m < a.marker_count; ++m) {
@@ -323,13 +358,10 @@ kernel void icp_solve(device IcpState* st [[buffer(0)]], device const float* par
         }
     }
     // Unit-scaled system (rotations as displacement at 100 mm).
-    const float sc[6] = {1, 1, 1, 0.01f, 0.01f, 0.01f};
-    Mat6 As, Ar, E, V;
-    float bs[6], rhs[6], xs[6], ev[6], prior_s[6];
     for (int i = 0; i < 6; ++i)
         for (int j = 0; j < 6; ++j) As[i][j] = sc[i] * Ao[i][j] * sc[j];
     for (int i = 0; i < 6; ++i) bs[i] = sc[i] * bo[i];
-    const float4x4 T = load4(st->T);
+    T = load4(st->T);
     const float4x4 Tinit = load4(st->T_init);
     float dxp[6];
     se3_log(Tinit * inverse_rigid(T), dxp);
@@ -346,9 +378,27 @@ kernel void icp_solve(device IcpState* st [[buffer(0)]], device const float* par
     }
     if (!cholesky_solve6(Ar, rhs, xs)) {
         st->failed = 1;
-        return;
+        stop_level(disp);
+        tg_abort = 1;
     }
-    jacobi6(E, V, ev);
+    for (int i = 0; i < 6; ++i)
+        for (int j = 0; j < 6; ++j) tgE[i * 6 + j] = E[i][j];
+    }  // lane 0
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (tg_abort) return;
+    jacobi6_simd(tgE, tgV, tgEv, lane);
+    if (lane != 0) return;
+    for (int i = 0; i < 6; ++i) {
+        ev[i] = tgEv[i];
+        for (int j = 0; j < 6; ++j) V[i][j] = tgV[i * 6 + j];
+    }
+    // sort ascending (eigenvectors are columns of V)
+    for (int i = 0; i < 6; ++i)
+        for (int j = i + 1; j < 6; ++j)
+            if (ev[j] < ev[i]) {
+                const float tt = ev[i]; ev[i] = ev[j]; ev[j] = tt;
+                for (int kk = 0; kk < 6; ++kk) { const float tv = V[kk][i]; V[kk][i] = V[kk][j]; V[kk][j] = tv; }
+            }
     int degenerate = 0;
     float basis[36];
     for (int i = 0; i < 36; ++i) basis[i] = 0;
@@ -386,7 +436,10 @@ kernel void icp_solve(device IcpState* st [[buffer(0)]], device const float* par
         for (int i = 0; i < 6; ++i)
             for (int j = 0; j < 6; ++j) st->hessian[i * 6 + j] = As[i][j];
     }
-    if (converged) st->level_done = 1;
+    if (converged) {
+        st->level_done = 1;
+        stop_level(disp);
+    }
 }
 
 // ---- normal-space balancing weights (mirrors track::normal_balance_weights) ----

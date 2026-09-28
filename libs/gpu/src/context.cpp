@@ -38,13 +38,27 @@ Result<MTL::Library*> Context::library(std::string_view name, std::string_view s
 }
 
 Result<Ref<MTL::ComputePipelineState>> Context::compute_pipeline(MTL::Library* lib, std::string_view function) {
+    return compute_pipeline(lib, function, {});
+}
+
+Result<Ref<MTL::ComputePipelineState>> Context::compute_pipeline(MTL::Library* lib, std::string_view function,
+                                                                 std::span<const std::pair<int, std::uint32_t>> uint_constants) {
     NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
-    Ref<MTL::Function> fn(lib->newFunction(ns_string(function)));
-    if (!fn) {
-        pool->release();
-        return make_error(Errc::not_found, std::format("Metal function '{}' not found", function));
-    }
     NS::Error* err = nullptr;
+    Ref<MTL::Function> fn;
+    if (uint_constants.empty()) {
+        fn = Ref<MTL::Function>(lib->newFunction(ns_string(function)));
+    } else {
+        Ref<MTL::FunctionConstantValues> values(MTL::FunctionConstantValues::alloc()->init());
+        for (const auto& [index, value] : uint_constants)
+            values->setConstantValue(&value, MTL::DataTypeUInt, static_cast<NS::UInteger>(index));
+        fn = Ref<MTL::Function>(lib->newFunction(ns_string(function), values.get(), &err));
+    }
+    if (!fn) {
+        std::string msg = err ? err->localizedDescription()->utf8String() : "not found";
+        pool->release();
+        return make_error(Errc::not_found, std::format("Metal function '{}': {}", function, msg));
+    }
     Ref<MTL::ComputePipelineState> pso(device_->newComputePipelineState(fn.get(), &err));
     if (!pso) {
         std::string msg = err ? err->localizedDescription()->utf8String() : "unknown error";

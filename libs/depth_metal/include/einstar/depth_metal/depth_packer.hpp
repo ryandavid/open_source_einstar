@@ -11,6 +11,7 @@
 #include "einstar/core/error.hpp"
 #include "einstar/gpu/context.hpp"
 #include "einstar/gpu/device_data.hpp"
+#include "einstar/gpu/profile.hpp"
 
 namespace einstar::depth_metal {
 
@@ -24,7 +25,10 @@ public:
         int width = 0, height = 0;
         // The frame's buffers return to the stereo pool when it is released: keep it until packed.
         std::shared_ptr<const gpu::MetalFrameData> frame;
-        void wait() const { command->waitUntilCompleted(); }
+        void wait() const {
+            command->waitUntilCompleted();
+            gpu::profile::record("recording/pack depth", command.get());
+        }
         [[nodiscard]] std::span<const std::uint8_t> bytes() const {
             return {static_cast<const std::uint8_t*>(buffer->contents()), static_cast<std::size_t>(width * height * 3)};
         }

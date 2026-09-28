@@ -8,6 +8,7 @@
 #include <Eigen/Eigenvalues>
 
 #include "einstar/core/log.hpp"
+#include "einstar/gpu/profile.hpp"
 #include "einstar/gpu/device_data.hpp"
 
 namespace einstar::track_metal {
@@ -23,7 +24,8 @@ struct IcpState {
     std::uint32_t failed, level_done, stats_written;
     std::int32_t correspondences, candidates, degenerate_dirs;
     float rms, inlier_ratio, coverage, eig_ratio;
-    float marker_rms, pad;
+    float marker_rms;
+    std::uint32_t iterations;
     float basis[36];
     float hessian[36];
 };
@@ -74,7 +76,7 @@ struct MetalIcp::Impl {
     std::shared_ptr<gpu::Context> ctx;
     Ref<MTL::ComputePipelineState> level_begin, accumulate, solve, bal_hist, bal_bins, bal_apply;
     Ref<MTL::Buffer> hist, w_bin;
-    Ref<MTL::Buffer> state, partials, markers;
+    Ref<MTL::Buffer> state, partials, markers, dispatch;  // dispatch: LevelDispatch per level (6 uints)
     Ref<MTL::Buffer> src_pts, src_nrm, src_w, mdl_pts, mdl_nrm;
     std::size_t src_n = 0, mdl_n = 0;
     // Cache of the last uploaded frame (the tracker calls ICP several times per frame).
@@ -165,7 +167,8 @@ track::IcpResult MetalIcp::solve(const track::DepthFrame& frame, const track::Ra
             be->setBytes(&ba, sizeof(ba), 4);
             be->dispatchThreads(MTL::Size(static_cast<NS::UInteger>(W), static_cast<NS::UInteger>(H), 1), MTL::Size(16, 16, 1));
             be->endEncoding();
-            bcmd->commit();  // same queue: ordered before the ICP command buffer
+            if (gpu::profile::enabled()) gpu::profile::commit_and_wait(bcmd, "icp/normal balance");
+            else bcmd->commit();  // same queue: ordered before the ICP command buffer
             bp->release();
         } else {
             frame.ensure_cpu();
@@ -248,6 +251,8 @@ track::IcpResult MetalIcp::solve(const track::DepthFrame& frame, const track::Ra
     // Partials buffer sized for the finest level.
     const std::size_t max_groups = static_cast<std::size_t>((W + 15) / 16) * static_cast<std::size_t>((H + 15) / 16);
     if (!im.partials || im.partials->length() < max_groups * 32 * 4) im.partials = im.ctx->buffer(max_groups * 32 * 4);
+    if (!im.dispatch || im.dispatch->length() < static_cast<std::size_t>(p.levels) * 24)
+        im.dispatch = im.ctx->buffer(static_cast<std::size_t>(p.levels) * 24);
 
     NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
     MTL::CommandBuffer* cmd = im.ctx->queue()->commandBuffer();
@@ -270,8 +275,14 @@ track::IcpResult MetalIcp::solve(const track::DepthFrame& frame, const track::Ra
         aa.c[0] = static_cast<float>(c.x()), aa.c[1] = static_cast<float>(c.y()), aa.c[2] = static_cast<float>(c.z());
         const int iters = p.iterations[static_cast<std::size_t>(std::min(level, 2))];
 
+        // Accumulate grid in whole threadgroups (the kernel bounds-checks its pixels); launched
+        // indirectly so iterations after convergence cost nothing.
+        const std::uint32_t acc_groups[2] = {static_cast<std::uint32_t>((gw + 15) / 16), static_cast<std::uint32_t>((gh + 15) / 16)};
+        const auto disp_offset = static_cast<NS::UInteger>(level) * 24;
         enc->setComputePipelineState(im.level_begin.get());
         enc->setBuffer(im.state.get(), 0, 0);
+        enc->setBuffer(im.dispatch.get(), disp_offset, 1);
+        enc->setBytes(acc_groups, sizeof(acc_groups), 2);
         enc->dispatchThreads(MTL::Size(1, 1, 1), MTL::Size(1, 1, 1));
         enc->memoryBarrier(MTL::BarrierScopeBuffers);
         for (int it = 0; it < iters; ++it) {
@@ -284,7 +295,7 @@ track::IcpResult MetalIcp::solve(const track::DepthFrame& frame, const track::Ra
             enc->setBuffer(im.state.get(), 0, 5);
             enc->setBuffer(im.partials.get(), 0, 6);
             enc->setBytes(&aa, sizeof(aa), 7);
-            enc->dispatchThreads(MTL::Size(static_cast<NS::UInteger>(gw), static_cast<NS::UInteger>(gh), 1), MTL::Size(16, 16, 1));
+            enc->dispatchThreadgroups(im.dispatch.get(), disp_offset, MTL::Size(16, 16, 1));
             enc->memoryBarrier(MTL::BarrierScopeBuffers);
             SolveArgs sa{};
             sa.num_partials = groups;
@@ -301,14 +312,15 @@ track::IcpResult MetalIcp::solve(const track::DepthFrame& frame, const track::Ra
             enc->setBuffer(im.partials.get(), 0, 1);
             enc->setBytes(&sa, sizeof(sa), 2);
             enc->setBuffer(im.markers.get(), 0, 3);
-            enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(256, 1, 1));
+            enc->setBuffer(im.dispatch.get(), disp_offset, 4);
+            enc->dispatchThreadgroups(im.dispatch.get(), disp_offset + 12, MTL::Size(256, 1, 1));
             enc->memoryBarrier(MTL::BarrierScopeBuffers);
         }
     }
     enc->endEncoding();
-    cmd->commit();
-    cmd->waitUntilCompleted();
+    gpu::profile::commit_and_wait(cmd, "icp/iterations (all levels)");
     last_gpu_ms_ = (cmd->GPUEndTime() - cmd->GPUStartTime()) * 1000.0;
+    last_iterations_ = static_cast<const IcpState*>(im.state->contents())->iterations;
     const bool gpu_error = cmd->status() == MTL::CommandBufferStatusError;
     pool->release();
     if (gpu_error) {
