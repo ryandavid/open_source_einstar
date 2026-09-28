@@ -292,9 +292,9 @@ bool Tracker::still_confirming(bool marker_pose, double t, TrackResult& out) {
 }
 
 void Tracker::fuse(const DepthFrame& frame, const FrameMarkers& fm, TrackResult& out) {
-    // Degenerate frames (pose partly held by the motion prior) are fused with reduced weight so
-    // they extend the model without reshaping what is already well observed.
-    if (params_.fuse_surface) {
+    // Degenerate frames (pose partly held by the motion prior) only extend the model when enabled
+    // (see TrackerParams::degenerate_weight).
+    if (params_.fuse_surface && (!out.degenerate || params_.degenerate_weight > 0.0f)) {
         volume_->integrate(frame, out.T_world_camera, out.degenerate ? params_.degenerate_weight : 1.0f, out.degenerate);
         out.integrated = true;
     }

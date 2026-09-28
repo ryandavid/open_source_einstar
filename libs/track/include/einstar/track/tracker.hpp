@@ -42,9 +42,13 @@ struct TrackerParams {
     double max_speed_mm_s = 800.0;      // generous hand-motion limits, scaled by elapsed time
     double max_rot_speed_deg_s = 240.0;
     // Below this the pose is only weakly determined by geometry (e.g. surfaces of revolution): the
-    // frame is tracked but only extends the model into unobserved space.
+    // frame is tracked but does not extend the live model. The pose can slide along the unconstrained
+    // directions unnoticed, and surface fused from a slid pose is a "ghost" that later contradicts real
+    // views and breaks tracking there (mustang replays: fusing degenerate frames, even only runs of 10,
+    // cut accepted frames to 75-94% across start frames versus 89-94% without). The process step still
+    // fuses these frames at its optimised poses.
     double degenerate_eigen_ratio = 5e-3;  // (centred, unit-scaled Hessian; ~7% of frames on real scans)
-    float degenerate_weight = 0.5f;
+    float degenerate_weight = 0.0f;        // > 0: fuse degenerate frames at this weight, into unobserved space only
     int relocalize_attempts_per_frame = 2;
     // A relocalisation is only trusted after this many consecutive frames track consistently from
     // it, under stricter thresholds; nothing is fused into the model until then.

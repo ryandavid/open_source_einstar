@@ -260,6 +260,8 @@ int track_fixture(const char* path, std::span<char*> args) {
     tp.mode = mode == "geometry" ? track::AlignMode::geometry : mode == "markers" ? track::AlignMode::markers : track::AlignMode::hybrid;
     tp.marker_map.min_observations = static_cast<int>(arg_int(args, "--marker-confirm", tp.marker_map.min_observations));
     tp.icp.degenerate_direction_ratio = arg_double(args, "--degen-ratio", tp.icp.degenerate_direction_ratio);
+    tp.degenerate_weight = static_cast<float>(arg_double(args, "--degen-weight", tp.degenerate_weight));
+    tp.degenerate_eigen_ratio = arg_double(args, "--degen-flag", tp.degenerate_eigen_ratio);
     std::println("volume: {}, icp: {}, mode: {}", volume ? "Metal" : "CPU", gpu_icp ? "Metal" : "CPU", mode);
     track::Tracker tracker(tp, std::move(volume));
     if (gpu_icp) tracker.set_icp_solver(gpu_icp->as_function());
@@ -275,6 +277,13 @@ int track_fixture(const char* path, std::span<char*> args) {
     std::ofstream exstar_poses;
     const char* record_path = arg_str(args, "--record");
     std::vector<double> t_err, r_err, ms, rpe_t, rpe_r, eigs;
+    std::vector<int> episodes;  // lengths of runs of frames without an accepted pose
+    // Recovery after the recording's large jumps (EXStar lost the scanner there too): frames until the
+    // next accepted pose, and whether that pose agrees with EXStar's.
+    long kidnap_from = -1;
+    std::vector<double> recover_frames;
+    int recover_wrong = 0;
+    int run_lost = 0;
     std::optional<SE3> prev_ours, prev_theirs;
     int gross = 0;
     int accepted = 0, lost = 0, reloc = 0, degenerate = 0, processed = 0, marker_frames = 0;
@@ -301,6 +310,7 @@ int track_fixture(const char* path, std::span<char*> args) {
         }
         if (first_ref && processed > 0) {
             const SE3 step = prev_ref.inverse() * f->T_world_camera;
+            if (translation_norm(step) > 40.0 || rotation_angle(step) * 180.0 / M_PI > 8.0) kidnap_from = i;  // recording jumps
             if (translation_norm(step) > 20.0)
                 std::println("frame {:5} EXStar pose jump {:.1f} mm / {:.1f} deg (discontinuity in the recording)", i,
                              translation_norm(step), rotation_angle(step) * 180.0 / M_PI);
@@ -370,6 +380,13 @@ int track_fixture(const char* path, std::span<char*> args) {
             }
         }
         ms.push_back(r.ms);
+        if (kidnap_from >= 0 && r.accepted) {
+            recover_frames.push_back(static_cast<double>(i - kidnap_from));
+            if (translation_norm(f->T_world_camera.inverse() * r.T_world_camera) > 20.0) ++recover_wrong;
+            kidnap_from = -1;
+        }
+        if (!r.accepted) ++run_lost;
+        else if (run_lost > 0) episodes.push_back(std::exchange(run_lost, 0));
         if (r.icp.converged) eigs.push_back(r.icp.min_eigenvalue_ratio);
         if (r.marker_pose) ++marker_frames;
         if (r.accepted) {
@@ -453,8 +470,16 @@ int track_fixture(const char* path, std::span<char*> args) {
                      fit_checked, pct(fit_median, 0.5), fit_bad, 100.0 * fit_bad / std::max(1, fit_checked));
     std::println("icp eigen ratio percentiles: p1 {:.1e} p5 {:.1e} p10 {:.1e} p25 {:.1e} p50 {:.1e}", pct(eigs, 0.01), pct(eigs, 0.05),
                  pct(eigs, 0.10), pct(eigs, 0.25), pct(eigs, 0.5));
-    std::println("time per frame: median {:.1f} ms p95 {:.1f} ms; model bricks {}", pct(ms, 0.5), pct(ms, 0.95),
-                 tracker.volume().brick_count());
+    std::println("time per frame: median {:.1f} ms p95 {:.1f} ms max {:.1f} ms; model bricks {}", pct(ms, 0.5), pct(ms, 0.95),
+                 ms.empty() ? 0.0 : std::ranges::max(ms), tracker.volume().brick_count());
+    if (run_lost > 0) episodes.push_back(run_lost);
+    std::ranges::sort(episodes, std::greater{});
+    std::print("lost episodes: {}, longest:", episodes.size());
+    for (std::size_t e = 0; e < std::min<std::size_t>(5, episodes.size()); ++e) std::print(" {}", episodes[e]);
+    std::println(" frames");
+    std::println("after recording jumps: {} recoveries, frames to recover median {:.0f} p90 {:.0f} max {:.0f}, wrong pose {}",
+                 recover_frames.size(), pct(recover_frames, 0.5), pct(recover_frames, 0.9),
+                 recover_frames.empty() ? 0.0 : std::ranges::max(recover_frames), recover_wrong);
     if (recorder) {
         recorder->close();
         std::println("recorded {} frames ({:.1f} MB) to {}", recorder->frames_written(), static_cast<double>(recorder->bytes_written()) / 1e6,
