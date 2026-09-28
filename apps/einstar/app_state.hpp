@@ -5,11 +5,13 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <Eigen/Core>
 
 #include "einstar/core/image.hpp"
+#include "einstar/recon/process.hpp"
 #include "einstar/core/timing.hpp"
 #include "einstar/render/overlays.hpp"
 #include "einstar/render/types.hpp"
@@ -33,6 +35,8 @@ struct RenderUpdate {
     ImageU8 ir_left, ir_right;
     std::vector<pipeline::LiveUpdate::PreviewMarker> preview_markers;  // on the left preview (half-res px)
     std::optional<Eigen::Matrix4f> scanner_pose;
+    // Processed mesh (full replacement when present; an empty mesh clears it).
+    std::optional<std::pair<std::vector<render::MeshVertex>, std::vector<std::uint32_t>>> mesh;
 };
 
 struct Hud {
@@ -56,6 +60,15 @@ struct Hud {
     float distance_mm = 0;
     int distance_step = -1;  // 0..9, -1 = out of range
     std::size_t model_points = 0;
+    std::uint64_t recorded_frames = 0;
+};
+
+struct ProcessStatus {
+    bool running = false;
+    bool done = false;         // a mesh is available
+    std::string stage;
+    double fraction = 0;
+    std::string summary;       // report of the last run (or its error)
 };
 
 class AppState {
@@ -87,6 +100,12 @@ public:
     bool load_global_markers(const std::string& path);
     [[nodiscard]] std::string global_marker_status() const;
 
+    // Process step on the recorded scan (background thread).
+    void process_scan(const recon::ProcessParams& params);
+    void cancel_processing();
+    [[nodiscard]] ProcessStatus process_status() const;
+    bool export_mesh(const std::string& path);
+
     ScanSettings settings;
     bool follow_scanner = false;
 
@@ -103,6 +122,10 @@ private:
     Stopwatch housekeeping_;
     float last_depth_ = 0;
     std::string global_status_;
+    ProcessStatus process_;
+    std::shared_ptr<recon::TriangleMesh> mesh_;
+    std::atomic<bool> cancel_{false};
+    std::jthread process_thread_;
 };
 
 }  // namespace einstar::app

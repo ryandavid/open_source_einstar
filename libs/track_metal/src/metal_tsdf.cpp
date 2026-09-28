@@ -1,5 +1,7 @@
 #include "einstar/track_metal/metal_tsdf.hpp"
 
+#include <array>
+
 #include <algorithm>
 #include <cstring>
 #include <functional>
@@ -179,6 +181,23 @@ void MetalTsdfVolume::clear() {
 }
 
 std::size_t MetalTsdfVolume::brick_count() const { return impl_->count(); }
+
+void MetalTsdfVolume::for_each_brick(const BrickVisitor& fn) const {
+    // Shared storage: read the pool in place (half sdf, half weight per voxel).
+    const auto& im = *impl_;
+    const auto* coords = static_cast<const std::int32_t*>(im.coords->contents());
+    const auto* vox = static_cast<const _Float16*>(im.voxels->contents());
+    std::array<float, track::kBrickVoxels> sdf{}, weight{};
+    for (std::uint32_t b = 0; b < im.count(); ++b) {
+        const track::BrickCoord c{coords[4 * b], coords[4 * b + 1], coords[4 * b + 2]};
+        const _Float16* v = vox + static_cast<std::size_t>(b) * track::kBrickVoxels * 2;
+        for (int i = 0; i < track::kBrickVoxels; ++i) {
+            sdf[static_cast<std::size_t>(i)] = static_cast<float>(v[2 * i]);
+            weight[static_cast<std::size_t>(i)] = static_cast<float>(v[2 * i + 1]);
+        }
+        fn(c, sdf, weight);
+    }
+}
 
 bool MetalTsdfVolume::pool_exhausted() const {
     return *static_cast<std::uint32_t*>(impl_->brick_count->contents()) >= impl_->opt.brick_capacity;

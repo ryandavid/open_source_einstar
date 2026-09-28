@@ -15,6 +15,8 @@
 | ICP | done (CPU reference + Metal) | Metal runs all Gauss-Newton iterations in one command buffer (1.6 ms vs 3.7 ms); identical poses and Hessians to the CPU solver |
 | Live view | done | Metal splats, frustum/trail, ghost frustum when lost, HUD, IR previews (`--snapshot` for headless capture), marker discs (map / global / current frame) and preview detections |
 | Markers | done | detection on raw IR (blob + half-level contour + ellipse fit + dark-ring test), rectified stereo matching gated by a dense-depth disparity prior, marker map with candidate confirmation, RANSAC association, triangle-signature relocalisation, joint marker + surface ICP (CPU and Metal) |
+| Session recording | done | every processed frame (depth, confidence, pose, flags, markers) to `.estr`, zstd, crash-tolerant; see docs/process.md |
+| Process step | done | frame-level pose graph (chain + fragment registrations + loop closures + marker landmarks), island check, re-fusion, surface-nets mesh, cleanup, STL/PLY/OBJ export; CLI `process`, app Process panel |
 | Global markers | done | markers-only constellation capture -> keyframes -> Ceres stereo-reprojection bundle adjustment -> fixed map that later scans start on; save/load as text |
 
 ### Tracking on EXStar's own recordings (`einstar-cli track-fixture`)
@@ -41,8 +43,9 @@ scan started; the degeneracy/relocalisation thresholds were recalibrated for it.
 2. **Open-loop drift** on young models (synthetic sweep: ~0.03 deg/frame). Fix in the process step: keyframe pose graph + loop closure + re-fusion.
 3. **Surfaces of revolution** are geometrically ambiguous; depth-only tracking holds but may slide. Use markers (hybrid / global markers) or, later, texture.
 4. **Markers on real IR**: tuned on EXStar's calibration captures and synthetic stickers only. Real scans may need the detection threshold / ring test adjusted (live speckle brightness vs. retro-reflective return under the strobe is unknown until hardware). 3 mm markers are disabled by default (too close to speckle size).
-5. **Process step**: global optimisation, Poisson meshing, export (STL/PLY/OBJ) — not started.
-6. **Session recording** of raw frames — not started.
+5. **Process step**: done (docs/process.md). Open: recovering frames live tracking lost, marker-hole filling, watertight (Poisson) meshing, mesh decimation.
+6. **Session recording**: done (depth, not raw IR; raw IR would be ~60 MB/s).
+9. **Live tracking is not bit-reproducible**: GPU atomics and parallel reductions make repeated replays differ (±3% accepted frames on mustang); on the symmetric mustang part some runs relocalise onto the wrong side (p95 pose error vs EXStar of 60–155 mm in those runs) while the fused surface stays consistent.
 7. Stereo outlier blobs at silhouettes need an extra consistency filter.
 8. Hardware-only unknowns: exact LED distance-zone semantics, button codes 2/3, exposure units.
 

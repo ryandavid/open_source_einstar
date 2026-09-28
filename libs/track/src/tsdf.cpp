@@ -93,6 +93,11 @@ const Brick* TsdfVolume::find(const BrickCoord& c) const {
     return it == bricks_.end() ? nullptr : it->second.get();
 }
 
+void TsdfVolume::for_each_brick(const BrickVisitor& fn) const {
+    std::shared_lock lock(mutex_);
+    for (const auto& [c, b] : bricks_) fn(c, b->sdf, b->weight);
+}
+
 std::size_t TsdfVolume::brick_count() const {
     std::shared_lock lock(mutex_);
     return bricks_.size();

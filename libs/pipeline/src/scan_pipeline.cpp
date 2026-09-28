@@ -6,7 +6,11 @@
 #include "gpu_overlay.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <filesystem>
+#include <format>
 #include <map>
+#include <future>
 #include <set>
 
 namespace einstar::pipeline {
@@ -157,6 +161,7 @@ void ScanPipeline::set_phase(ScanPhase phase) {
         // (running-mean) marker map; a surface scan starts on the fixed global map if there is one.
         if (phase == ScanPhase::global_markers) {
             tracker_.reset(true);
+            if (tracker_.marker_map().empty() && bundle_.observations.empty()) restart_recording(false);  // new world frame
             if (!bundle_.observations.empty()) {
                 // Resume a capture: the map the keyframes refer to must be kept.
                 std::vector<markers::MapMarker> m;
@@ -239,6 +244,10 @@ GlobalMarkerReport ScanPipeline::run_bundle_adjustment() {
         std::lock_guard lock(global_mutex_);
         global_map_ = map;
     }
+    {
+        std::lock_guard rlock(recorder_mutex_);
+        if (recorder_) recorder_->write_global_markers(map);
+    }
     tracker_.set_marker_map(std::move(map));
     log::info("global markers: {} keyframes, {} markers, reprojection rms {:.3f} -> {:.3f} px, {} outliers, max shift {:.3f} mm",
               rep.keyframes, rep.markers, rep.bundle.rms_before_px, rep.bundle.rms_after_px, rep.bundle.outliers_removed, rep.max_shift_mm);
@@ -270,6 +279,7 @@ void ScanPipeline::clear_global_markers() {
             global_map_.clear();
         }
         tracker_.reset(false);
+        restart_recording(false);
         apply_phase();
     });
 }
@@ -283,8 +293,92 @@ void ScanPipeline::set_global_markers(std::vector<markers::MapMarker> map) {
         }
         tracker_.reset(false);
         tracker_.set_marker_map(std::move(map));
+        restart_recording(false);  // the loaded map defines a new world frame
         apply_phase();
     });
+}
+
+void ScanPipeline::set_recording_directory(std::string directory) {
+    post([this, directory = std::move(directory)] {
+        if (directory == record_dir_) return;
+        restart_recording(false);
+        record_dir_ = directory;
+    });
+}
+
+std::string ScanPipeline::flush_recording() {
+    // Ordered with frames (everything pushed before this call is recorded), then drained to disk.
+    std::promise<std::string> done;
+    auto fut = done.get_future();
+    post([this, &done] {
+        std::lock_guard lock(recorder_mutex_);
+        if (recorder_) recorder_->flush();
+        done.set_value(recorder_ ? recorder_->path() : std::string{});
+    });
+    return fut.get();
+}
+
+void ScanPipeline::restart_recording(bool delete_current) {
+    std::lock_guard lock(recorder_mutex_);
+    if (!recorder_) return;
+    const auto path = recorder_->path();
+    const auto frames = recorder_->frames_written();
+    recorder_->close();
+    recorder_.reset();
+    std::error_code ec;
+    if (delete_current || frames == 0) {
+        std::filesystem::remove(path, ec);
+        log::info("recording: discarded {}", path);
+    } else {
+        log::info("recording: closed {} ({} frames)", path, frames);
+    }
+    stats_.recorded_frames = 0;
+}
+
+void ScanPipeline::record(const track::TrackResult& r, const DepthOutput& depth) {
+    if (record_dir_.empty()) return;
+    std::lock_guard lock(recorder_mutex_);
+    if (!recorder_) {
+        const auto now = std::chrono::system_clock::now();
+        const auto path = (std::filesystem::path(record_dir_) /
+                           std::format("scan-{:%Y%m%d-%H%M%S}.estr", std::chrono::floor<std::chrono::seconds>(now)))
+                              .string();
+        session::SessionHeader h;
+        h.depth_intrinsics = frontend_->depth_intrinsics();
+        const auto& g = frontend_->rectification().geometry;
+        h.rect_f = g.f;
+        h.rect_cx = g.cx;
+        h.rect_cy = g.cy;
+        h.baseline_mm = g.baseline;
+        h.description = "live scan";
+        auto w = session::SessionWriter::create(path, h);
+        if (!w) {
+            log::error("recording disabled: {}", w.error().message);
+            record_dir_.clear();
+            return;
+        }
+        recorder_ = std::move(*w);
+        std::lock_guard glock(global_mutex_);
+        if (!global_map_.empty()) recorder_->write_global_markers(global_map_);
+        log::info("recording: {}", path);
+    }
+    session::FrameRecord rec;
+    rec.index = depth.frame.index;
+    rec.timestamp_s = depth.frame.timestamp_s;
+    rec.flags = (r.accepted ? session::frame_accepted : 0u) | (r.degenerate ? session::frame_degenerate : 0u) |
+                (r.relocalized ? session::frame_relocalized : 0u) | (r.marker_pose ? session::frame_marker_pose : 0u) |
+                (r.integrated ? session::frame_integrated : 0u) |
+                (phase_ == ScanPhase::global_markers ? session::frame_global_marker_capture : 0u);
+    rec.T_world_camera = r.T_world_camera;
+    std::map<int, int> ids(r.marker_ids.begin(), r.marker_ids.end());
+    for (std::size_t m = 0; m < depth.frame.markers.size(); ++m) {
+        const auto& mk = depth.frame.markers[m];
+        const auto it = ids.find(static_cast<int>(m));
+        rec.markers.push_back({mk.position, mk.normal, mk.diameter, it == ids.end() ? -1 : it->second, mk.left_rect, mk.right_rect});
+    }
+    session::capture_depth(depth.frame, rec.depth, rec.confidence);
+    recorder_->write(std::move(rec));
+    stats_.recorded_frames = recorder_->frames_written() + recorder_->backlog();
 }
 
 void ScanPipeline::set_surface_mode(track::AlignMode mode) {
@@ -381,6 +475,7 @@ void ScanPipeline::process(usb::FrameGroup&& group) {
     if (reset_requested_.exchange(false)) {
         // Clearing the model keeps an optimised global-marker map (it describes the scene, not the scan).
         tracker_.reset(true);
+        restart_recording(true);
         if (phase_ == ScanPhase::global_markers) {
             bundle_ = {};
             bundle_.geometry = frontend_->rectification().geometry;
@@ -401,6 +496,7 @@ void ScanPipeline::process(usb::FrameGroup&& group) {
 
     const auto r = tracker_.process(depth->frame);
     if (phase_ == ScanPhase::global_markers) collect_keyframe(r, depth->frame);
+    record(r, *depth);
     track_times_.add(r.ms);
     ++stats_.frames_processed;
     if (r.accepted) {

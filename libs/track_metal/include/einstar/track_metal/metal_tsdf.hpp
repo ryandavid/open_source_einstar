@@ -30,6 +30,7 @@ public:
                                                                   float min_weight = 0.5f) const override;
     [[nodiscard]] bool fast_full_extraction() const override { return true; }
 
+    void for_each_brick(const BrickVisitor& fn) const override;
     [[nodiscard]] std::size_t brick_count() const override;
     [[nodiscard]] std::uint32_t frame_counter() const override { return frame_; }
     [[nodiscard]] const track::TsdfParams& params() const override { return params_; }

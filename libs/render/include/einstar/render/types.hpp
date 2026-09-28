@@ -28,6 +28,12 @@ struct MarkerInstance {
 };
 static_assert(sizeof(MarkerInstance) == 32);
 
+struct MeshVertex {
+    float px, py, pz;
+    float nx, ny, nz;
+};
+static_assert(sizeof(MeshVertex) == 24);
+
 struct LineVertex {
     float px, py, pz;
     Rgba8 color;

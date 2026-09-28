@@ -17,6 +17,7 @@
 #include <cstring>
 #include <string_view>
 #include <vector>
+#include <filesystem>
 #include <format>
 #include <memory>
 #include <print>
@@ -104,14 +105,19 @@ static bool write_png(id<MTLTexture> tex, const char* path) {
 }
 
 int main(int argc, char** argv) {
-    // --snapshot <out.png> [seconds]: run the emulator scan headless and save one frame of the UI.
+    // --snapshot <out.png> [seconds] [--process]: run the emulator scan headless and save one frame of
+    // the UI; with --process the scan is stopped after `seconds`, processed, and the snapshot shows the mesh.
     const char* snapshot_path = nullptr;
     double snapshot_seconds = 8.0;
-    for (int i = 1; i < argc; ++i)
+    bool snapshot_process = false;
+    for (int i = 1; i < argc; ++i) {
         if (std::string_view(argv[i]) == "--snapshot" && i + 1 < argc) {
             snapshot_path = argv[i + 1];
-            if (i + 2 < argc) snapshot_seconds = std::atof(argv[i + 2]);
+            if (i + 2 < argc && argv[i + 2][0] != '-') snapshot_seconds = std::atof(argv[i + 2]);
         }
+        if (std::string_view(argv[i]) == "--process") snapshot_process = true;
+    }
+    bool snapshot_processing = false;
     if (!glfwInit()) {
         std::println(stderr, "glfwInit failed");
         return 1;
@@ -155,6 +161,11 @@ int main(int argc, char** argv) {
     PreviewTexture preview_left, preview_right;
     std::vector<pipeline::LiveUpdate::PreviewMarker> preview_markers;
     int align_mode = 1;  // hybrid
+    int voxel_choice = 1;  // 0.3 / 0.5 / 1.0 mm
+    bool optimise_poses = true;
+    int smooth_iterations = 0;
+    char export_path[512] = {};
+    if (const char* home = std::getenv("HOME")) std::snprintf(export_path, sizeof export_path, "%s/Documents/Einstar/scan.stl", home);
     char marker_path[512] = {};
     if (const char* home = std::getenv("HOME")) std::snprintf(marker_path, sizeof marker_path, "%s/Documents/einstar_global_markers.txt", home);
     id<MTLTexture> depth_tex = nil;
@@ -169,6 +180,9 @@ int main(int argc, char** argv) {
     id<MTLTexture> offscreen = nil;
     Stopwatch snapshot_clock;
     if (snapshot_path) {
+        // Headless runs record into a temporary directory, never the user's scans.
+        const auto tmp = std::filesystem::temp_directory_path() / "einstar_snapshot_scans";
+        setenv("EINSTAR_SCAN_DIR", tmp.c_str(), 1);
         state.connect(true);
         state.follow_scanner = true;
         state.start_scan();
@@ -201,6 +215,12 @@ int main(int argc, char** argv) {
                 (*renderer)->set_lines(upd->lines);
                 preview_left.upload(device, upd->ir_left);
                 preview_markers = std::move(upd->preview_markers);
+                if (upd->mesh) {
+                    (*renderer)->set_mesh(upd->mesh->first, upd->mesh->second);
+                    // A fresh result is shown as a mesh; the live points stay available.
+                    settings.show_mesh = true;
+                    settings.show_points = upd->mesh->second.empty();
+                }
                 preview_right.upload(device, upd->ir_right);
                 if (state.follow_scanner && upd->scanner_pose) {
                     camera.target = (*upd->scanner_pose * Eigen::Vector4f(0, 0, 300, 1)).head<3>();
@@ -255,7 +275,7 @@ int main(int argc, char** argv) {
 
             // ---- Control panel ----
             ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
-            ImGui::SetNextWindowSize(ImVec2(340, 470), ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowSize(ImVec2(340, 620), ImGuiCond_FirstUseEver);
             ImGui::Begin("Scan");
             ImGui::TextWrapped("%s", state.status().c_str());
             if (!state.scanning()) {
@@ -306,6 +326,37 @@ int main(int argc, char** argv) {
                 }
                 ImGui::EndDisabled();
             }
+            // ---- Process: optimise poses, re-fuse, mesh, export ----
+            {
+                const auto ps = state.process_status();
+                if (ImGui::CollapsingHeader("Process", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    ImGui::BeginDisabled(ps.running || state.scanning() || !state.connected());
+                    ImGui::Combo("Resolution", &voxel_choice, "0.3 mm (fine)\0" "0.5 mm\0" "1.0 mm (fast)\0");
+                    ImGui::Checkbox("Optimise poses (loop closure)", &optimise_poses);
+                    ImGui::SliderInt("Smoothing", &smooth_iterations, 0, 10);
+                    if (ImGui::Button("Process scan", ImVec2(-1, 0))) {
+                        recon::ProcessParams pp;
+                        pp.tsdf.voxel_mm = voxel_choice == 0 ? 0.3f : voxel_choice == 2 ? 1.0f : 0.5f;
+                        pp.tsdf.truncation_mm = 5.0f * pp.tsdf.voxel_mm;
+                        pp.optimize_poses = optimise_poses;
+                        pp.smooth_iterations = smooth_iterations;
+                        state.process_scan(pp);
+                    }
+                    ImGui::EndDisabled();
+                    if (ps.running) {
+                        ImGui::ProgressBar(static_cast<float>(ps.fraction), ImVec2(-1, 0), ps.stage.c_str());
+                        if (ImGui::Button("Cancel")) state.cancel_processing();
+                    }
+                    if (!ps.summary.empty()) ImGui::TextWrapped("%s", ps.summary.c_str());
+                    if (ps.done) {
+                        ImGui::Checkbox("Show mesh", &settings.show_mesh);
+                        ImGui::SameLine();
+                        ImGui::Checkbox("Show points", &settings.show_points);
+                        ImGui::InputText("##export", export_path, sizeof export_path);
+                        if (ImGui::Button("Export (.stl / .ply / .obj)", ImVec2(-1, 0))) (void)state.export_mesh(export_path);
+                    }
+                }
+            }
             ImGui::Separator();
             ImGui::TextUnformatted("Scanner settings");
             bool changed = false;
@@ -346,6 +397,7 @@ int main(int argc, char** argv) {
             ImGui::Text("Point distance %4.2f mm", hud.point_distance_mm);
             ImGui::Text("Depth / track  %5.1f / %5.1f ms", hud.depth_ms, hud.track_ms);
             ImGui::Text("Queue / drops  %d / %d", hud.queue_depth, hud.dropped);
+            if (hud.recorded_frames > 0) ImGui::Text("Recorded       %llu frames", static_cast<unsigned long long>(hud.recorded_frames));
             if (hud.temperature_c > -100) ImGui::Text("Temperature    %4.1f C", hud.temperature_c);
             ImGui::Separator();
             ImGui::Text("Distance %s", hud.distance_mm > 0 ? std::format("{:.0f} mm", hud.distance_mm).c_str() : "--");
@@ -377,7 +429,28 @@ int main(int argc, char** argv) {
             [enc endEncoding];
             if (drawable) [cmd presentDrawable:drawable];
             [cmd commit];
-            if (snapshot_path && snapshot_clock.elapsed_ms() > snapshot_seconds * 1000.0) {
+            if (snapshot_path && snapshot_process && snapshot_clock.elapsed_ms() > snapshot_seconds * 1000.0) {
+                if (!snapshot_processing) {
+                    state.stop_scan();
+                    state.follow_scanner = false;
+                    recon::ProcessParams pp;
+                    state.process_scan(pp);
+                    snapshot_processing = true;
+                }
+                const auto ps = state.process_status();
+                if (ps.running || !ps.done) {
+                    if (!ps.running && !ps.done) {
+                        std::println("process failed: {}", ps.summary);
+                        break;
+                    }
+                    continue;
+                }
+                snapshot_process = false;  // done: take the snapshot on the next frame
+                snapshot_seconds = 0;
+                std::println("process: {}", ps.summary);
+                continue;
+            }
+            if (snapshot_path && !snapshot_process && snapshot_clock.elapsed_ms() > snapshot_seconds * 1000.0) {
                 [cmd waitUntilCompleted];
                 std::println("snapshot: {}", write_png(offscreen, snapshot_path) ? snapshot_path : "FAILED");
                 break;

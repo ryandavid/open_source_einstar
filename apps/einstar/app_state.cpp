@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <format>
 
+#include "einstar/session/session.hpp"
+
 #include "einstar/core/log.hpp"
 
 namespace einstar::app {
@@ -17,7 +19,90 @@ constexpr render::Rgba8 kTrailColor{255, 200, 60, 255};
 
 AppState::AppState() { connect(false); }
 
-AppState::~AppState() { session_.reset(); }
+AppState::~AppState() {
+    cancel_processing();
+    if (process_thread_.joinable()) process_thread_.join();
+    session_.reset();
+}
+
+void AppState::process_scan(const recon::ProcessParams& params) {
+    if (!session_ || scanning()) return;
+    {
+        std::lock_guard lock(mutex_);
+        if (process_.running) return;
+        process_ = {};
+        process_.running = true;
+        process_.stage = "Saving the recording";
+    }
+    if (process_thread_.joinable()) process_thread_.join();
+    cancel_ = false;
+    process_thread_ = std::jthread([this, params = recon::ProcessParams(params)]() mutable {
+        const auto path = session_->pipeline().flush_recording();
+        auto fail = [&](const std::string& msg) {
+            std::lock_guard lock(mutex_);
+            process_.running = false;
+            process_.summary = msg;
+            log::error("process: {}", msg);
+        };
+        if (path.empty()) return fail("nothing has been recorded yet");
+        auto reader = session::SessionReader::open(path);
+        if (!reader) return fail(reader.error().message);
+        params.cancel = &cancel_;
+        params.progress = [this](const std::string& stage, double f) {
+            std::lock_guard lock(mutex_);
+            process_.stage = stage;
+            process_.fraction = f;
+        };
+        auto r = recon::process_session(**reader, params);
+        if (!r) return fail(r.error().message);
+        const auto& rep = r->report;
+        std::string times;
+        const double total_s = rep.stage_ms.contains("total") ? rep.stage_ms.at("total") / 1000.0 : 0.0;
+        auto summary = std::format("{} frames, {} loop closures, {} marker landmarks; poses moved {:.2f} mm (median), {:.1f} mm max; "
+                                   "{} triangles; {:.1f} s",
+                                   rep.frames_used, rep.loop_edges, rep.marker_landmarks, rep.median_correction_mm, rep.max_correction_mm,
+                                   rep.triangles, total_s);
+        if (rep.frames_excluded > 0) summary += std::format("; {} frames left out (inconsistent segment)", rep.frames_excluded);
+        auto mesh = std::make_shared<recon::TriangleMesh>(std::move(r->mesh));
+        std::vector<render::MeshVertex> verts(mesh->vertices.size());
+        for (std::size_t i = 0; i < verts.size(); ++i) {
+            const auto& p = mesh->vertices[i];
+            const Vec3f n = mesh->normals.size() == verts.size() ? mesh->normals[i] : Vec3f::Zero();
+            verts[i] = {p.x(), p.y(), p.z(), n.x(), n.y(), n.z()};
+        }
+        std::vector<std::uint32_t> idx;
+        idx.reserve(mesh->triangles.size() * 3);
+        for (const auto& t : mesh->triangles) idx.insert(idx.end(), t.begin(), t.end());
+        std::lock_guard lock(mutex_);
+        mesh_ = std::move(mesh);
+        process_.running = false;
+        process_.done = true;
+        process_.summary = std::move(summary);
+        if (!pending_) pending_.emplace();
+        pending_->mesh = std::pair{std::move(verts), std::move(idx)};
+        log::info("process: {}", process_.summary);
+    });
+}
+
+void AppState::cancel_processing() { cancel_ = true; }
+
+ProcessStatus AppState::process_status() const {
+    std::lock_guard lock(mutex_);
+    return process_;
+}
+
+bool AppState::export_mesh(const std::string& path) {
+    std::shared_ptr<recon::TriangleMesh> mesh;
+    {
+        std::lock_guard lock(mutex_);
+        mesh = mesh_;
+    }
+    if (!mesh) return false;
+    auto r = recon::save_mesh(*mesh, path);
+    std::lock_guard lock(mutex_);
+    process_.summary = r ? std::format("Exported {} triangles to {}", mesh->triangles.size(), path) : r.error().message;
+    return r.has_value();
+}
 
 void AppState::connect(bool emulator) {
     session_.reset();
@@ -66,6 +151,9 @@ void AppState::clear_model() {
     trail_.clear();
     if (!pending_) pending_.emplace();
     pending_->model = std::vector<render::PointVertex>{};
+    pending_->mesh = std::pair<std::vector<render::MeshVertex>, std::vector<std::uint32_t>>{};
+    mesh_.reset();
+    process_ = {};
 }
 
 void AppState::apply_settings() {
@@ -197,6 +285,7 @@ void AppState::on_live_update(pipeline::LiveUpdate&& u) {
     hud_.dropped = static_cast<int>(st.dropped);
     hud_.distance_mm = st.mean_depth_mm;
     hud_.model_points = st.model_points;
+    hud_.recorded_frames = st.recorded_frames;
     hud_.markers = st.markers_in_frame;
     hud_.markers_matched = st.markers_matched;
     hud_.map_markers = st.map_markers;
@@ -228,6 +317,7 @@ void AppState::on_live_update(pipeline::LiveUpdate&& u) {
     pending_->ir_right = std::move(up.ir_right);
     pending_->markers = std::move(up.markers);
     pending_->preview_markers = std::move(up.preview_markers);
+    if (up.mesh) pending_->mesh = std::move(up.mesh);
     pending_->scanner_pose = up.scanner_pose;
 }
 

@@ -5,6 +5,8 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <functional>
+#include <span>
 #include <memory>
 #include <optional>
 #include <mutex>
@@ -87,6 +89,12 @@ public:
     // True when extracting the whole surface is cheap enough to do for every display refresh.
     [[nodiscard]] virtual bool fast_full_extraction() const { return false; }
 
+    // Visits every allocated brick (offline meshing). `sdf` is normalised to [-1, 1] of the
+    // truncation distance, voxel (x, y, z) at index (z * 8 + y) * 8 + x, centre at
+    // ((coord * 8 + xyz) + 0.5) * voxel_mm.
+    using BrickVisitor = std::function<void(const BrickCoord&, std::span<const float> sdf, std::span<const float> weight)>;
+    virtual void for_each_brick(const BrickVisitor& fn) const = 0;
+
     [[nodiscard]] virtual std::size_t brick_count() const = 0;
     [[nodiscard]] virtual std::uint32_t frame_counter() const = 0;
     [[nodiscard]] virtual const TsdfParams& params() const = 0;
@@ -103,6 +111,7 @@ public:
     [[nodiscard]] std::vector<BrickCoord> bricks_updated_since(std::uint32_t frame) const override;
     [[nodiscard]] std::vector<SurfacePoint> extract_points(const std::vector<BrickCoord>& bricks, float min_weight = 0.5f) const override;
 
+    void for_each_brick(const BrickVisitor& fn) const override;
     [[nodiscard]] std::size_t brick_count() const override;
     [[nodiscard]] std::uint32_t frame_counter() const override { return frame_counter_; }
     [[nodiscard]] const TsdfParams& params() const override { return params_; }

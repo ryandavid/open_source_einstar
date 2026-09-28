@@ -4,6 +4,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <filesystem>
 #include <future>
 #include <map>
 #include <mutex>
@@ -12,6 +13,8 @@
 #include <thread>
 
 #include "einstar/pipeline/scan_pipeline.hpp"
+#include "einstar/recon/process.hpp"
+#include "einstar/session/session.hpp"
 #include "synthetic_setup.hpp"
 
 using namespace einstar;
@@ -73,6 +76,9 @@ TEST_CASE("global markers: capture, bundle adjustment and a surface scan locked 
         std::lock_guard lock(m);
         results[u.frame_id] = {u.accepted, *u.pose, u.stats, u.markers.size()};
     });
+    const auto rec_dir = std::filesystem::temp_directory_path() / "einstar_e2e_recording";
+    std::filesystem::remove_all(rec_dir);
+    pipe.set_recording_directory(rec_dir.string());
     pipe.start();
 
     // 1. Constellation capture: a markers-only pass over the scene (nothing is fused).
@@ -135,7 +141,58 @@ TEST_CASE("global markers: capture, bundle adjustment and a surface scan locked 
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
+    const auto session_path = pipe.flush_recording();
     pipe.stop();
+
+    // 3. The recorded session through the process step: one world frame (the global map's), the fixed
+    //    markers anchor the pose graph, and the mesh lies on the scene.
+    {
+        REQUIRE(!session_path.empty());
+        auto ses = session::SessionReader::open(session_path);
+        REQUIRE(ses.has_value());
+        CHECK((*ses)->frame_count() == 21 + 30);
+        CHECK((*ses)->global_markers().size() == map.size());
+        // Mesh error against the analytic scene: mean distance and fraction of samples off it.
+        auto mesh_error = [&](const recon::TriangleMesh& mesh) {
+            double sum = 0;
+            int cnt = 0, off = 0;
+            for (std::size_t v = 0; v < mesh.vertices.size(); v += 11) {
+                const Vec3 p = T_truth_map * mesh.vertices[v].cast<double>();
+                const Vec3 nrm = T_truth_map.linear() * mesh.normals[v].cast<double>();
+                double best = 1e9;
+                for (const double sg : {1.0, -1.0})
+                    if (const auto hit = setup.scene.intersect(p - sg * 2.0 * nrm, sg * nrm)) best = std::min(best, std::abs(hit->t - 2.0));
+                if (best > 1.0) {
+                    ++off;
+                    continue;
+                }
+                sum += best;
+                ++cnt;
+            }
+            return std::pair{cnt ? sum / cnt : 1e9, static_cast<double>(off) / std::max(1, cnt + off)};
+        };
+        recon::ProcessParams live_only;
+        live_only.optimize_poses = false;
+        auto base = recon::process_session(**ses, live_only);
+        recon::ProcessParams full;
+        full.fragment_frames = 10;
+        auto res = recon::process_session(**ses, full);
+        REQUIRE(base.has_value());
+        REQUIRE(res.has_value());
+        const auto [base_mean, base_off] = mesh_error(base->mesh);
+        const auto [mean, off] = mesh_error(res->mesh);
+        const auto& pr = res->report;
+        std::println("process on the recording: {} frames, {} loop edges, {} landmarks ({} fixed), mesh {} triangles; error vs scene: "
+                     "live poses {:.3f} mm ({:.1f}% off) -> processed {:.3f} mm ({:.1f}% off)",
+                     pr.frames_used, pr.loop_edges, pr.marker_landmarks, (*ses)->global_markers().size(), pr.triangles, base_mean,
+                     100 * base_off, mean, 100 * off);
+        CHECK(pr.marker_landmarks > 0);
+        CHECK(pr.triangles > 10000);
+        CHECK(mean < 0.2);               // real (synthetic-speckle) stereo depth, not exact depth
+        CHECK(mean < base_mean + 0.02);  // processing must not make an already-anchored scan worse
+        CHECK(off < 0.05);
+    }
+    std::filesystem::remove_all(rec_dir);
 
     // Every marker the tracker knows (fixed + any added while scanning) must be a real sticker.
     int phantoms = 0;

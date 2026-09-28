@@ -32,7 +32,7 @@ einstar_add_test(test_track track/test_tsdf.cpp track/test_metal_tsdf.cpp)
 target_link_libraries(test_track PRIVATE einstar::track einstar::track_metal)
 
 einstar_add_test(test_pipeline pipeline/test_end_to_end.cpp pipeline/test_global_markers.cpp)
-target_link_libraries(test_pipeline PRIVATE einstar::pipeline einstar::device einstar::sim einstar::synth)
+target_link_libraries(test_pipeline PRIVATE einstar::pipeline einstar::device einstar::sim einstar::synth einstar::recon)
 add_executable(debug_dump pipeline/debug_dump.cpp)
 target_link_libraries(debug_dump PRIVATE einstar::pipeline einstar::synth)
 add_executable(debug_track pipeline/debug_track.cpp)
@@ -45,3 +45,9 @@ einstar_add_test(test_optim optim/test_marker_bundle.cpp)
 target_link_libraries(test_optim PRIVATE einstar::optim)
 add_executable(debug_markers pipeline/debug_markers.cpp)
 target_link_libraries(debug_markers PRIVATE einstar::pipeline einstar::synth)
+
+einstar_add_test(test_session session/test_session.cpp)
+target_link_libraries(test_session PRIVATE einstar::session)
+
+einstar_add_test(test_recon recon/test_mesh.cpp recon/test_process.cpp)
+target_link_libraries(test_recon PRIVATE einstar::recon einstar::fixtures einstar::synth)

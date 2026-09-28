@@ -61,6 +61,9 @@ Result<std::unique_ptr<SceneRenderer>> SceneRenderer::create(std::shared_ptr<gpu
     auto splat = make_pipeline(*r->ctx_, *lib, "splat_vs", "splat_fs", color, depth, false);
     auto marker = make_pipeline(*r->ctx_, *lib, "marker_vs", "marker_fs", color, depth, false);
     auto line = make_pipeline(*r->ctx_, *lib, "line_vs", "line_fs", color, depth, true);
+    auto mesh = make_pipeline(*r->ctx_, *lib, "mesh_vs", "mesh_fs", color, depth, false);
+    if (!mesh) return std::unexpected(mesh.error());
+    r->mesh_pso_ = std::move(*mesh);
     if (!splat) return std::unexpected(splat.error());
     if (!marker) return std::unexpected(marker.error());
     if (!line) return std::unexpected(line.error());
@@ -107,6 +110,19 @@ void SceneRenderer::set_frame_buffer(gpu::Ref<MTL::Buffer> buffer, std::size_t c
     frame_.capacity = 0;
 }
 
+void SceneRenderer::set_mesh(std::span<const MeshVertex> vertices, std::span<const std::uint32_t> indices) {
+    mesh_index_count_ = 0;
+    mesh_vertices_ = {};
+    mesh_indices_ = {};
+    if (vertices.empty() || indices.empty()) return;
+    mesh_vertices_ = ctx_->buffer(vertices.size_bytes());
+    mesh_indices_ = ctx_->buffer(indices.size_bytes());
+    if (!mesh_vertices_ || !mesh_indices_) return;
+    std::memcpy(mesh_vertices_->contents(), vertices.data(), vertices.size_bytes());
+    std::memcpy(mesh_indices_->contents(), indices.data(), indices.size_bytes());
+    mesh_index_count_ = indices.size();
+}
+
 void SceneRenderer::set_lines(std::span<const LineVertex> l) { upload(lines_, l.data(), l.size(), sizeof(LineVertex), false); }
 
 void SceneRenderer::encode(MTL::RenderCommandEncoder* enc, const ViewCamera& cam, float vw, float vh,
@@ -129,8 +145,16 @@ void SceneRenderer::encode(MTL::RenderCommandEncoder* enc, const ViewCamera& cam
         enc->setVertexBuffer(layer.buffer.get(), 0, 0);
         enc->drawPrimitives(MTL::PrimitiveTypeTriangleStrip, NS::UInteger(0), NS::UInteger(4), NS::UInteger(layer.count));
     };
-    draw_splats(model_);
-    draw_splats(frame_);
+    if (s.show_mesh && mesh_index_count_ > 0) {
+        enc->setRenderPipelineState(mesh_pso_.get());
+        enc->setVertexBuffer(mesh_vertices_.get(), 0, 0);
+        enc->drawIndexedPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(mesh_index_count_), MTL::IndexTypeUInt32,
+                                   mesh_indices_.get(), NS::UInteger(0));
+    }
+    if (s.show_points) {
+        draw_splats(model_);
+        draw_splats(frame_);
+    }
 
     if (markers_.count > 0) {
         enc->setRenderPipelineState(marker_pso_.get());

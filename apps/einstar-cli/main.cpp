@@ -2,24 +2,36 @@
 //   probe [--verbose]                 read-only hardware identification (first contact with a scanner)
 //   sim-probe                         same, against the device emulator
 //   calib <dir-with-CCF-files>        decode LeftCCF/RightCCF/TexCCF and print the rig
-//   track-fixture <project.ir_E10_prj> [--start N] [--count N] [--skip K] [--quiet]
-//                                     run the tracker on EXStar-recorded depth frames and compare poses
+//   track-fixture <project.ir_E10_prj> [--start N] [--count N] [--skip K] [--record out.estr] [--quiet]
+//                                     run the tracker on EXStar-recorded depth frames and compare poses;
+//                                     --record writes a session (plus EXStar's poses as <out>.exstar_poses)
+//   process <session.estr> [-o mesh.stl|ply|obj] [--voxel MM] [--no-optimize] [--smooth N]
+//           [--stl reference.stl] [--reference-poses file]
+//                                     the process step: optimise poses, re-fuse, mesh, export
 
 #include <algorithm>
 #include <charconv>
+#include <fstream>
+#include <map>
 #include <cstring>
 #include <cmath>
 #include <optional>
+#include <format>
+#include <iomanip>
 #include <print>
 #include <span>
 #include <string_view>
 #include <vector>
+
+#include <Eigen/Geometry>
 
 #include "einstar/calib/device_calibration.hpp"
 #include "einstar/core/log.hpp"
 #include "einstar/core/timing.hpp"
 #include "einstar/device/einstar_device.hpp"
 #include "einstar/fixtures/exstar_project.hpp"
+#include "einstar/recon/process.hpp"
+#include "einstar/session/session.hpp"
 #include "einstar/sim/sim_transport.hpp"
 #include "einstar/track/tracker.hpp"
 #include "einstar/track_metal/metal_icp.hpp"
@@ -32,7 +44,8 @@ namespace {
 int usage() {
     std::println(stderr,
                  "usage: einstar-cli probe [--verbose] | sim-probe | calib <dir> |\n"
-                 "       track-fixture <project.ir_E10_prj> [--start N] [--count N] [--skip K] [--stl ref.stl] [--cpu] [--mode geometry|hybrid|markers] [--global-markers] [--marker-confirm N] [--quiet]");
+                 "       track-fixture <project.ir_E10_prj> [--start N] [--count N] [--skip K] [--stl ref.stl] [--cpu] [--mode geometry|hybrid|markers] [--global-markers] [--marker-confirm N] [--record out.estr] [--quiet] |\n"
+                 "       process <session.estr> [-o mesh.stl|ply|obj] [--voxel MM] [--no-optimize] [--smooth N] [--stl reference.stl] [--reference-poses file]");
     return 2;
 }
 
@@ -44,6 +57,17 @@ long arg_int(std::span<char*> args, std::string_view name, long def) {
             return v;
         }
     return def;
+}
+
+const char* arg_str(std::span<char*> args, std::string_view name) {
+    for (std::size_t i = 0; i + 1 < args.size(); ++i)
+        if (name == args[i]) return args[i + 1];
+    return nullptr;
+}
+
+double arg_double(std::span<char*> args, std::string_view name, double def) {
+    const char* v = arg_str(args, name);
+    return v ? std::atof(v) : def;
 }
 
 bool has_flag(std::span<char*> args, std::string_view name) {
@@ -184,6 +208,9 @@ int track_fixture(const char* path, std::span<char*> args) {
         std::println("global markers: {} fixed markers from the project header", map.size());
         tracker.set_marker_map(std::move(map));
     }
+    std::unique_ptr<session::SessionWriter> recorder;
+    std::ofstream exstar_poses;
+    const char* record_path = arg_str(args, "--record");
     std::vector<double> t_err, r_err, ms, rpe_t, rpe_r, eigs;
     std::optional<SE3> prev_ours, prev_theirs;
     int gross = 0;
@@ -218,6 +245,42 @@ int track_fixture(const char* path, std::span<char*> args) {
         prev_ref = f->T_world_camera;
         const auto r = tracker.process(frame);
         ++processed;
+        if (record_path && !recorder) {
+            session::SessionHeader h;
+            h.depth_intrinsics = k;
+            h.baseline_mm = (*proj)->baseline_mm();
+            h.description = std::string("replay of ") + path;
+            auto w = session::SessionWriter::create(record_path, h);
+            if (!w) {
+                std::println(stderr, "{}", w.error().message);
+                return 1;
+            }
+            recorder = std::move(*w);
+            if (has_flag(args, "--global-markers")) recorder->write_global_markers(tracker.marker_map().markers());
+            exstar_poses.open(std::string(record_path) + ".exstar_poses");
+        }
+        if (recorder) {
+            session::FrameRecord rec;
+            rec.index = static_cast<std::uint64_t>(i);
+            rec.timestamp_s = frame.timestamp_s;
+            rec.flags = (r.accepted ? session::frame_accepted : 0u) | (r.degenerate ? session::frame_degenerate : 0u) |
+                        (r.relocalized ? session::frame_relocalized : 0u) | (r.marker_pose ? session::frame_marker_pose : 0u) |
+                        (r.integrated ? session::frame_integrated : 0u);
+            rec.T_world_camera = r.T_world_camera;
+            std::map<int, int> ids(r.marker_ids.begin(), r.marker_ids.end());
+            for (std::size_t m = 0; m < frame.markers.size(); ++m) {
+                const auto& mk = frame.markers[m];
+                const auto it = ids.find(static_cast<int>(m));
+                rec.markers.push_back({mk.position, mk.normal, mk.diameter, it == ids.end() ? -1 : it->second, mk.left_rect, mk.right_rect});
+            }
+            session::capture_depth(frame, rec.depth, rec.confidence);
+            recorder->write(std::move(rec));
+            const auto& M = f->T_world_camera.matrix();
+            exstar_poses << i;
+            for (int rr = 0; rr < 3; ++rr)
+                for (int cc = 0; cc < 4; ++cc) exstar_poses << ' ' << std::setprecision(12) << M(rr, cc);
+            exstar_poses << '\n';
+        }
         if (r.accepted && !diverged) {
             const SE3 d = f->T_world_camera.inverse() * r.T_world_camera;
             if (translation_norm(d) > 3.0) {
@@ -315,6 +378,190 @@ int track_fixture(const char* path, std::span<char*> args) {
                  pct(eigs, 0.10), pct(eigs, 0.25), pct(eigs, 0.5));
     std::println("time per frame: median {:.1f} ms p95 {:.1f} ms; model bricks {}", pct(ms, 0.5), pct(ms, 0.95),
                  tracker.volume().brick_count());
+    if (recorder) {
+        recorder->close();
+        std::println("recorded {} frames ({:.1f} MB) to {}", recorder->frames_written(), static_cast<double>(recorder->bytes_written()) / 1e6,
+                     recorder->path());
+    }
+    return 0;
+}
+
+double percentile(std::vector<double> v, double p) {
+    if (v.empty()) return 0.0;
+    std::ranges::sort(v);
+    return v[static_cast<std::size_t>(p * static_cast<double>(v.size() - 1))];
+}
+
+int process_cmd(const char* path, std::span<char*> args) {
+    auto s = session::SessionReader::open(path);
+    if (!s) {
+        std::println(stderr, "{}", s.error().message);
+        return 1;
+    }
+    std::println("session: {} frames, {}", (*s)->frame_count(), (*s)->header().description);
+    if (has_flag(args, "--verbose")) log::set_level(log::Level::debug);
+    recon::ProcessParams pp;
+    pp.tsdf.voxel_mm = static_cast<float>(arg_double(args, "--voxel", pp.tsdf.voxel_mm));
+    pp.tsdf.truncation_mm = 5.0f * pp.tsdf.voxel_mm;
+    pp.optimize_poses = !has_flag(args, "--no-optimize");
+    pp.smooth_iterations = static_cast<int>(arg_int(args, "--smooth", 0));
+    // Tuning knobs (see recon::ProcessParams).
+    pp.graph_iterations = static_cast<int>(arg_int(args, "--graph-iterations", pp.graph_iterations));
+    pp.refine_rounds = static_cast<int>(arg_int(args, "--refine", pp.refine_rounds));
+    pp.loop_min_eigen_ratio = arg_double(args, "--loop-eig", pp.loop_min_eigen_ratio);
+    pp.chain_sigma_deg = arg_double(args, "--chain-deg", pp.chain_sigma_deg);
+    pp.chain_sigma_mm = arg_double(args, "--chain-mm", pp.chain_sigma_mm);
+    pp.fragment_frames = static_cast<int>(arg_int(args, "--fragment-frames", pp.fragment_frames));
+    pp.use_markers = !has_flag(args, "--no-markers");
+    pp.marker_sigma_mm = arg_double(args, "--marker-sigma", pp.marker_sigma_mm);
+    std::string last_stage;
+    pp.progress = [&](const std::string& stage, double) {
+        if (stage != last_stage) {
+            std::println("  {}...", stage);
+            last_stage = stage;
+        }
+    };
+    auto r = recon::process_session(**s, pp);
+    if (!r) {
+        std::println(stderr, "process failed: {}", r.error().message);
+        return 1;
+    }
+    const auto& rep = r->report;
+    std::println("frames {} in {} fragments; {} odometry and {} loop-closure edges ({} candidates, {} pruned), {} graph iterations; "
+                 "{} marker landmarks ({} observations)",
+                 rep.frames_used, rep.fragments, rep.odometry_edges, rep.loop_edges, rep.loop_candidates, rep.loop_edges_pruned,
+                 rep.graph_iterations, rep.marker_landmarks, rep.marker_observations);
+    std::println("pose corrections: median {:.2f} mm, max {:.2f} mm / {:.2f} deg; {} frames refined against the model",
+                 rep.median_correction_mm, rep.max_correction_mm, rep.max_correction_deg, rep.frames_refined);
+    std::println("islands: {} unverified segments, {} excluded ({} frames)", rep.islands, rep.islands_excluded, rep.frames_excluded);
+    std::println("mesh: {} vertices, {} triangles ({} small pieces removed)", rep.vertices, rep.triangles, rep.cleanup.removed_components);
+    std::string times;
+    for (const auto& [stage, ms] : rep.stage_ms) times += std::format(" {} {:.1f} s,", stage, ms / 1000.0);
+    std::println("time:{}", times);
+
+    if (const char* ref = arg_str(args, "--reference-poses")) {
+        std::ifstream f(ref);
+        std::map<std::size_t, SE3> exstar;
+        std::size_t idx;
+        while (f >> idx) {
+            SE3 T = SE3::Identity();
+            for (int rr = 0; rr < 3; ++rr)
+                for (int cc = 0; cc < 4; ++cc) f >> T.matrix()(rr, cc);
+            exstar[idx] = T;
+        }
+        std::vector<double> live_t, live_r, opt_t, opt_r;
+        int good_to_bad = 0, bad_to_good = 0, bad_both = 0;
+        for (const auto& [i, T] : r->frame_poses) {
+            const auto it = exstar.find((*s)->meta(i).index);
+            if (it == exstar.end()) continue;
+            const SE3 el = it->second.inverse() * (*s)->meta(i).T_world_camera;
+            const SE3 eo = it->second.inverse() * T;
+            const bool lb = translation_norm(el) > 3.0, ob = translation_norm(eo) > 3.0;
+            good_to_bad += !lb && ob;
+            if (has_flag(args, "--verbose") && translation_norm((*s)->meta(i).T_world_camera.inverse() * T) > 5.0 && (*s)->meta(i).index % 10 == 0)
+                std::println("  frame {}: live vs EXStar {:.1f} mm, processed vs EXStar {:.1f} mm, flags {:#x}", (*s)->meta(i).index,
+                             translation_norm(el), translation_norm(eo), (*s)->meta(i).flags);
+            bad_to_good += lb && !ob;
+            bad_both += lb && ob;
+            live_t.push_back(translation_norm(el));
+            live_r.push_back(rotation_angle(el) * 180 / M_PI);
+            opt_t.push_back(translation_norm(eo));
+            opt_r.push_back(rotation_angle(eo) * 180 / M_PI);
+        }
+        std::println("pose vs EXStar ({} frames): live median {:.2f} mm p95 {:.2f} mm ({:.3f} / {:.3f} deg) -> processed median {:.2f} mm "
+                     "p95 {:.2f} mm ({:.3f} / {:.3f} deg)",
+                     opt_t.size(), percentile(live_t, 0.5), percentile(live_t, 0.95), percentile(live_r, 0.5), percentile(live_r, 0.95),
+                     percentile(opt_t, 0.5), percentile(opt_t, 0.95), percentile(opt_r, 0.5), percentile(opt_r, 0.95));
+        std::println("frames > 3 mm from EXStar: live only {}, processed only {}, both {}", bad_to_good, good_to_bad, bad_both);
+        // The process step fixes only the first frame, so the whole scan may differ from EXStar's by a
+        // rigid transform; compare after the best rigid alignment of the camera centres.
+        auto aligned = [&](bool processed) {
+            std::vector<Vec3> a, b;
+            std::vector<SE3> ours, theirs;
+            for (const auto& [i, T] : r->frame_poses) {
+                const auto it = exstar.find((*s)->meta(i).index);
+                if (it == exstar.end()) continue;
+                const SE3 P = processed ? T : (*s)->meta(i).T_world_camera;
+                if (translation_norm(it->second.inverse() * P) > 3.0) continue;  // gross (symmetric) cases
+                a.push_back(P.translation());
+                b.push_back(it->second.translation());
+                ours.push_back(P);
+                theirs.push_back(it->second);
+            }
+            if (a.size() < 3) return std::pair{0.0, 0.0};
+            Eigen::Matrix3Xd A(3, static_cast<Eigen::Index>(a.size())), B(3, static_cast<Eigen::Index>(b.size()));
+            for (std::size_t n = 0; n < a.size(); ++n) A.col(static_cast<Eigen::Index>(n)) = a[n], B.col(static_cast<Eigen::Index>(n)) = b[n];
+            SE3 G = SE3::Identity();
+            G.matrix() = Eigen::umeyama(A, B, false);
+            std::vector<double> et;
+            for (std::size_t n = 0; n < ours.size(); ++n) et.push_back(translation_norm(theirs[n].inverse() * G * ours[n]));
+            return std::pair{percentile(et, 0.5), percentile(et, 0.95)};
+        };
+        const auto [lm, l95] = aligned(false);
+        const auto [pm, p95] = aligned(true);
+        std::println("after rigid alignment to EXStar (frames within 3 mm): live median {:.2f} mm p95 {:.2f} mm -> processed median {:.2f} mm p95 {:.2f} mm",
+                     lm, l95, pm, p95);
+        if (has_flag(args, "--verbose")) {
+            // Marker consistency: spread of each identified marker's world positions under each pose set.
+            for (const char* which : {"EXStar", "live", "processed"}) {
+                std::map<int, std::vector<Vec3>> pts;
+                for (const auto& [i, T] : r->frame_poses) {
+                    const auto it = exstar.find((*s)->meta(i).index);
+                    if (it == exstar.end()) continue;
+                    const SE3 P = std::string_view(which) == "EXStar" ? it->second : std::string_view(which) == "live" ? (*s)->meta(i).T_world_camera : T;
+                    for (const auto& m : (*s)->meta(i).markers)
+                        if (m.map_id >= 0) pts[m.map_id].push_back(P * m.position);
+                }
+                std::vector<double> spread;
+                for (const auto& [id, v] : pts) {
+                    if (v.size() < 5) continue;
+                    Vec3 c = Vec3::Zero();
+                    for (const auto& p : v) c += p;
+                    c /= static_cast<double>(v.size());
+                    for (const auto& p : v) spread.push_back((p - c).norm());
+                }
+                std::println("  marker spread under {} poses: median {:.3f} mm p95 {:.3f} mm", which, percentile(spread, 0.5), percentile(spread, 0.95));
+            }
+        }
+    }
+    if (const char* ref = arg_str(args, "--stl")) {
+        auto m = fixtures::load_stl(ref);
+        if (!m) {
+            std::println(stderr, "{}", m.error().message);
+            return 1;
+        }
+        // Accuracy: our surface -> reference. Completeness: reference -> our surface.
+        const fixtures::MeshDistance to_ref(*m);
+        fixtures::Mesh ours;
+        ours.vertices.reserve(r->mesh.triangles.size() * 3);
+        for (const auto& t : r->mesh.triangles)
+            for (const auto v : t) ours.vertices.push_back(r->mesh.vertices[v]);
+        const fixtures::MeshDistance to_ours(ours);
+        std::vector<double> acc;
+        int far = 0;
+        const std::size_t step = std::max<std::size_t>(1, r->mesh.vertices.size() / 200000);
+        for (std::size_t v = 0; v < r->mesh.vertices.size(); v += step) {
+            if (auto d = to_ref.distance(r->mesh.vertices[v], 3.0f)) acc.push_back(*d);
+            else ++far;
+        }
+        std::vector<double> comp;
+        const std::size_t rstep = std::max<std::size_t>(1, m->vertices.size() / 200000);
+        for (std::size_t v = 0; v < m->vertices.size(); v += rstep) comp.push_back(to_ours.distance(m->vertices[v], 3.0f).value_or(3.0f));
+        const auto within = [](const std::vector<double>& d, double t) {
+            return 100.0 * static_cast<double>(std::ranges::count_if(d, [&](double x) { return x <= t; })) / static_cast<double>(std::max<std::size_t>(1, d.size()));
+        };
+        std::println("vs reference mesh: accuracy median {:.3f} mm p90 {:.3f} mm p95 {:.3f} mm ({:.1f}% of our surface beyond 3 mm: not in the reference); "
+                     "completeness {:.1f}% of the reference within 0.5 mm, {:.1f}% within 1 mm",
+                     percentile(acc, 0.5), percentile(acc, 0.9), percentile(acc, 0.95), 100.0 * far / static_cast<double>(far + acc.size()),
+                     within(comp, 0.5), within(comp, 1.0));
+    }
+    if (const char* outp = arg_str(args, "-o")) {
+        if (auto w = recon::save_mesh(r->mesh, outp); !w) {
+            std::println(stderr, "{}", w.error().message);
+            return 1;
+        }
+        std::println("wrote {}", outp);
+    }
     return 0;
 }
 
@@ -328,5 +575,6 @@ int main(int argc, char** argv) {
     if (cmd == "sim-probe") return sim_probe();
     if (cmd == "calib" && argc >= 3) return calib_cmd(argv[2]);
     if (cmd == "track-fixture" && argc >= 3) return track_fixture(argv[2], rest);
+    if (cmd == "process" && argc >= 3) return process_cmd(argv[2], std::span<char*>(argv + 3, static_cast<std::size_t>(argc - 3)));
     return usage();
 }

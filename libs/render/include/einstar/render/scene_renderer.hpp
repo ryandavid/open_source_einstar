@@ -21,6 +21,8 @@ struct RenderSettings {
     float point_size_mm = 0.6f;   // splat diameter in world units
     float min_point_px = 1.5f;    // keep splats visible when zoomed out
     bool lighting = true;
+    bool show_points = true;      // model / frame splats
+    bool show_mesh = true;        // processed mesh, when one is set
 };
 
 class SceneRenderer {
@@ -38,6 +40,9 @@ public:
     // reference; the producer must not modify the buffer afterwards).
     void set_model_buffer(gpu::Ref<MTL::Buffer> buffer, std::size_t count);
     void set_frame_buffer(gpu::Ref<MTL::Buffer> buffer, std::size_t count);
+    // Processed triangle mesh (replaces any previous one; empty clears it).
+    void set_mesh(std::span<const MeshVertex> vertices, std::span<const std::uint32_t> indices);
+    [[nodiscard]] bool has_mesh() const { return mesh_index_count_ > 0; }
 
     [[nodiscard]] std::size_t model_point_count() const { return model_.count; }
 
@@ -56,6 +61,9 @@ private:
     gpu::Ref<MTL::RenderPipelineState> splat_pso_;
     gpu::Ref<MTL::RenderPipelineState> marker_pso_;
     gpu::Ref<MTL::RenderPipelineState> line_pso_;
+    gpu::Ref<MTL::RenderPipelineState> mesh_pso_;
+    gpu::Ref<MTL::Buffer> mesh_vertices_, mesh_indices_;
+    std::size_t mesh_index_count_ = 0;
     gpu::Ref<MTL::DepthStencilState> depth_state_;
     Layer model_, frame_, markers_, lines_;
 };

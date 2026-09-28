@@ -1,6 +1,7 @@
 #include "session.hpp"
 
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <format>
 #include <random>
@@ -168,6 +169,9 @@ Result<std::unique_ptr<Session>> Session::open(bool force_emulator, UpdateSink u
     pipeline::ScanPipelineParams pp;
     pp.block_when_full = s->emulated_;  // the emulator can wait; a real scanner cannot
     s->pipeline_ = std::make_unique<pipeline::ScanPipeline>(std::make_unique<pipeline::StereoFrontend>(rig), pp, std::move(updates));
+    // Every scan is recorded so the process step can use every frame.
+    if (const char* dir = std::getenv("EINSTAR_SCAN_DIR")) s->pipeline_->set_recording_directory(dir);
+    else if (const char* home = std::getenv("HOME")) s->pipeline_->set_recording_directory(std::string(home) + "/Documents/Einstar/Scans");
     s->pipeline_->start();
 
     const auto& info = s->device_->info();

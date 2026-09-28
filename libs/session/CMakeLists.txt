@@ -1,0 +1,5 @@
+add_library(einstar_session src/session.cpp)
+add_library(einstar::session ALIAS einstar_session)
+target_include_directories(einstar_session PUBLIC include)
+target_link_libraries(einstar_session PUBLIC einstar::core einstar::track einstar::markers PRIVATE einstar_zstd)
+einstar_target_defaults(einstar_session)

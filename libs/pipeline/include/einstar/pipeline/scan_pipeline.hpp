@@ -17,6 +17,7 @@
 
 #include "einstar/core/timing.hpp"
 #include "einstar/optim/marker_bundle.hpp"
+#include "einstar/session/session.hpp"
 #include "einstar/pipeline/stereo_frontend.hpp"
 #include "einstar/render/types.hpp"
 #include "einstar/track/tracker.hpp"
@@ -59,6 +60,7 @@ struct LiveStats {
     int global_markers = 0;      // fixed markers of the optimised map in use
     int keyframes = 0;           // global-marker keyframes collected
     double marker_ms = 0;        // median
+    std::uint64_t recorded_frames = 0;  // in the current session file
 };
 
 struct LiveUpdate {
@@ -142,6 +144,13 @@ public:
     void set_global_markers(std::vector<markers::MapMarker> map);  // e.g. loaded from disk
     // Alignment used while scanning surfaces (geometry falls back to hybrid while a global map is set).
     void set_surface_mode(track::AlignMode mode);
+
+    // Session recording: every processed frame goes to `<directory>/scan-<date>-<time>.estr`. A new
+    // file starts whenever the tracker's world frame restarts (clear, new marker capture); clearing
+    // the model deletes the discarded recording. Empty directory = off.
+    void set_recording_directory(std::string directory);
+    // Waits until everything recorded so far is on disk; returns the current session file ("" if none).
+    [[nodiscard]] std::string flush_recording();
     [[nodiscard]] std::vector<markers::MapMarker> global_markers() const;
 
     // Called from the device thread; never blocks.
@@ -159,6 +168,8 @@ private:
     void collect_keyframe(const track::TrackResult& r, const track::DepthFrame& frame);
     GlobalMarkerReport run_bundle_adjustment();
     void fill_marker_overlays(const track::TrackResult& r, const DepthOutput& depth, LiveUpdate& up) const;
+    void record(const track::TrackResult& r, const DepthOutput& depth);
+    void restart_recording(bool delete_current);  // world frame restarted
 
     std::unique_ptr<StereoFrontend> frontend_;
     ScanPipelineParams params_;
@@ -183,6 +194,9 @@ private:
     std::vector<Command> commands_;
     std::atomic<std::uint64_t> frames_taken_{0};
     TimingStats marker_times_{64};
+    std::string record_dir_;
+    std::unique_ptr<session::SessionWriter> recorder_;
+    mutable std::mutex recorder_mutex_;
 
     std::mutex mutex_;
     std::condition_variable cv_;
