@@ -50,6 +50,7 @@ struct ProcessParams {
     double loop_max_correction_deg = 10.0;
     double loop_min_overlap = 0.25;         // quick overlap test before registration
     int loop_rounds = 4;                    // search again after each solve (poses improve)
+    int loop_max_partners = 10;             // nearest overlapping fragments tried per fragment
     double prune_chi = 25.0;               // whitened loop-closure error (~0.5 mm with the default information scale)
     // Frame refinement: after the pose graph, every frame is registered against the model built from
     // all fragments (removes drift inside fragments). Skipped for frames whose geometry does not

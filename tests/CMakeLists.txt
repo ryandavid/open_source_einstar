@@ -51,3 +51,5 @@ target_link_libraries(test_session PRIVATE einstar::session)
 
 einstar_add_test(test_recon recon/test_mesh.cpp recon/test_process.cpp)
 target_link_libraries(test_recon PRIVATE einstar::recon einstar::fixtures einstar::synth)
+add_executable(debug_depth_errors pipeline/debug_depth_errors.cpp)
+target_link_libraries(debug_depth_errors PRIVATE einstar::pipeline einstar::synth)

@@ -236,21 +236,43 @@ Result<ProcessResult> process_session(const session::SessionReader& s, const Pro
         // round re-tests pairs that failed before: once nearer loops are closed, the poses of far
         // ones improve enough for registration to converge (drift grows around a loop).
         std::set<std::pair<std::size_t, std::size_t>> closed;
+        std::map<std::pair<std::size_t, std::size_t>, SE3> tried;  // relative pose when last attempted
+        double t_reg = 0, t_solve = 0;
         optim::PoseGraphParams gp;
         gp.prune_chi = params.prune_chi;
         gp.fixed_node = static_cast<int>(tracked.front());
         for (int round = 0; round < params.loop_rounds; ++round) {
+            // Each fragment tries only its nearest overlapping partners (a revisited area has many
+            // redundant ones), and a pair that failed before is retried only once the estimate of its
+            // relative pose has changed.
             std::vector<std::pair<std::size_t, std::size_t>> cands;
-            for (std::size_t i = 0; i < frags.size(); ++i)
-                for (std::size_t j = i + 2; j < frags.size(); ++j) {
-                    if (closed.contains({i, j})) continue;
-                    if ((current(i) * frags[i].center - current(j) * frags[j].center).norm() > 0.8 * (frags[i].radius + frags[j].radius))
-                        continue;
-                    cands.emplace_back(i, j);
+            std::set<std::pair<std::size_t, std::size_t>> picked;
+            for (std::size_t i = 0; i < frags.size(); ++i) {
+                std::vector<std::pair<double, std::size_t>> near;
+                const Vec3 ci = current(i) * frags[i].center;
+                for (std::size_t j = 0; j < frags.size(); ++j) {
+                    if (j + 1 >= i && j <= i + 1) continue;  // itself and consecutive fragments
+                    const double d = (ci - current(j) * frags[j].center).norm();
+                    if (d <= 0.8 * (frags[i].radius + frags[j].radius)) near.emplace_back(d, j);
                 }
+                std::ranges::sort(near);
+                if (static_cast<int>(near.size()) > params.loop_max_partners) near.resize(static_cast<std::size_t>(params.loop_max_partners));
+                for (const auto& [d, j] : near) {
+                    const auto key = std::minmax(i, j);
+                    if (closed.contains(key) || !picked.insert(key).second) continue;
+                    const SE3 rel = current(key.first).inverse() * current(key.second);
+                    if (const auto it = tried.find(key); it != tried.end()) {
+                        const SE3 moved = it->second.inverse() * rel;
+                        if (translation_norm(moved) < 1.0 && rotation_angle(moved) < 0.2 * M_PI / 180.0) continue;
+                    }
+                    tried[key] = rel;
+                    cands.push_back(key);
+                }
+            }
             rep.loop_candidates += static_cast<int>(cands.size());
             std::vector<std::optional<optim::PoseEdge>> found(cands.size());
             std::atomic<int> done{0};
+            Stopwatch reg_sw;
             tbb::parallel_for(std::size_t{0}, cands.size(), [&](std::size_t c) {
                 if (cancelled(params)) return;
                 const auto [i, j] = cands[c];
@@ -273,6 +295,7 @@ Result<ProcessResult> process_session(const session::SessionReader& s, const Pro
                 progress(params, "Finding loop closures", static_cast<double>(++done) / static_cast<double>(cands.size()));
             });
             if (cancelled(params)) return make_error(Errc::busy, "cancelled");
+            t_reg += reg_sw.elapsed_ms();
             int added = 0;
             for (std::size_t c = 0; c < found.size(); ++c)
                 if (found[c]) {
@@ -284,7 +307,10 @@ Result<ProcessResult> process_session(const session::SessionReader& s, const Pro
             rep.loop_edges += added;
             if (added == 0 && round > 0) break;
             progress(params, "Optimising poses", 0.0);
+            Stopwatch solve_sw;
             const auto pr = optim::optimize(graph, gp);
+            t_solve += solve_sw.elapsed_ms();
+            log::debug("process: solve {:.0f} ms ({} solves)", solve_sw.elapsed_ms(), pr.solves);
             rep.loop_edges_pruned += pr.pruned_edges;
             log::info("process: round {}: {} candidates, {} loop closures ({} pruned), cost {:.4g} -> {:.4g}", round, cands.size(), added,
                       pr.pruned_edges, pr.cost_before, pr.cost_after);
@@ -314,6 +340,7 @@ Result<ProcessResult> process_session(const session::SessionReader& s, const Pro
         }
         rep.stage_ms["pose graph"] += sw.elapsed_ms();
         ++rep.graph_iterations;
+        log::debug("process: iteration {}: loop registration {:.0f} ms, solves {:.0f} ms", iter, t_reg, t_solve);
         log::info("process: pose graph iteration {}: largest pose change {:.3f} mm (at a 100 mm lever)", iter, change);
         if (change < params.graph_tolerance_mm) break;
     }
@@ -529,14 +556,29 @@ Result<ProcessResult> process_session(const session::SessionReader& s, const Pro
             if (auto v = track_metal::MetalTsdfVolume::create(*ctx, params.tsdf)) volume = std::move(*v);
     if (!volume) volume = std::make_unique<track::TsdfVolume>(params.tsdf);
     {
-        std::size_t n = 0;
-        for (const auto& [i, T] : out.frame_poses) {
+        // Decoding (zstd, points, normals) runs in parallel batches; integration stays in order.
+        const std::vector<std::pair<std::size_t, SE3>> todo(out.frame_poses.begin(), out.frame_poses.end());
+        constexpr std::size_t kBatch = 32;
+        std::vector<track::DepthFrame> batch(kBatch);
+        std::vector<float> weight(kBatch);
+        std::vector<std::string> errors(kBatch);
+        for (std::size_t b = 0; b < todo.size(); b += kBatch) {
             if (cancelled(params)) return make_error(Errc::busy, "cancelled");
-            auto rec = s.read(i);
-            if (!rec) return make_error(Errc::io, rec.error().message);
-            const bool degenerate = (rec->flags & session::frame_degenerate) != 0;
-            volume->integrate(rec->depth_frame(k), T, degenerate ? params.degenerate_weight : 1.0f);
-            if (++n % 16 == 0) progress(params, "Fusing", static_cast<double>(n) / static_cast<double>(out.frame_poses.size()));
+            const std::size_t n = std::min(kBatch, todo.size() - b);
+            tbb::parallel_for(std::size_t{0}, n, [&](std::size_t j) {
+                auto rec = s.read(todo[b + j].first);
+                if (!rec) {
+                    errors[j] = rec.error().message;
+                    return;
+                }
+                batch[j] = rec->depth_frame(k);
+                weight[j] = (rec->flags & session::frame_degenerate) ? params.degenerate_weight : 1.0f;
+            });
+            for (std::size_t j = 0; j < n; ++j) {
+                if (!errors[j].empty()) return make_error(Errc::io, errors[j]);
+                volume->integrate(batch[j], todo[b + j].second, weight[j]);
+            }
+            progress(params, "Fusing", static_cast<double>(b + n) / static_cast<double>(todo.size()));
         }
     }
     if (const auto* mv = dynamic_cast<const track_metal::MetalTsdfVolume*>(volume.get()); mv && mv->pool_exhausted())
