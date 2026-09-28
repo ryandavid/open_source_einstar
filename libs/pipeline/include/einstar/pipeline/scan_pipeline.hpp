@@ -19,6 +19,7 @@
 #include "einstar/pipeline/stereo_frontend.hpp"
 #include "einstar/render/types.hpp"
 #include "einstar/track/tracker.hpp"
+#include "einstar/track_metal/metal_icp.hpp"
 #include "einstar/usb/stream.hpp"
 
 namespace einstar::pipeline {
@@ -105,6 +106,7 @@ private:
     ScanPipelineParams params_;
     Sink sink_;
     track::Tracker tracker_;
+    std::unique_ptr<track_metal::MetalIcp> gpu_icp_;
     ModelPointCache cache_;
 
     std::mutex mutex_;

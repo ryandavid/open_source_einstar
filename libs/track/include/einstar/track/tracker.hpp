@@ -22,7 +22,7 @@ struct TrackerParams {
     TsdfParams tsdf;
     IcpParams icp;
     double model_scale = 0.5;           // raycast resolution relative to the depth frame
-    double min_inlier_ratio = 0.6;      // of source points that land on the model
+    double min_inlier_ratio = 0.7;      // of source points that land on the model (good frames: 0.8-0.9)
     double min_coverage = 0.15;         // of the frame that must overlap the model
     int min_correspondences = 800;
     double max_rms_mm = 0.45;
@@ -30,7 +30,7 @@ struct TrackerParams {
     double max_rot_speed_deg_s = 240.0;
     // Below this the pose is only weakly determined by geometry (e.g. surfaces of revolution): the
     // frame is tracked but only extends the model into unobserved space.
-    double degenerate_eigen_ratio = 1e-4;
+    double degenerate_eigen_ratio = 5e-3;  // (centred, unit-scaled Hessian; ~7% of frames on real scans)
     float degenerate_weight = 0.5f;
     int relocalize_attempts_per_frame = 2;
     // A relocalisation is only trusted after this many consecutive frames track consistently from
@@ -38,7 +38,7 @@ struct TrackerParams {
     int confirm_frames = 3;
     double reloc_min_inlier_ratio = 0.75;
     double reloc_min_coverage = 0.35;
-    double reloc_min_eigen_ratio = 1e-4;   // relocalising onto ambiguous (sliding) geometry is refused
+    double reloc_min_eigen_ratio = 5e-3;   // relocalising onto ambiguous (sliding) geometry is refused
     // Global (pose-independent) relocalisation while lost.
     bool global_relocalization = true;
     int global_reloc_every = 3;            // attempt on every Nth lost frame (it costs ~50-150 ms)
@@ -64,6 +64,9 @@ public:
     explicit Tracker(TrackerParams params = {}, std::unique_ptr<Volume> volume = nullptr);
 
     TrackResult process(const DepthFrame& frame);
+    // Replace the ICP solver (e.g. with the Metal implementation). Must have the same semantics.
+    void set_icp_solver(IcpFunction f) { icp_ = std::move(f); }
+
     // Seed the pose of the first frame (e.g. from markers); otherwise identity.
     void set_initial_pose(const SE3& T) { initial_pose_ = T; }
 
@@ -80,6 +83,7 @@ private:
 
     TrackerParams params_;
     std::unique_ptr<Volume> volume_;
+    IcpFunction icp_ = icp_point_to_plane;
     TrackState state_ = TrackState::initializing;
     std::optional<SE3> initial_pose_;
     SE3 last_pose_ = SE3::Identity();
@@ -87,7 +91,8 @@ private:
     double last_time_ = 0, prev_time_ = 0;
     bool have_velocity_ = false;
     int degenerate_dirs_ = 0;              // unobservable directions at the last frame
-    Mat6 degenerate_basis_ = Mat6::Zero(); // (unit-scaled twist coordinates)
+    Mat6 degenerate_basis_ = Mat6::Zero(); // (unit-scaled twist coordinates about degenerate_center_)
+    Vec3 degenerate_center_ = Vec3::Zero();
     int confirm_count_ = 0;
     int lost_frames_ = 0;
     FeatureModel feature_model_;

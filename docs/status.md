@@ -9,20 +9,25 @@
 | Device emulator | done | speaks the protocol, streams packetised frames, serves flash, buttons, temperature |
 | Calibration | done | decodes EXStar CCF / flash blob; matches documented values; baseline 159.913 mm |
 | Rectification | done | row alignment < 1e-6 px on synthetic rig with distortion + toe-in |
-| Stereo depth (CPU) | done | census + SGM (slant steps) + slanted-window ZNCC; 0.056 mm median error on synthetic speckle; ~20-25 ms at 640x512 output |
+| Stereo depth | done (CPU reference + Metal) | census + SGM (slant steps) + slanted-window ZNCC; 0.056 mm median error on synthetic speckle; Metal 5.7 ms/frame (CPU 21 ms), 99.8% of disparities within 0.25 px of CPU |
 | Tracking | working | robust point-to-plane ICP, normal-space balancing, degeneracy-aware updates, extend-only fusion for weak frames, global FPFH relocalisation with 3-frame confirmation |
-| Fusion | done | sparse voxel-hash TSDF, tile-bounded raycast, per-brick point extraction |
+| Fusion | done (CPU reference + Metal) | sparse voxel-hash TSDF; Metal: GPU hash table + brick pool, integrate 0.7 ms, raycast 1.2 ms, full surface extraction 0.4 ms |
+| ICP | done (CPU reference + Metal) | Metal runs all Gauss-Newton iterations in one command buffer (1.6 ms vs 3.7 ms); identical poses and Hessians to the CPU solver |
 | Live view | done | Metal splats, frustum/trail, ghost frustum when lost, HUD, IR previews (`--snapshot` for headless capture) |
 
 ### Tracking on EXStar's own recordings (`einstar-cli track-fixture`)
-mustang_differential, 6055 frames, depth-only (no markers/texture):
-- tracked frames land on EXStar's final mesh with median 0.17 mm; ~95% of sampled frames fit cleanly
-- per-frame relative error median 0.066 mm / 0.019 deg
-- first 2000 frames: 90.6% tracked, pose within 1.26 mm (p95) of EXStar's optimised poses
+mustang_differential, 6055 frames, depth-only (no markers/texture), GPU path:
+- 92.3% of frames tracked; pose within 1.62 mm (p95) of EXStar's globally optimised poses
+- tracked frames land on EXStar's final mesh with median 0.18 mm; 2.3% of sampled frames misfit
+- 6.7 ms per frame for tracking + fusion (CPU reference: ~28 ms)
 - lost frames are dominated by the recording's own discontinuities (EXStar did not store the frames it lost), which live capture does not have
 
+ICP is linearised about the centroid of the observed surface (not the world origin), which keeps
+the float GPU solve well conditioned and makes the degeneracy analysis independent of where the
+scan started; the degeneracy/relocalisation thresholds were recalibrated for it.
+
 ## Known issues / next steps
-1. **Speed**: stereo + tracking run on the CPU (~50-60 ms/frame idle). Port stereo and TSDF raycast/integration to Metal (target < 30 ms total).
+1. **Speed**: done for the main path (stereo 5.7 ms + tracking/fusion 6.7 ms). Remaining: keep depth frames on the GPU between stereo, ICP and fusion (today they round-trip through CPU memory, ~1 ms each); renderer could draw the extracted surface buffer directly.
 2. **Open-loop drift** on young models (synthetic sweep: ~0.03 deg/frame). Fix in the process step: keyframe pose graph + loop closure + re-fusion.
 3. **Surfaces of revolution** are geometrically ambiguous; depth-only tracking holds but may slide. Needs markers (next) or texture.
 4. **Markers**: detection, stereo matching, marker map, joint marker + ICP tracking — not started (EXStar's parameters are in docs/algorithms.md).

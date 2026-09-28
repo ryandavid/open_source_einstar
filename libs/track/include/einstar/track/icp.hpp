@@ -4,6 +4,9 @@
 // a weak prior towards the predicted pose (keeps flat / slippery surfaces from sliding),
 // and degeneracy analysis from the Gauss-Newton Hessian.
 
+#include <functional>
+#include <vector>
+
 #include "einstar/track/frame.hpp"
 #include "einstar/track/tsdf.hpp"
 
@@ -25,7 +28,7 @@ struct IcpParams {
     double data_sigma_mm = 0.2;
     // Degeneracy-aware update: eigen-directions of the (unit-scaled) Hessian weaker than this
     // fraction of the strongest are not updated from the data; they keep the prediction.
-    double degenerate_direction_ratio = 1e-6;
+    double degenerate_direction_ratio = 1e-4;
 };
 
 struct IcpResult {
@@ -37,9 +40,21 @@ struct IcpResult {
     double coverage = 0;                  // source points that landed on the model / all valid source points
     double min_eigenvalue_ratio = 0;      // smallest / largest Hessian eigenvalue (degeneracy indicator)
     int degenerate_directions = 0;        // directions held by the prediction in the final solve
-    Mat6 degenerate_basis = Mat6::Zero(); // first `degenerate_directions` columns, in unit-scaled twist coords
+    Mat6 degenerate_basis = Mat6::Zero(); // first `degenerate_directions` columns, in unit-scaled twist coords about `center`
+    Vec3 center = Vec3::Zero();           // linearisation point (world): centroid of the observed surface
     bool converged = false;
 };
+
+// Linearisation centre used by the ICP solvers: centroid of (subsampled) frame points at the given pose.
+[[nodiscard]] Vec3 icp_center(const DepthFrame& frame, const SE3& T_world_camera);
+[[nodiscard]] Vec6 twist_from_center(const Vec6& twist_about_center, const Vec3& c);  // -> twist about the origin
+[[nodiscard]] Vec6 twist_to_center(const Vec6& twist_about_origin, const Vec3& c);
+
+// Per-pixel normal-space balancing weights (empty when alpha <= 0).
+[[nodiscard]] std::vector<float> normal_balance_weights(const DepthFrame& frame, double alpha);
+
+// Solver signature shared by the CPU implementation and GPU backends.
+using IcpFunction = std::function<IcpResult(const DepthFrame&, const RaycastResult&, const SE3&, const SE3&, const IcpParams&)>;
 
 // `model` must be a raycast from the predicted pose (it defines the association camera).
 [[nodiscard]] IcpResult icp_point_to_plane(const DepthFrame& frame, const RaycastResult& model, const SE3& T_model_camera,

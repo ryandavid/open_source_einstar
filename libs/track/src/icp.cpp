@@ -52,43 +52,76 @@ inline int normal_bin(const Vec3f& n) {
 
 }  // namespace
 
+// Twists (v, w) about the origin vs about a point c: v_origin = v_c + c x w (w is unchanged).
+Vec6 twist_from_center(const Vec6& xc, const Vec3& c) {
+    Vec6 xo = xc;
+    xo.head<3>() += c.cross(xc.tail<3>());
+    return xo;
+}
+Vec6 twist_to_center(const Vec6& xo, const Vec3& c) {
+    Vec6 xc = xo;
+    xc.head<3>() -= c.cross(xo.tail<3>());
+    return xc;
+}
+
+Vec3 icp_center(const DepthFrame& frame, const SE3& T_world_camera) {
+    Vec3 c = Vec3::Zero();
+    int n = 0;
+    for (int y = 0; y < frame.points.height(); y += 16)
+        for (int x = 0; x < frame.points.width(); x += 16)
+            if (frame.points(x, y).z() > 0) {
+                c += T_world_camera * frame.points(x, y).cast<double>();
+                ++n;
+            }
+    return n > 0 ? Vec3(c / n) : T_world_camera.translation();
+}
+
+std::vector<float> normal_balance_weights(const DepthFrame& frame, double alpha) {
+    std::vector<float> balance;
+    if (alpha <= 0) return balance;
+    const int W = frame.points.width(), H = frame.points.height();
+    std::array<int, 128> hist{};
+    int total = 0;
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            const Vec3f& n = frame.normals(x, y);
+            if (frame.points(x, y).z() <= 0 || n.squaredNorm() == 0) continue;
+            ++hist[static_cast<std::size_t>(normal_bin(n))];
+            ++total;
+        }
+    int occupied = 0;
+    for (int c : hist) occupied += c > 0;
+    const double mean = occupied ? static_cast<double>(total) / occupied : 1.0;
+    std::array<float, 128> w_bin{};
+    for (std::size_t b = 0; b < hist.size(); ++b)
+        w_bin[b] = hist[b] ? static_cast<float>(std::pow(mean / hist[b], alpha)) : 0.0f;
+    // Cap the boost so a handful of noisy normals cannot dominate either.
+    for (auto& w : w_bin) w = std::min(w, 20.0f);
+    balance.assign(static_cast<std::size_t>(W * H), 1.0f);
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            const Vec3f& n = frame.normals(x, y);
+            if (n.squaredNorm() > 0) balance[static_cast<std::size_t>(y * W + x)] = w_bin[static_cast<std::size_t>(normal_bin(n))];
+        }
+    return balance;
+}
+
 IcpResult icp_point_to_plane(const DepthFrame& frame, const RaycastResult& model, const SE3& T_model_camera,
                              const SE3& T_init, const IcpParams& p) {
     IcpResult res;
     SE3 T = T_init;
+    // Linearise about the centroid of the observed surface rather than the world origin: the
+    // rotation/translation coupling (and so the degeneracy analysis) then does not depend on how
+    // far the scanner is from where the scan started, and the system stays well conditioned.
+    const Vec3 c = icp_center(frame, T_init);
+    res.center = c;
     const SE3 T_mc_inv = T_model_camera.inverse();  // world -> model camera
     const Eigen::Matrix4d M_cw = T_mc_inv.matrix();
     const float cos_max = std::cos(p.max_normal_angle_deg * static_cast<float>(M_PI) / 180.0f);
     const auto& mk = model.intrinsics;
     const int W = frame.points.width(), H = frame.points.height();
 
-    // Per-point balancing weight from the normal histogram of the (full) source frame.
-    std::vector<float> balance;
-    if (p.normal_balance_alpha > 0) {
-        std::array<int, 128> hist{};
-        int total = 0;
-        for (int y = 0; y < H; ++y)
-            for (int x = 0; x < W; ++x) {
-                const Vec3f& n = frame.normals(x, y);
-                if (frame.points(x, y).z() <= 0 || n.squaredNorm() == 0) continue;
-                ++hist[static_cast<std::size_t>(normal_bin(n))];
-                ++total;
-            }
-        int occupied = 0;
-        for (int c : hist) occupied += c > 0;
-        const double mean = occupied ? static_cast<double>(total) / occupied : 1.0;
-        std::array<float, 128> w_bin{};
-        for (std::size_t b = 0; b < hist.size(); ++b)
-            w_bin[b] = hist[b] ? static_cast<float>(std::pow(mean / hist[b], p.normal_balance_alpha)) : 0.0f;
-        // Cap the boost so a handful of noisy normals cannot dominate either.
-        for (auto& w : w_bin) w = std::min(w, 20.0f);
-        balance.assign(static_cast<std::size_t>(W * H), 1.0f);
-        for (int y = 0; y < H; ++y)
-            for (int x = 0; x < W; ++x) {
-                const Vec3f& n = frame.normals(x, y);
-                if (n.squaredNorm() > 0) balance[static_cast<std::size_t>(y * W + x)] = w_bin[static_cast<std::size_t>(normal_bin(n))];
-            }
-    }
+    const std::vector<float> balance = normal_balance_weights(frame, p.normal_balance_alpha);
 
     for (int level = p.levels - 1; level >= 0; --level) {
         const int step = 1 << level;
@@ -128,7 +161,7 @@ IcpResult icp_point_to_plane(const DepthFrame& frame, const RaycastResult& model
                             if (!balance.empty()) w *= balance[static_cast<std::size_t>(y * W + x)];
                             Vec6 J;
                             J.head<3>() = nq;             // translation (left-perturbation twist v, w)
-                            J.tail<3>() = pw.cross(nq);   // rotation
+                            J.tail<3>() = (pw - c).cross(nq);  // rotation about the centroid
                             acc.A.noalias() += w * J * J.transpose();
                             acc.b.noalias() -= w * J * r;
                             acc.sq += w * r * r;
@@ -149,7 +182,8 @@ IcpResult icp_point_to_plane(const DepthFrame& frame, const RaycastResult& model
             scale << 1, 1, 1, 0.01, 0.01, 0.01;  // x = S xs; xs rotations are mm of displacement at 100 mm
             const Mat6 As = scale.asDiagonal() * sys.A * scale.asDiagonal();
             const Vec6 bs = scale.cwiseProduct(sys.b);
-            const Vec6 prior_s = se3_log(T_init * T.inverse()).cwiseQuotient(scale);  // step back to the prediction
+            // Step back to the prediction, expressed as a twist about the centroid.
+            const Vec6 prior_s = twist_to_center(se3_log(T_init * T.inverse()), c).cwiseQuotient(scale);
 
             // Weak prior (motion-model uncertainty vs depth noise).
             const double s2 = p.data_sigma_mm * p.data_sigma_mm;
@@ -179,7 +213,7 @@ IcpResult icp_point_to_plane(const DepthFrame& frame, const RaycastResult& model
             if (level == 0) res.degenerate_basis = basis;
             const Vec6 dx = scale.cwiseProduct(xs);
             if (level == 0) res.degenerate_directions = degenerate;
-            T = se3_exp(dx) * T;
+            T = se3_exp(twist_from_center(dx, c)) * T;
 
             if (level == 0 && it == iters - 1) {
                 res.min_eigenvalue_ratio = eigen_ratio(sys.A);

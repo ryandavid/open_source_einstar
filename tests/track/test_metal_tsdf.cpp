@@ -111,3 +111,41 @@ TEST_CASE("Metal TSDF matches the CPU volume") {
     CHECK((*gpu_vol)->brick_count() == cpu_vol.brick_count());
     CHECK((*gpu_vol)->bricks_updated_since(1).size() > 0);
 }
+
+#include "einstar/track_metal/metal_icp.hpp"
+
+TEST_CASE("Metal ICP matches the CPU solver") {
+    auto ctx = gpu::Context::create();
+    REQUIRE(ctx.has_value());
+    auto icp = track_metal::MetalIcp::create(*ctx);
+    if (!icp) FAIL(icp.error().message);
+    TsdfVolume vol;
+    const SE3 pose0 = SE3::Identity();
+    vol.integrate(make_depth_frame(render_depth(pose0, kK), kK), pose0);
+    const auto model = vol.raycast(pose0, kK.scaled(0.5));
+
+    for (const Vec6 xi : {Vec6{1.5, -1.0, 2.0, 0.01, -0.015, 0.008}, Vec6{4.0, 2.0, -3.0, -0.02, 0.03, 0.015}}) {
+        const SE3 pose1 = se3_exp(xi);
+        auto f1 = make_depth_frame(render_depth(pose1, kK), kK);
+        f1.index = static_cast<std::uint64_t>(xi(0) * 10);
+        Stopwatch sw;
+        const auto cpu = icp_point_to_plane(f1, model, pose0, pose0, {});
+        const double cpu_ms = sw.elapsed_ms();
+        (void)(*icp)->solve(f1, model, pose0, pose0, {});  // warm-up
+        sw.reset();
+        const auto gpu = (*icp)->solve(f1, model, pose0, pose0, {});
+        const double gpu_ms = sw.elapsed_ms();
+        REQUIRE(gpu.converged);
+        const SE3 d = cpu.T_world_camera.inverse() * gpu.T_world_camera;
+        const SE3 e = pose1.inverse() * gpu.T_world_camera;
+        std::println("icp cpu {:.2f} ms, gpu {:.2f} ms (gpu time {:.2f} ms): gpu-cpu {:.4f} mm {:.5f} deg; gpu err {:.4f} mm | rms {:.4f}/{:.4f} inl {:.3f}/{:.3f} cov {:.3f}/{:.3f} eig {:.2e}/{:.2e} n {}/{}",
+                     cpu_ms, gpu_ms, (*icp)->last_gpu_ms(), translation_norm(d), rotation_angle(d) * 180 / M_PI, translation_norm(e),
+                     cpu.rms_mm, gpu.rms_mm, cpu.inlier_ratio, gpu.inlier_ratio, cpu.coverage, gpu.coverage,
+                     cpu.min_eigenvalue_ratio, gpu.min_eigenvalue_ratio, cpu.correspondences, gpu.correspondences);
+        CHECK(translation_norm(d) < 0.01);
+        CHECK(rotation_angle(d) * 180 / M_PI < 0.002);
+        CHECK(std::abs(cpu.rms_mm - gpu.rms_mm) < 0.002);
+        CHECK(std::abs(cpu.correspondences - gpu.correspondences) < cpu.correspondences / 100 + 5);
+        CHECK(std::abs(std::log(cpu.min_eigenvalue_ratio / gpu.min_eigenvalue_ratio)) < 0.05);
+    }
+}

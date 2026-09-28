@@ -1,4 +1,4 @@
-add_library(einstar_track_metal src/metal_tsdf.cpp)
+add_library(einstar_track_metal src/metal_tsdf.cpp src/metal_icp.cpp)
 add_library(einstar::track_metal ALIAS einstar_track_metal)
 target_include_directories(einstar_track_metal PUBLIC include PRIVATE src)
 target_link_libraries(einstar_track_metal PUBLIC einstar::track einstar::gpu)

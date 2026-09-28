@@ -22,6 +22,7 @@
 #include "einstar/fixtures/exstar_project.hpp"
 #include "einstar/sim/sim_transport.hpp"
 #include "einstar/track/tracker.hpp"
+#include "einstar/track_metal/metal_icp.hpp"
 #include "einstar/track_metal/metal_tsdf.hpp"
 
 using namespace einstar;
@@ -162,9 +163,14 @@ int track_fixture(const char* path, std::span<char*> args) {
         if (auto ctx = gpu::Context::create())
             if (auto v = track_metal::MetalTsdfVolume::create(*ctx)) volume = std::move(*v);
     }
-    std::println("volume: {}", volume ? "Metal" : "CPU");
+    std::unique_ptr<track_metal::MetalIcp> gpu_icp;
+    if (!has_flag(args, "--cpu") && !has_flag(args, "--cpu-icp"))
+        if (auto ctx = gpu::Context::create())
+            if (auto g = track_metal::MetalIcp::create(*ctx)) gpu_icp = std::move(*g);
+    std::println("volume: {}, icp: {}", volume ? "Metal" : "CPU", gpu_icp ? "Metal" : "CPU");
     track::Tracker tracker({}, std::move(volume));
-    std::vector<double> t_err, r_err, ms, rpe_t, rpe_r;
+    if (gpu_icp) tracker.set_icp_solver(gpu_icp->as_function());
+    std::vector<double> t_err, r_err, ms, rpe_t, rpe_r, eigs;
     std::optional<SE3> prev_ours, prev_theirs;
     int gross = 0;
     int accepted = 0, lost = 0, reloc = 0, degenerate = 0, processed = 0;
@@ -207,6 +213,7 @@ int track_fixture(const char* path, std::span<char*> args) {
             }
         }
         ms.push_back(r.ms);
+        if (r.icp.converged) eigs.push_back(r.icp.min_eigenvalue_ratio);
         if (r.accepted) {
             if (prev_ours && prev_theirs) {
                 const SE3 ours = prev_ours->inverse() * r.T_world_camera;
@@ -285,6 +292,8 @@ int track_fixture(const char* path, std::span<char*> args) {
     if (mesh_dist)
         std::println("geometric fit to reference mesh ({} sampled frames): median of medians {:.3f} mm, misfit frames {} ({:.1f}%)",
                      fit_checked, pct(fit_median, 0.5), fit_bad, 100.0 * fit_bad / std::max(1, fit_checked));
+    std::println("icp eigen ratio percentiles: p1 {:.1e} p5 {:.1e} p10 {:.1e} p25 {:.1e} p50 {:.1e}", pct(eigs, 0.01), pct(eigs, 0.05),
+                 pct(eigs, 0.10), pct(eigs, 0.25), pct(eigs, 0.5));
     std::println("time per frame: median {:.1f} ms p95 {:.1f} ms; model bricks {}", pct(ms, 0.5), pct(ms, 0.95),
                  tracker.volume().brick_count());
     return 0;

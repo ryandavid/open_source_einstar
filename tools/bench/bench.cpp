@@ -1,5 +1,7 @@
 // Stage-by-stage timing of the depth + tracking path (CPU reference vs GPU once ported).
 #include <filesystem>
+#include <array>
+#include <format>
 #include <functional>
 #include <print>
 
@@ -12,6 +14,7 @@
 #include "einstar/synth/speckle_scene.hpp"
 #include "einstar/track/icp.hpp"
 #include "einstar/track/tsdf.hpp"
+#include "einstar/track_metal/metal_icp.hpp"
 #include "einstar/track_metal/metal_tsdf.hpp"
 
 using namespace einstar;
@@ -115,5 +118,18 @@ int main() {
     time_it("icp (3 levels)", 20, [&] { (void)track::icp_point_to_plane(df, model, pose, pose, {}); });
     time_it("integrate", 20, [&] { (*mv)->integrate(df, pose); });
     time_it("extract all", 10, [&] { (void)(*mv)->extract_points(0); });
+    auto gicp = track_metal::MetalIcp::create(*ctx);
+    if (gicp) {
+        for (const auto iters : {std::array<int, 3>{1, 1, 1}, std::array<int, 3>{5, 5, 5}, std::array<int, 3>{15, 10, 8}}) {
+            track::IcpParams ip;
+            ip.iterations = iters;
+            TimingStats gt(20);
+            time_it(std::format("gpu icp iters {}/{}/{}", iters[0], iters[1], iters[2]).c_str(), 20, [&] {
+                (void)(*gicp)->solve(df, model, pose, pose, ip);
+                gt.add((*gicp)->last_gpu_ms());
+            });
+            std::println("{:28} gpu-side median {:.2f} ms", "", gt.median());
+        }
+    }
     return 0;
 }

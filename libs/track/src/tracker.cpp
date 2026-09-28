@@ -35,12 +35,12 @@ SE3 Tracker::predict(double t) const {
         const Vec3 v_world = R * xi.head<3>() - w_world.cross(last_pose_.translation());
         Vec6 xw;
         xw << v_world, w_world;
-        Vec6 xs = xw.cwiseQuotient(scale);
+        Vec6 xs = twist_to_center(xw, degenerate_center_).cwiseQuotient(scale);
         for (int d = 0; d < degenerate_dirs_; ++d) {
             const Vec6 v = degenerate_basis_.col(d);
             xs -= v * v.dot(xs);
         }
-        xw = xs.cwiseProduct(scale);
+        xw = twist_from_center(xs.cwiseProduct(scale), degenerate_center_);
         return se3_exp(xw) * last_pose_;
     }
     return last_pose_ * se3_exp(xi);
@@ -130,13 +130,13 @@ TrackResult Tracker::process(const DepthFrame& frame) {
     std::string last_reason = "no seed";
     for (const SE3& seed : seeds) {
         const RaycastResult model = volume_->raycast(seed, mk);
-        IcpResult r = icp_point_to_plane(frame, model, seed, seed, icp);
+        IcpResult r = icp_(frame, model, seed, seed, icp);
         // A second pass re-rendered from the refined pose tightens associations after large motion.
         if (r.converged && translation_norm(seed.inverse() * r.T_world_camera) > 2.0) {
             const RaycastResult model2 = volume_->raycast(r.T_world_camera, mk);
             IcpParams fine = params_.icp;
             fine.levels = 1;
-            const IcpResult r2 = icp_point_to_plane(frame, model2, r.T_world_camera, r.T_world_camera, fine);
+            const IcpResult r2 = icp_(frame, model2, r.T_world_camera, r.T_world_camera, fine);
             if (r2.converged) r = r2;
         }
         const bool strict = state_ == TrackState::lost || state_ == TrackState::confirming;
@@ -154,7 +154,7 @@ TrackResult Tracker::process(const DepthFrame& frame) {
         (lost_frames_ % std::max(1, params_.global_reloc_every)) == 0) {
         if (auto seed = global_candidate(frame)) {
             const RaycastResult model = volume_->raycast(*seed, mk);
-            const IcpResult r = icp_point_to_plane(frame, model, *seed, *seed, params_.icp);
+            const IcpResult r = icp_(frame, model, *seed, *seed, params_.icp);
             const auto verdict = check(r, *seed, 0.1, true);  // motion gate is meaningless here
             if (!verdict) best = r;
             else last_reason = "global reloc rejected: " + *verdict;
@@ -183,6 +183,7 @@ TrackResult Tracker::process(const DepthFrame& frame) {
     out.degenerate = best->min_eigenvalue_ratio < params_.degenerate_eigen_ratio || best->degenerate_directions > 0;
     degenerate_dirs_ = best->degenerate_directions;
     degenerate_basis_ = best->degenerate_basis;
+    degenerate_center_ = best->center;
 
     lost_frames_ = 0;
     if (state_ == TrackState::lost || state_ == TrackState::confirming) {

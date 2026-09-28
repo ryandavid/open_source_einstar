@@ -80,7 +80,16 @@ std::unique_ptr<track::Volume> make_volume(const ScanPipelineParams& p) {
 }  // namespace
 
 ScanPipeline::ScanPipeline(std::unique_ptr<StereoFrontend> frontend, ScanPipelineParams params, Sink sink)
-    : frontend_(std::move(frontend)), params_(params), sink_(std::move(sink)), tracker_(params.tracker, make_volume(params)) {}
+    : frontend_(std::move(frontend)), params_(params), sink_(std::move(sink)), tracker_(params.tracker, make_volume(params)) {
+    if (params_.gpu_volume) {
+        if (auto ctx = gpu::Context::create())
+            if (auto icp = track_metal::MetalIcp::create(*ctx)) {
+                gpu_icp_ = std::move(*icp);
+                tracker_.set_icp_solver(gpu_icp_->as_function());
+            }
+        log::info("tracking: {} volume, {} ICP", tracker_.volume().fast_full_extraction() ? "Metal" : "CPU", gpu_icp_ ? "Metal" : "CPU");
+    }
+}
 
 ScanPipeline::~ScanPipeline() { stop(); }
 
