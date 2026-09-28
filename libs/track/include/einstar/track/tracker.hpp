@@ -72,6 +72,11 @@ struct TrackerParams {
     // candidate within this distance of where tracking was lost.
     double ambiguous_reloc_max_mm = 150.0;
     double feature_model_rebuild_growth = 0.15;  // rebuild descriptors (in the background) when the model grew by 15%
+    // ...but while tracking at most once per this many frames (~10 s): early in a scan the model grows
+    // 15% every few frames, and rebuilding that often cost ~15 ms of CPU per frame. When tracking is
+    // lost, a model missing surface added since its snapshot is rebuilt at once.
+    int feature_model_min_interval_frames = 150;
+    double feature_model_loss_growth = 0.02;  // while lost: rebuild when the model grew this much since the snapshot
 };
 
 struct TrackResult {
@@ -158,6 +163,7 @@ private:
     int lost_frames_ = 0;
     std::unique_ptr<GlobalRelocaliser> reloc_;  // created on first use
     std::size_t feature_model_bricks_ = 0;      // model size at the last descriptor snapshot
+    std::int64_t feature_model_frame_ = 0;      // frame of the last descriptor snapshot
     std::int64_t frame_no_ = 0;                 // frames processed (the relocaliser's clock)
     std::uint32_t reloc_seed_ = 1;
     SE3 lost_pose_ = SE3::Identity();  // last trusted pose before the loss

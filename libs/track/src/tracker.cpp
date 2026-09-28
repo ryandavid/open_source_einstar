@@ -14,6 +14,7 @@ void Tracker::reset(bool keep_fixed_markers) {
     volume_->clear();
     if (reloc_) reloc_->clear();
     feature_model_bricks_ = 0;
+    feature_model_frame_ = frame_no_;
     if (keep_fixed_markers) {
         std::vector<markers::MapMarker> fixed;
         for (const auto& m : map_.markers())
@@ -85,6 +86,7 @@ void Tracker::refresh_feature_model(double& wait_ms) {
     // While tracking, keep a descriptor model of the surface current in the background so a loss can
     // query it immediately.
     if (!params_.global_relocalization || !params_.fuse_surface || frame_no_ % 10 != 0) return;
+    if (frame_no_ - feature_model_frame_ < params_.feature_model_min_interval_frames) return;
     auto& rl = relocaliser();
     (void)rl.model(frame_no_, wait_ms);  // adopt a finished rebuild
     if (rl.model_pending()) return;
@@ -94,6 +96,7 @@ void Tracker::refresh_feature_model(double& wait_ms) {
          static_cast<double>(bricks) <= static_cast<double>(feature_model_bricks_) * (1.0 + params_.feature_model_rebuild_growth)))
         return;
     feature_model_bricks_ = bricks;
+    feature_model_frame_ = frame_no_;
     rl.submit_model(volume_->extract_points(0, 1.0f, false), frame_no_ + params_.feature_model_latency_frames);
 }
 
@@ -254,9 +257,15 @@ std::optional<IcpResult> Tracker::global_relocalise(const DepthFrame& frame, std
     }
     if (!found && !rl.query_pending()) {
         auto model = rl.model(frame_no_, wait_ms);
-        if (!model && !rl.model_pending()) {
-            // Lost before the first background rebuild: start one now.
-            feature_model_bricks_ = volume_->brick_count();
+        // Lost with no model, or one that misses surface added since its snapshot (background rebuilds
+        // are rate-limited while tracking, and the scanner may be over exactly that new part): rebuild
+        // now; queries use the old one until it is ready.
+        const std::size_t bricks = volume_->brick_count();
+        const bool stale = !model || static_cast<double>(bricks) >
+                                         static_cast<double>(feature_model_bricks_) * (1.0 + params_.feature_model_loss_growth);
+        if (stale && !rl.model_pending() && bricks > 0) {
+            feature_model_bricks_ = bricks;
+            feature_model_frame_ = frame_no_;
             rl.submit_model(volume_->extract_points(0, 1.0f, false), frame_no_ + params_.feature_model_latency_frames);
         }
         if (model && !model->empty()) {

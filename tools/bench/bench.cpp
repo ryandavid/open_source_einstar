@@ -116,6 +116,8 @@ static void bench_pipeline(const RigCalibration& rig) {
         std::filesystem::remove_all(dir);
         pipeline::ScanPipelineParams pp;
         pp.block_when_full = true;
+        pp.tracker.deterministic_relocalisation = false;  // as live: never wait for the relocaliser
+        if (std::getenv("EINSTAR_BENCH_NO_GLOBAL_RELOC")) pp.tracker.global_relocalization = false;
         pipeline::StereoFrontendParams fp;
         fp.detect_markers = markers;
         std::atomic<int> done{0};
