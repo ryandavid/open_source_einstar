@@ -39,6 +39,7 @@ public:
     void stop_scan();
     Result<void> apply(const ScanSettings& s);
     void reset_model() { pipeline_->reset_model(); }
+    [[nodiscard]] pipeline::ScanPipeline& pipeline() { return *pipeline_; }
     Result<double> temperature() { return device_->temperature_c(); }
     void set_distance_indication(float mean_depth_mm);
 

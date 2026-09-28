@@ -32,7 +32,7 @@ namespace {
 int usage() {
     std::println(stderr,
                  "usage: einstar-cli probe [--verbose] | sim-probe | calib <dir> |\n"
-                 "       track-fixture <project.ir_E10_prj> [--start N] [--count N] [--skip K] [--stl ref.stl] [--cpu] [--mode geometry|hybrid|markers] [--quiet]");
+                 "       track-fixture <project.ir_E10_prj> [--start N] [--count N] [--skip K] [--stl ref.stl] [--cpu] [--mode geometry|hybrid|markers] [--global-markers] [--marker-confirm N] [--quiet]");
     return 2;
 }
 
@@ -172,9 +172,18 @@ int track_fixture(const char* path, std::span<char*> args) {
     for (std::size_t a = 0; a + 1 < args.size(); ++a)
         if (std::string_view(args[a]) == "--mode") mode = args[a + 1];
     tp.mode = mode == "geometry" ? track::AlignMode::geometry : mode == "markers" ? track::AlignMode::markers : track::AlignMode::hybrid;
+    tp.marker_map.min_observations = static_cast<int>(arg_int(args, "--marker-confirm", tp.marker_map.min_observations));
     std::println("volume: {}, icp: {}, mode: {}", volume ? "Metal" : "CPU", gpu_icp ? "Metal" : "CPU", mode);
     track::Tracker tracker(tp, std::move(volume));
     if (gpu_icp) tracker.set_icp_solver(gpu_icp->as_function());
+    if (has_flag(args, "--global-markers")) {
+        // EXStar's final marker map from the project header as a fixed global-marker map: the scan
+        // then starts by locating itself on it, in EXStar's world frame.
+        std::vector<markers::MapMarker> map;
+        for (const auto& m : (*proj)->global_markers()) map.push_back({m.id, m.position, m.diameter > 1.5 ? m.diameter : 6.0, 1, true});
+        std::println("global markers: {} fixed markers from the project header", map.size());
+        tracker.set_marker_map(std::move(map));
+    }
     std::vector<double> t_err, r_err, ms, rpe_t, rpe_r, eigs;
     std::optional<SE3> prev_ours, prev_theirs;
     int gross = 0;
@@ -273,15 +282,17 @@ int track_fixture(const char* path, std::span<char*> args) {
         const long trace_from = arg_int(args, "--trace-from", -1), trace_to = arg_int(args, "--trace-to", -1);
         if (i >= trace_from && i <= trace_to) {
             const SE3 d = f->T_world_camera.inverse() * r.T_world_camera;
-            std::println("trace {:5} {:10} err {:6.2f} mm {:5.2f} deg  rms {:.3f} inl {:.2f} cov {:.2f} eig {:.1e} {}", i,
+            std::println("trace {:5} {:10} err {:6.2f} mm {:5.2f} deg  rms {:.3f} inl {:.2f} cov {:.2f} eig {:.1e} markers {}/{} "
+                         "mrms {:.3f} mpose {} {}", i,
                          r.accepted ? (r.degenerate ? "ok-degen" : "ok") : "not-acc", translation_norm(d),
                          rotation_angle(d) * 180.0 / M_PI, r.icp.rms_mm, r.icp.inlier_ratio, r.icp.coverage,
-                         r.icp.min_eigenvalue_ratio, r.reason);
+                         r.icp.min_eigenvalue_ratio, r.markers_matched, r.markers_seen, r.icp.marker_rms_mm, r.marker_pose, r.reason);
         }
-        if (!quiet && (!r.accepted || processed % 100 == 0)) {
-            std::println("frame {:5} {:6} rms {:.3f} inl {:.2f} cov {:.2f} eig {:.1e}  {:5.1f} ms  bricks {}  {}", i,
+        if (!quiet && (!r.accepted || r.relocalized || processed % 100 == 0)) {
+            std::println("frame {:5} {:6} rms {:.3f} inl {:.2f} cov {:.2f} eig {:.1e}  {:5.1f} ms  bricks {}  markers {}/{}  {}", i,
                          r.accepted ? (r.relocalized ? "reloc" : "ok") : "LOST", r.icp.rms_mm, r.icp.inlier_ratio,
-                         r.icp.coverage, r.icp.min_eigenvalue_ratio, r.ms, tracker.volume().brick_count(), r.reason);
+                         r.icp.coverage, r.icp.min_eigenvalue_ratio, r.ms, tracker.volume().brick_count(), r.markers_matched,
+                         r.markers_seen, r.reason);
         }
     }
     auto pct = [](std::vector<double> v, double p) {

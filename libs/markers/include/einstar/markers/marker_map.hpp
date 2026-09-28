@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <optional>
 #include <random>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -47,6 +48,12 @@ struct MapParams {
     int min_inliers = 4;
     double min_inlier_fraction = 0.6;  // of the frame's markers, for relocalisation
     int ransac_iterations = 300;
+    // New markers are candidates until re-observed at the same world position this many times.
+    // Candidates help tracking near a pose guess (associations there are verified by RANSAC), but only
+    // confirmed (or fixed) markers are used for pose-free relocalisation, reported, drawn and bundle
+    // adjusted. Keeps one-off phantoms (e.g. a speckle dot that passed detection; it moves with the
+    // projector, so it never re-appears in place) out of the map.
+    int min_observations = 2;
 };
 
 class MarkerMap {
@@ -62,7 +69,10 @@ public:
     // Replace the map (e.g. with an optimised global-marker map). `fixed` markers are not moved by updates.
     void set_markers(std::vector<MapMarker> markers);
 
-    [[nodiscard]] std::optional<int> nearest(const Vec3& world, double radius_mm) const;
+    [[nodiscard]] std::optional<int> nearest(const Vec3& world, double radius_mm, bool confirmed_only = false) const;
+    [[nodiscard]] bool confirmed(const MapMarker& m) const { return m.fixed || m.observations >= params_.min_observations; }
+    [[nodiscard]] std::size_t confirmed_count() const;
+    void confirm_all();  // e.g. the first frame of a scan defines the map
 
     // Associate frame markers using a pose guess, then refine the pose on the inliers.
     [[nodiscard]] std::optional<PoseEstimate> track(const std::vector<Vec3>& frame_markers, const SE3& T_guess) const;
@@ -90,5 +100,9 @@ private:
     mutable std::vector<Pair> pairs_;
     mutable bool pairs_dirty_ = true;
 };
+
+// Plain-text marker map ("id x y z diameter" per line, mm) for saving global-marker maps.
+[[nodiscard]] bool save_markers(const std::string& path, const std::vector<MapMarker>& markers);
+[[nodiscard]] std::optional<std::vector<MapMarker>> load_markers(const std::string& path);
 
 }  // namespace einstar::markers

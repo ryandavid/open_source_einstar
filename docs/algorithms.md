@@ -362,6 +362,19 @@ Likely causes of "0 markers", in order:
 
 ---
 
+### 2.9 Our implementation (differences from EXStar)
+
+Written from the notes above, not from EXStar's code.
+
+- **Detection** (`libs/markers/detect`): threshold blobs → sub-pixel contour at the half level between the local background and the peak, restricted to the blob's own box → Fitzgibbon ellipse fit with residual, axis-ratio and angular-coverage checks → **dark-ring test** (samples at 1.4× the ellipse must stay within 20% of the disc contrast above the background). The ring test is what separates stickers from laser speckle dots, which pass every shape test.
+- **Stereo** (`libs/markers/stereo`): centres are undistorted and rectified. Candidate pairs are gated by row error, depth range, left/right size agreement and physical diameter (6 mm by default). A disparity prior comes from the dense depth in an annulus just outside the sticker ring, because the sticker itself leaves a hole in the speckle depth. Markers with no surface around them are rejected unless dense stereo can't exist there (outside either rectified view). Pairings that aren't unique are dropped rather than guessed.
+- **Map** (`libs/markers/marker_map`):
+  - Association is RANSAC over triplets with a least-squares refit and re-association. EXStar's greedy association lets a few wrong pairs drag the pose.
+  - New markers are candidates until they are re-observed in place. Candidates can help tracking near a pose guess, but they are never used for relocalisation, bundle adjustment or display.
+  - Relocalisation uses pairwise-distance triangle signatures, verified on all frame markers.
+- **Tracking**: joint marker + point-to-plane ICP. Marker terms are weighted and centred like the surface terms, in both the CPU and Metal solvers. Markers can override a failing surface check only with at least 4 inliers.
+- **Global markers**: a markers-only capture pass collects keyframes (pose, identified markers, rectified left/right centres). A Ceres bundle adjustment then minimises the stereo reprojection error of every marker centre over keyframe poses and marker positions, with a Huber loss, outlier removal and the first keyframe fixed. EXStar keeps only a running mean with no adjustment. The result becomes a fixed map; a later scan starts by relocalising onto it and tracks in its frame.
+
 ## 3. Tuning database `config.db`
 
 - Opened by `libSn3DConfig.dylib` `Sn3DConfigSQLite::open` (0x7598) through the Qt SQL driver **`SQLITECIPHER`** (`PlugIns/sqldrivers/libsqlitecipher.dylib` = *SQLite3 Multiple Ciphers 1.3.5*, SQLite 3.37.0).

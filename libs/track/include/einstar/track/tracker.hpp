@@ -29,6 +29,9 @@ struct TrackerParams {
     double marker_weight = 200.0;         // see IcpParams::marker_weight
     double max_marker_rms_mm = 0.5;       // markers must agree with the final pose this well
     int min_marker_inliers = 3;
+    // Markers may override a failing surface check only with redundancy: any 3 markers define a
+    // rigid pose exactly, so 3 wrong associations are self-consistent.
+    int min_marker_override_inliers = 4;
     TsdfParams tsdf;
     IcpParams icp;
     double model_scale = 0.5;           // raycast resolution relative to the depth frame
@@ -92,7 +95,11 @@ public:
     // Replace the marker map (e.g. an optimised global-marker map, markers flagged fixed).
     void set_marker_map(std::vector<markers::MapMarker> m) { map_.set_markers(std::move(m)); }
     [[nodiscard]] const SE3& last_good_pose() const { return last_pose_; }
-    void reset();
+    // Mode / fusion switches take effect from the next frame.
+    [[nodiscard]] TrackerParams& params() { return params_; }
+    [[nodiscard]] const TrackerParams& params() const { return params_; }
+    // Clears the model and tracking state; fixed (global) markers survive when asked to.
+    void reset(bool keep_fixed_markers = false);
 
 private:
     [[nodiscard]] SE3 predict(double t) const;

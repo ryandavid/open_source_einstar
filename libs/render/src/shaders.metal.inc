@@ -74,14 +74,21 @@ vertex SplatOut marker_vs(uint vid [[vertex_id]], uint iid [[instance_id]],
                           const device MarkerInstance* ms [[buffer(0)]],
                           constant Uniforms& u [[buffer(1)]]) {
     MarkerInstance m = ms[iid];
-    float3 n = normalize(float3(m.normal));
-    float3 t = normalize(abs(n.z) < 0.9 ? cross(n, float3(0, 0, 1)) : cross(n, float3(1, 0, 0)));
-    float3 b = cross(n, t);
     float2 c = kCorners[vid];
     float r = m.radius * 1.6;  // include the rim
-    float3 world = float3(m.pos) + (t * c.x + b * c.y) * r + n * 0.05;
     SplatOut o;
-    o.position = u.proj * u.view * float4(world, 1.0);
+    if (length(float3(m.normal)) < 0.1) {
+        // No normal (map markers): camera-facing disc, nudged towards the viewer.
+        float4 vp = u.view * float4(float3(m.pos), 1.0);
+        vp.xyz += float3(c * r, 0) + normalize(-vp.xyz) * 0.1;
+        o.position = u.proj * vp;
+    } else {
+        float3 n = normalize(float3(m.normal));
+        float3 t = normalize(abs(n.z) < 0.9 ? cross(n, float3(0, 0, 1)) : cross(n, float3(1, 0, 0)));
+        float3 b = cross(n, t);
+        float3 world = float3(m.pos) + (t * c.x + b * c.y) * r + n * 0.05;
+        o.position = u.proj * u.view * float4(world, 1.0);
+    }
     o.corner = c;
     o.color = float4(m.color) / 255.0;
     return o;

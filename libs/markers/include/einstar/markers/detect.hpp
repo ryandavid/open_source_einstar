@@ -7,6 +7,7 @@
 //    (robust for saturated markers), traced by marching squares.
 // 3. Direct least-squares ellipse fit (Fitzgibbon) with residual, axis-ratio and angular-coverage
 //    checks. The marker centre is the ellipse centre.
+// 4. The sticker's dark ring must surround the disc (rejects laser speckle and highlights).
 
 #include <cstdint>
 #include <vector>
@@ -25,6 +26,11 @@ struct DetectParams {
     double max_axis_ratio = 3.0;    // fitted a/b (foreshortening limit, ~70 deg)
     double max_residual_px = 0.35;  // RMS geometric residual of contour points
     double min_coverage = 0.7;      // fraction of 12 angular sectors with contour points
+    double ring_scale = 1.4;        // dark-ring test at this multiple of the fitted ellipse (0 = off)
+    // Ring samples must stay within this fraction of the disc contrast above the background (a
+    // Gaussian speckle dot is still at ~26% of its peak there; the sticker ring is near black).
+    double ring_max_contrast = 0.2;
+    double max_ring_bright_fraction = 0.1;
     int border = 4;
 };
 

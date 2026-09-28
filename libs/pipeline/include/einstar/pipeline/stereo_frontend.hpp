@@ -9,6 +9,8 @@
 #include "einstar/calib/rectify.hpp"
 #include "einstar/depth/stereo.hpp"
 #include "einstar/depth_metal/metal_stereo.hpp"
+#include "einstar/markers/detect.hpp"
+#include "einstar/markers/stereo.hpp"
 #include "einstar/track/frame.hpp"
 #include "einstar/usb/stream.hpp"
 
@@ -22,13 +24,19 @@ struct StereoFrontendParams {
     double max_depth_mm = 700.0;
     depth::RefineParams refine;
     depth::SpeckleParams speckle{100, 1.0f};
+    bool detect_markers = true;
+    markers::DetectParams marker_detect;
+    markers::StereoParams marker_stereo{.require_prior = true};
 };
 
 struct DepthOutput {
     track::DepthFrame frame;
     ImageU8 rectified_left;   // half resolution, for previews
     ImageU8 rectified_right;
+    std::vector<markers::Marker3D> markers;  // also in frame.markers (same order)
+    std::vector<Vec2> unmatched_left;       // rectified full-resolution centres of left detections without a match
     double stereo_ms = 0;
+    double marker_ms = 0;
 };
 
 class StereoFrontend {
@@ -48,14 +56,18 @@ public:
     [[nodiscard]] const track::Intrinsics& depth_intrinsics() const { return depth_k_; }
     [[nodiscard]] bool using_gpu() const { return metal_ != nullptr; }
     [[nodiscard]] const calib::StereoRectification& rectification() const { return rect_; }
+    [[nodiscard]] const markers::MarkerStereo& marker_stereo() const { return *marker_stereo_; }
 
 private:
+    void add_markers(const ImageU8& raw_left, const ImageU8& raw_right, DepthOutput& out) const;
+
     StereoFrontendParams params_;
     calib::StereoRectification rect_;
     calib::RemapTable map_left_, map_right_;
     depth::StereoParams stereo_;
     track::Intrinsics depth_k_;
     int left_sensor_ = 0;
+    std::unique_ptr<markers::MarkerStereo> marker_stereo_;
     std::unique_ptr<depth_metal::MetalStereo> metal_;
     mutable std::mutex metal_mutex_;
 };

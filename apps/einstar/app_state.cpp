@@ -72,6 +72,65 @@ void AppState::apply_settings() {
     if (session_ && session_->scanning()) (void)session_->apply(settings);
 }
 
+void AppState::set_phase(pipeline::ScanPhase phase) {
+    if (session_) session_->pipeline().set_phase(phase);
+    std::lock_guard lock(mutex_);
+    trail_.clear();
+}
+
+void AppState::set_align_mode(track::AlignMode mode) {
+    if (session_) session_->pipeline().set_surface_mode(mode);
+}
+
+void AppState::optimize_global_markers() {
+    if (!session_) return;
+    {
+        std::lock_guard lock(mutex_);
+        global_status_ = "Optimising...";
+    }
+    session_->pipeline().optimize_global_markers([this](const pipeline::GlobalMarkerReport& r) {
+        std::lock_guard lock(mutex_);
+        global_status_ = r.error.empty()
+                             ? std::format("{} markers from {} keyframes, reprojection {:.3f} px ({} outliers), max correction {:.2f} mm",
+                                           r.markers, r.keyframes, r.bundle.rms_after_px, r.bundle.outliers_removed, r.max_shift_mm)
+                             : "Not optimised: " + r.error;
+    });
+}
+
+void AppState::clear_global_markers() {
+    if (session_) session_->pipeline().clear_global_markers();
+    std::lock_guard lock(mutex_);
+    global_status_.clear();
+}
+
+bool AppState::save_global_markers(const std::string& path) {
+    if (!session_) return false;
+    const auto map = session_->pipeline().global_markers();
+    const bool ok = !map.empty() && markers::save_markers(path, map);
+    std::lock_guard lock(mutex_);
+    global_status_ = ok ? std::format("Saved {} markers to {}", map.size(), path)
+                        : map.empty() ? "Nothing to save: optimise a global-marker capture first" : "Could not write " + path;
+    return ok;
+}
+
+bool AppState::load_global_markers(const std::string& path) {
+    if (!session_) return false;
+    auto map = markers::load_markers(path);
+    std::lock_guard lock(mutex_);
+    if (!map || map->empty()) {
+        global_status_ = "Could not read a marker map from " + path;
+        return false;
+    }
+    global_status_ = std::format("Loaded {} global markers", map->size());
+    session_->pipeline().set_global_markers(std::move(*map));
+    return true;
+}
+
+std::string AppState::global_marker_status() const {
+    std::lock_guard lock(mutex_);
+    return global_status_;
+}
+
 void AppState::update() {
     if (toggle_requested_.exchange(false)) toggle_scan();
     if (!session_ || housekeeping_.elapsed_ms() < 500) return;
@@ -110,6 +169,8 @@ void AppState::on_live_update(pipeline::LiveUpdate&& u) {
     if (u.frame_buffer) up.frame_gpu = GpuPoints{std::move(u.frame_buffer), u.frame_buffer_count};
     up.ir_left = std::move(u.preview_left);
     up.ir_right = std::move(u.preview_right);
+    up.markers = std::move(u.markers);
+    up.preview_markers = std::move(u.preview_markers);
 
     const float fx = 579.0f, fy = 579.0f, cx = 320.0f, cy = 256.0f;  // display frustum only
     std::lock_guard lock(mutex_);
@@ -136,6 +197,13 @@ void AppState::on_live_update(pipeline::LiveUpdate&& u) {
     hud_.dropped = static_cast<int>(st.dropped);
     hud_.distance_mm = st.mean_depth_mm;
     hud_.model_points = st.model_points;
+    hud_.markers = st.markers_in_frame;
+    hud_.markers_matched = st.markers_matched;
+    hud_.map_markers = st.map_markers;
+    hud_.global_markers = st.global_markers;
+    hud_.keyframes = st.keyframes;
+    hud_.marker_ms = static_cast<float>(st.marker_ms);
+    hud_.phase = st.phase;
     // Working range 175..625 mm mapped onto the 10-step bar.
     hud_.distance_step = st.mean_depth_mm > 0 ? std::clamp(static_cast<int>((st.mean_depth_mm - 175.0f) / 45.0f), 0, 9) : -1;
     last_depth_ = st.mean_depth_mm;
@@ -158,6 +226,8 @@ void AppState::on_live_update(pipeline::LiveUpdate&& u) {
     pending_->lines = std::move(up.lines);
     pending_->ir_left = std::move(up.ir_left);
     pending_->ir_right = std::move(up.ir_right);
+    pending_->markers = std::move(up.markers);
+    pending_->preview_markers = std::move(up.preview_markers);
     pending_->scanner_pose = up.scanner_pose;
 }
 

@@ -10,9 +10,17 @@ namespace einstar::track {
 Tracker::Tracker(TrackerParams params, std::unique_ptr<Volume> volume)
     : params_(params), volume_(volume ? std::move(volume) : std::make_unique<TsdfVolume>(params.tsdf)), map_(params.marker_map) {}
 
-void Tracker::reset() {
+void Tracker::reset(bool keep_fixed_markers) {
     volume_->clear();
-    map_.clear();
+    if (keep_fixed_markers) {
+        std::vector<markers::MapMarker> fixed;
+        for (const auto& m : map_.markers())
+            if (m.fixed) fixed.push_back(m);
+        map_.set_markers(std::move(fixed));
+    } else {
+        map_.clear();
+    }
+    initial_pose_.reset();
     state_ = TrackState::initializing;
     have_velocity_ = false;
 }
@@ -105,15 +113,30 @@ TrackResult Tracker::process(const DepthFrame& frame) {
             fm.push_back(m.position);
             fd.push_back(m.diameter);
         }
-    out.markers_seen = static_cast<int>(fm.size());
+    out.markers_seen = static_cast<int>(frame.markers.size());
 
     if (state_ == TrackState::initializing) {
-        last_pose_ = prev_pose_ = initial_pose_.value_or(SE3::Identity());
+        SE3 start = initial_pose_.value_or(SE3::Identity());
+        if (!map_.empty() && params_.mode != AlignMode::geometry) {
+            // A (global) marker map already exists: the scan starts in its coordinate frame, so the
+            // first frame must be located against it.
+            std::optional<markers::PoseEstimate> p;
+            if (use_markers) p = map_.relocalize(fm, reloc_seed_++);
+            if (!p || static_cast<int>(p->inliers.size()) < params_.min_marker_inliers) {
+                out.state = state_;
+                out.reason = use_markers ? "markers do not match the global marker map" : "no markers in view to start on the global marker map";
+                out.ms = sw.elapsed_ms();
+                return out;
+            }
+            start = p->T_world_camera;
+        }
+        last_pose_ = prev_pose_ = start;
         if (params_.fuse_surface) volume_->integrate(frame, last_pose_);
         if (use_markers) {
             map_.update(fm, fd, last_pose_, {});
+            map_.confirm_all();  // the first frame defines the map
             for (std::size_t i = 0; i < fm.size(); ++i)
-                if (auto slot = map_.nearest(last_pose_ * fm[i], params_.marker_map.merge_radius_mm))
+                if (auto slot = map_.nearest(last_pose_ * fm[i], params_.marker_map.merge_radius_mm, true))
                     out.marker_ids.emplace_back(static_cast<int>(i), map_.markers()[static_cast<std::size_t>(*slot)].id);
         }
         last_time_ = prev_time_ = t;
@@ -176,10 +199,9 @@ TrackResult Tracker::process(const DepthFrame& frame) {
         auto verdict = check(r, last_pose_, state_ == TrackState::lost ? 0.5 : dt, strict);
         // Markers are an independent identity check: a pose they agree with is accepted even when the
         // surface overlap alone would be too weak (new areas, featureless or symmetric parts).
-        if (mpose && r.converged && r.marker_rms_mm <= params_.max_marker_rms_mm &&
-            static_cast<int>(icp.markers.size()) >= params_.min_marker_inliers)
-            verdict.reset();
-        if (params_.mode == AlignMode::markers && mpose && (!r.converged || r.marker_rms_mm > params_.max_marker_rms_mm)) {
+        const bool marker_redundant = mpose && static_cast<int>(icp.markers.size()) >= params_.min_marker_override_inliers;
+        if (marker_redundant && r.converged && r.marker_rms_mm <= params_.max_marker_rms_mm) verdict.reset();
+        if (params_.mode == AlignMode::markers && marker_redundant && (!r.converged || r.marker_rms_mm > params_.max_marker_rms_mm)) {
             // Markers-only mode: fall back to the marker pose when the surface disagrees.
             r.T_world_camera = mpose->T_world_camera;
             r.converged = true;
@@ -274,7 +296,7 @@ TrackResult Tracker::process(const DepthFrame& frame) {
         map_.update(fm, fd, out.T_world_camera, matched);
         // Report ids after the update (new markers now have ids too).
         for (std::size_t i = 0; i < fm.size(); ++i)
-            if (auto slot = map_.nearest(out.T_world_camera * fm[i], params_.marker_map.merge_radius_mm))
+            if (auto slot = map_.nearest(out.T_world_camera * fm[i], params_.marker_map.merge_radius_mm, true))
                 out.marker_ids.emplace_back(static_cast<int>(i), map_.markers()[static_cast<std::size_t>(*slot)].id);
     }
     prev_pose_ = last_pose_;

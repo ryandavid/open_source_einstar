@@ -3,6 +3,7 @@
 #include <cmath>
 #include <filesystem>
 #include <format>
+#include <random>
 
 #include "einstar/calib/device_calibration.hpp"
 #include "einstar/core/log.hpp"
@@ -60,6 +61,15 @@ std::shared_ptr<EmulatorScene> make_scene(const RigCalibration& rig) {
     e->projector.model.cx = 640;
     e->projector.model.cy = 400;
     e->projector.pattern = synth::DotPattern::random(1280, 800, 9000, 3.5, 11);
+    // Marker stickers scattered over the table (irregular, >= 24 mm apart).
+    std::mt19937 rng(5);
+    std::uniform_real_distribution<double> ux(-260, 120), uz(-150, 170);
+    for (int tries = 0; tries < 20000 && e->scene.markers.size() < 60; ++tries) {
+        const Vec3 c(ux(rng), 70.0, uz(rng));
+        bool ok = true;
+        for (const auto& m : e->scene.markers) ok = ok && (m.center - c).norm() > 24.0;
+        if (ok) e->scene.markers.push_back({c, Vec3(0, -1, 0), 6.0, 10.0});
+    }
     return e;
 }
 

@@ -34,6 +34,9 @@ std::vector<Marker3D> MarkerStereo::reconstruct(const std::vector<Ellipse>& left
         Marker3D m;
     };
     std::vector<Candidate> cands;
+    std::vector<double> priors(left.size(), -1.0);
+    if (prior)
+        for (std::size_t i = 0; i < left.size(); ++i) priors[i] = prior(rl[i], left[i].a);
     for (std::size_t i = 0; i < left.size(); ++i)
         for (std::size_t j = 0; j < right.size(); ++j) {
             const double dy = std::abs(rl[i].y() - rr[j].y());
@@ -41,8 +44,15 @@ std::vector<Marker3D> MarkerStereo::reconstruct(const std::vector<Ellipse>& left
             const double d = rl[i].x() - rr[j].x();
             if (d <= 0) continue;
             double prior_err = 0;
-            if (prior) {
-                const double dp = prior(rl[i]);
+            {
+                const double dp = priors[i];
+                if (prior && params_.require_prior && dp < 0) {
+                    // No surface around it: only acceptable where dense stereo cannot exist anyway (the
+                    // right view of this point falls outside the rectified image).
+                    const auto& rc = rect_.rectified;
+                    const bool unverifiable = rr[j].x() < 0 || rr[j].x() >= rc.width || rr[j].y() < 0 || rr[j].y() >= rc.height;
+                    if (!unverifiable) continue;
+                }
                 if (dp > 0) {
                     prior_err = std::abs(d - dp);
                     if (prior_err > params_.prior_tolerance_px) continue;

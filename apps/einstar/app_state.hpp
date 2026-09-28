@@ -31,6 +31,7 @@ struct RenderUpdate {
     std::vector<render::MarkerInstance> markers;
     std::vector<render::LineVertex> lines;
     ImageU8 ir_left, ir_right;
+    std::vector<pipeline::LiveUpdate::PreviewMarker> preview_markers;  // on the left preview (half-res px)
     std::optional<Eigen::Matrix4f> scanner_pose;
 };
 
@@ -39,7 +40,13 @@ struct Hud {
     std::string reason;
     float fps = 0;
     int frames = 0;
-    int markers = 0;
+    int markers = 0;           // stereo markers in the current frame
+    int markers_matched = 0;   // of those, identified in the map
+    int map_markers = 0;
+    int global_markers = 0;
+    int keyframes = 0;
+    float marker_ms = 0;
+    pipeline::ScanPhase phase = pipeline::ScanPhase::surface;
     float point_distance_mm = 0.5f;
     float depth_ms = 0;
     float track_ms = 0;
@@ -71,6 +78,15 @@ public:
     [[nodiscard]] std::optional<RenderUpdate> take_render_update();
     [[nodiscard]] Hud hud() const;
 
+    // Global markers / alignment.
+    void set_phase(pipeline::ScanPhase phase);
+    void set_align_mode(track::AlignMode mode);
+    void optimize_global_markers();
+    void clear_global_markers();
+    bool save_global_markers(const std::string& path);
+    bool load_global_markers(const std::string& path);
+    [[nodiscard]] std::string global_marker_status() const;
+
     ScanSettings settings;
     bool follow_scanner = false;
 
@@ -86,6 +102,7 @@ private:
     std::atomic<bool> toggle_requested_{false};
     Stopwatch housekeeping_;
     float last_depth_ = 0;
+    std::string global_status_;
 };
 
 }  // namespace einstar::app

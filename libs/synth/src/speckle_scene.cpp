@@ -154,6 +154,18 @@ RenderedView render_view(const Scene& scene, const Projector& proj, const Camera
                     if (sx == ss / 2 && sy == ss / 2) {
                         out.depth(x, y) = static_cast<float>((T_world_camera.inverse() * hit->point).z());
                     }
+                    // Marker stickers replace the surface reflectance.
+                    bool on_marker = false;
+                    for (const auto& m : scene.markers) {
+                        const Vec3 d = hit->point - m.center;
+                        if (std::abs(d.dot(m.normal)) > 0.5) continue;
+                        const double r = (d - d.dot(m.normal) * m.normal).norm();
+                        if (r > 0.5 * m.ring_diameter) continue;
+                        acc += r <= 0.5 * m.diameter ? params.marker_brightness : params.marker_ring;
+                        on_marker = true;
+                        break;
+                    }
+                    if (on_marker) continue;
                     // Projector illumination with shadowing.
                     const Vec3 to_proj = proj_center - hit->point;
                     const double dist = to_proj.norm();

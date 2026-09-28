@@ -153,6 +153,10 @@ int main(int argc, char** argv) {
     render::RenderSettings settings;
     MouseState mouse;
     PreviewTexture preview_left, preview_right;
+    std::vector<pipeline::LiveUpdate::PreviewMarker> preview_markers;
+    int align_mode = 1;  // hybrid
+    char marker_path[512] = {};
+    if (const char* home = std::getenv("HOME")) std::snprintf(marker_path, sizeof marker_path, "%s/Documents/einstar_global_markers.txt", home);
     id<MTLTexture> depth_tex = nil;
     MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor new];
     pass.colorAttachments[0].clearColor = MTLClearColorMake(0.11, 0.12, 0.14, 1.0);
@@ -196,6 +200,7 @@ int main(int argc, char** argv) {
                 (*renderer)->set_markers(upd->markers);
                 (*renderer)->set_lines(upd->lines);
                 preview_left.upload(device, upd->ir_left);
+                preview_markers = std::move(upd->preview_markers);
                 preview_right.upload(device, upd->ir_right);
                 if (state.follow_scanner && upd->scanner_pose) {
                     camera.target = (*upd->scanner_pose * Eigen::Vector4f(0, 0, 300, 1)).head<3>();
@@ -268,6 +273,40 @@ int main(int argc, char** argv) {
             if (ImGui::Button("Clear model", ImVec2(-1, 0))) state.clear_model();
             ImGui::EndDisabled();
             ImGui::Separator();
+            ImGui::TextUnformatted("Alignment");
+            if (ImGui::Combo("##align", &align_mode, "Geometry\0Hybrid (surface + markers)\0Markers\0"))
+                state.set_align_mode(align_mode == 0 ? track::AlignMode::geometry : align_mode == 2 ? track::AlignMode::markers : track::AlignMode::hybrid);
+            {
+                const auto hud_now = state.hud();
+                ImGui::BeginDisabled(!state.connected());
+                if (ImGui::CollapsingHeader("Global markers", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    const bool capturing = hud_now.phase == pipeline::ScanPhase::global_markers;
+                    ImGui::TextWrapped(capturing ? "Capturing the marker constellation (no surface is recorded). Sweep over every marker, "
+                                                   "then optimise."
+                                                 : "Scan markers first for a drift-free frame for the whole object.");
+                    if (!capturing) {
+                        if (ImGui::Button("Capture markers", ImVec2(-1, 0))) state.set_phase(pipeline::ScanPhase::global_markers);
+                    } else {
+                        ImGui::Text("Keyframes %d, markers %d", hud_now.keyframes, hud_now.map_markers);
+                        if (ImGui::Button("Optimise and use", ImVec2(-1, 0))) {
+                            state.optimize_global_markers();
+                            state.set_phase(pipeline::ScanPhase::surface);
+                        }
+                        if (ImGui::Button("Back to surface scan", ImVec2(-1, 0))) state.set_phase(pipeline::ScanPhase::surface);
+                    }
+                    if (hud_now.global_markers > 0) {
+                        ImGui::TextColored(ImVec4(1, 0.75f, 0.1f, 1), "%d global markers in use", hud_now.global_markers);
+                        if (ImGui::Button("Discard global markers", ImVec2(-1, 0))) state.clear_global_markers();
+                    }
+                    ImGui::InputText("##path", marker_path, sizeof marker_path);
+                    if (ImGui::Button("Save")) (void)state.save_global_markers(marker_path);
+                    ImGui::SameLine();
+                    if (ImGui::Button("Load")) (void)state.load_global_markers(marker_path);
+                    if (const auto st = state.global_marker_status(); !st.empty()) ImGui::TextWrapped("%s", st.c_str());
+                }
+                ImGui::EndDisabled();
+            }
+            ImGui::Separator();
             ImGui::TextUnformatted("Scanner settings");
             bool changed = false;
             changed |= ImGui::SliderInt("Exposure", &state.settings.exposure, 500, 12000);
@@ -301,7 +340,9 @@ int main(int argc, char** argv) {
             ImGui::Text("FPS            %5.1f", hud.fps);
             ImGui::Text("Frames         %5d", hud.frames);
             ImGui::Text("Model points   %zu", hud.model_points);
-            ImGui::Text("Markers        %5d", hud.markers);
+            if (hud.phase == pipeline::ScanPhase::global_markers) ImGui::TextColored(ImVec4(1, 0.75f, 0.1f, 1), "GLOBAL MARKER CAPTURE");
+            ImGui::Text("Markers        %2d / %2d seen", hud.markers_matched, hud.markers);
+            ImGui::Text("Marker map     %5d%s", hud.map_markers, hud.global_markers > 0 ? " (global)" : "");
             ImGui::Text("Point distance %4.2f mm", hud.point_distance_mm);
             ImGui::Text("Depth / track  %5.1f / %5.1f ms", hud.depth_ms, hud.track_ms);
             ImGui::Text("Queue / drops  %d / %d", hud.queue_depth, hud.dropped);
@@ -317,6 +358,15 @@ int main(int argc, char** argv) {
                 ImGui::Begin("Cameras", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
                 const float pw = 256.0f, ph = pw * float(preview_left.height) / float(preview_left.width);
                 ImGui::Image((ImTextureID)(__bridge void*)preview_left.texture, ImVec2(pw, ph));
+                {
+                    // Marker detections on the left preview: green = stereo matched, red = left only.
+                    const ImVec2 o = ImGui::GetItemRectMin();
+                    const float k = pw / float(preview_left.width);
+                    auto* dl = ImGui::GetWindowDrawList();
+                    for (const auto& m : preview_markers)
+                        dl->AddCircle(ImVec2(o.x + m.x * k, o.y + m.y * k), std::max(3.0f, m.radius * k + 1.5f),
+                                      m.matched ? IM_COL32(40, 230, 90, 255) : IM_COL32(230, 60, 60, 255), 0, 1.5f);
+                }
                 ImGui::SameLine();
                 if (preview_right.texture) ImGui::Image((ImTextureID)(__bridge void*)preview_right.texture, ImVec2(pw, ph));
                 ImGui::End();

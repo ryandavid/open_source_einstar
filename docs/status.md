@@ -13,7 +13,9 @@
 | Tracking | working | robust point-to-plane ICP, normal-space balancing, degeneracy-aware updates, extend-only fusion for weak frames, global FPFH relocalisation with 3-frame confirmation |
 | Fusion | done (CPU reference + Metal) | sparse voxel-hash TSDF; Metal: GPU hash table + brick pool, integrate 0.7 ms, raycast 1.2 ms, full surface extraction 0.4 ms |
 | ICP | done (CPU reference + Metal) | Metal runs all Gauss-Newton iterations in one command buffer (1.6 ms vs 3.7 ms); identical poses and Hessians to the CPU solver |
-| Live view | done | Metal splats, frustum/trail, ghost frustum when lost, HUD, IR previews (`--snapshot` for headless capture) |
+| Live view | done | Metal splats, frustum/trail, ghost frustum when lost, HUD, IR previews (`--snapshot` for headless capture), marker discs (map / global / current frame) and preview detections |
+| Markers | done | detection on raw IR (blob + half-level contour + ellipse fit + dark-ring test), rectified stereo matching gated by a dense-depth disparity prior, marker map with candidate confirmation, RANSAC association, triangle-signature relocalisation, joint marker + surface ICP (CPU and Metal) |
+| Global markers | done | markers-only constellation capture -> keyframes -> Ceres stereo-reprojection bundle adjustment -> fixed map that later scans start on; save/load as text |
 
 ### Tracking on EXStar's own recordings (`einstar-cli track-fixture`)
 mustang_differential, 6055 frames, depth-only (no markers/texture), GPU path:
@@ -22,6 +24,14 @@ mustang_differential, 6055 frames, depth-only (no markers/texture), GPU path:
 - 6.7 ms per frame for tracking + fusion (CPU reference: ~28 ms)
 - lost frames are dominated by the recording's own discontinuities (EXStar did not store the frames it lost), which live capture does not have
 
+PG2/Project1 (markers on the part), 2057 frames, GPU path:
+- geometry only: 6.6% tracked (the part slides); hybrid (surface + markers): 85.8% tracked, pose p95 0.56 mm / 0.09 deg vs EXStar, 5.8 ms per frame
+- hybrid on EXStar's own final marker map as fixed global markers (`--global-markers`): **100% tracked**, frame-to-frame error p95 0.22 mm; absolute agreement 0.75 mm median (a constant offset from EXStar's final map)
+- the remaining losses without global markers follow the recording's discontinuities into areas whose markers were never seen before
+
+### Global markers end to end (synthetic, `test_global_markers`)
+Marker stickers rendered into the emulated IR images -> live detection -> markers-only capture (21/21 frames tracked, nothing fused) -> bundle adjustment (16 markers, 0.07 px, max error vs truth 0.20 mm) -> surface scan started on the fixed map: 30/30 frames tracked with **absolute** pose error <= 0.31 mm / 0.074 deg (the open-loop sweep without markers drifts ~2 deg), no phantom markers in the map.
+
 ICP is linearised about the centroid of the observed surface (not the world origin), which keeps
 the float GPU solve well conditioned and makes the degeneracy analysis independent of where the
 scan started; the degeneracy/relocalisation thresholds were recalibrated for it.
@@ -29,8 +39,8 @@ scan started; the degeneracy/relocalisation thresholds were recalibrated for it.
 ## Known issues / next steps
 1. **Speed**: done. Frames stay GPU-resident from stereo through ICP, fusion and rendering (speckle filter, points/normals, balancing weights, raycasts, surface extraction and the live overlay are all GPU buffers; the CPU only touches them for relocalisation and fallbacks). Full frame path 8.6 ms (was 12.9 ms with CPU round trips, ~50 ms all-CPU).
 2. **Open-loop drift** on young models (synthetic sweep: ~0.03 deg/frame). Fix in the process step: keyframe pose graph + loop closure + re-fusion.
-3. **Surfaces of revolution** are geometrically ambiguous; depth-only tracking holds but may slide. Needs markers (next) or texture.
-4. **Markers**: detection, stereo matching, marker map, joint marker + ICP tracking — not started (EXStar's parameters are in docs/algorithms.md).
+3. **Surfaces of revolution** are geometrically ambiguous; depth-only tracking holds but may slide. Use markers (hybrid / global markers) or, later, texture.
+4. **Markers on real IR**: tuned on EXStar's calibration captures and synthetic stickers only. Real scans may need the detection threshold / ring test adjusted (live speckle brightness vs. retro-reflective return under the strobe is unknown until hardware). 3 mm markers are disabled by default (too close to speckle size).
 5. **Process step**: global optimisation, Poisson meshing, export (STL/PLY/OBJ) — not started.
 6. **Session recording** of raw frames — not started.
 7. Stereo outlier blobs at silhouettes need an extra consistency filter.

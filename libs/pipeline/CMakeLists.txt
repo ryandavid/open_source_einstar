@@ -1,5 +1,5 @@
 add_library(einstar_pipeline src/stereo_frontend.cpp src/scan_pipeline.cpp src/gpu_overlay.cpp)
 add_library(einstar::pipeline ALIAS einstar_pipeline)
 target_include_directories(einstar_pipeline PUBLIC include)
-target_link_libraries(einstar_pipeline PUBLIC einstar::calib einstar::depth einstar::depth_metal einstar::track einstar::track_metal einstar::usb einstar::render_types)
+target_link_libraries(einstar_pipeline PUBLIC einstar::calib einstar::depth einstar::depth_metal einstar::track einstar::track_metal einstar::markers einstar::optim einstar::usb einstar::render_types)
 einstar_target_defaults(einstar_pipeline)

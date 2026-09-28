@@ -35,8 +35,18 @@ struct Hit {
     Vec3 normal;
 };
 
+// Retro-reflective marker sticker lying on a surface: a bright disc inside a dark ring. Lit by the
+// scanner's strobe, it appears saturated in both IR cameras and hides the speckle underneath.
+struct Marker {
+    Vec3 center;
+    Vec3 normal;
+    double diameter = 6.0;        // bright disc, mm
+    double ring_diameter = 10.0;  // dark surround, mm
+};
+
 struct Scene {
     std::vector<Primitive> primitives;  // world coordinates, mm
+    std::vector<Marker> markers;
 
     [[nodiscard]] std::optional<Hit> intersect(const Vec3& origin, const Vec3& dir) const;
 };
@@ -62,6 +72,8 @@ struct RenderParams {
     double ambient = 0.04;
     double albedo = 0.9;
     double noise_sigma = 2.0;  // grey levels
+    double marker_brightness = 1.3;  // retro-reflective return (saturates)
+    double marker_ring = 0.02;
     int supersample = 2;       // per axis
     std::uint32_t seed = 1;
 };

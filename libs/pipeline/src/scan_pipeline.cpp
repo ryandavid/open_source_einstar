@@ -6,6 +6,8 @@
 #include "gpu_overlay.hpp"
 
 #include <algorithm>
+#include <map>
+#include <set>
 
 namespace einstar::pipeline {
 
@@ -81,7 +83,9 @@ std::unique_ptr<track::Volume> make_volume(const ScanPipelineParams& p) {
 }  // namespace
 
 ScanPipeline::ScanPipeline(std::unique_ptr<StereoFrontend> frontend, ScanPipelineParams params, Sink sink)
-    : frontend_(std::move(frontend)), params_(params), sink_(std::move(sink)), tracker_(params.tracker, make_volume(params)) {
+    : frontend_(std::move(frontend)), params_(params), sink_(std::move(sink)), tracker_(params.tracker, make_volume(params)),
+      surface_mode_(params.tracker.mode) {
+    bundle_.geometry = frontend_->rectification().geometry;
     if (params_.gpu_volume) {
         if (auto ctx = gpu::Context::create())
             if (auto icp = track_metal::MetalIcp::create(*ctx)) {
@@ -111,6 +115,222 @@ void ScanPipeline::stop() {
 
 void ScanPipeline::reset_model() { reset_requested_ = true; }
 
+void ScanPipeline::post(std::function<void()> cmd) {
+    {
+        std::lock_guard lock(command_mutex_);
+        commands_.push_back({frames_in_.load(), std::move(cmd)});
+    }
+    cv_.notify_one();
+    if (!worker_.joinable()) run_commands();  // not running: execute inline
+}
+
+void ScanPipeline::run_commands() {
+    std::vector<std::function<void()>> cmds;
+    {
+        std::lock_guard lock(command_mutex_);
+        const auto taken = frames_taken_.load();
+        auto it = commands_.begin();
+        while (it != commands_.end() && it->after_frames <= taken) cmds.push_back(std::move((it++)->fn));
+        commands_.erase(commands_.begin(), it);
+    }
+    for (auto& c : cmds) c();
+}
+
+void ScanPipeline::apply_phase() {
+    auto& tp = tracker_.params();
+    if (phase_ == ScanPhase::global_markers) {
+        tp.mode = track::AlignMode::markers;
+        tp.fuse_surface = false;
+        tp.global_relocalization = false;  // no surface model to register against
+    } else {
+        tp.mode = surface_mode_ == track::AlignMode::geometry && !global_map_.empty() ? track::AlignMode::hybrid : surface_mode_;
+        tp.fuse_surface = true;
+        tp.global_relocalization = params_.tracker.global_relocalization;
+    }
+}
+
+void ScanPipeline::set_phase(ScanPhase phase) {
+    post([this, phase] {
+        if (phase == phase_) return;
+        phase_ = phase;
+        // Either way the tracker restarts: a fresh constellation capture continues on the current
+        // (running-mean) marker map; a surface scan starts on the fixed global map if there is one.
+        if (phase == ScanPhase::global_markers) {
+            tracker_.reset(true);
+            if (!bundle_.observations.empty()) {
+                // Resume a capture: the map the keyframes refer to must be kept.
+                std::vector<markers::MapMarker> m;
+                for (const auto& [id, p] : bundle_.markers) m.push_back({id, p, 6.0, 1, false});
+                tracker_.set_marker_map(std::move(m));
+            }
+        } else {
+            tracker_.reset(true);
+        }
+        cache_.clear();
+        last_keyframe_.reset();
+        apply_phase();
+        std::lock_guard lock(trajectory_mutex_);
+        trajectory_.clear();
+        log::info("scan phase: {}", phase == ScanPhase::global_markers ? "global markers" : "surface");
+    });
+}
+
+void ScanPipeline::collect_keyframe(const track::TrackResult& r, const track::DepthFrame& frame) {
+    if (!r.accepted || static_cast<int>(r.marker_ids.size()) < params_.keyframe_min_markers) return;
+    if (static_cast<int>(bundle_.T_world_camera.size()) >= params_.max_keyframes) return;
+    if (last_keyframe_) {
+        const SE3 d = last_keyframe_->inverse() * r.T_world_camera;
+        const double rot = Eigen::AngleAxisd(d.linear()).angle() * 180.0 / M_PI;
+        if (translation_norm(d) < params_.keyframe_translation_mm && rot < params_.keyframe_rotation_deg) return;
+    }
+    const int kf = bundle_.T_world_camera.empty() ? 0 : bundle_.T_world_camera.rbegin()->first + 1;
+    bundle_.T_world_camera[kf] = r.T_world_camera;
+    const auto& map = tracker_.marker_map();
+    for (const auto& [fi, id] : r.marker_ids) {
+        const auto& m = frame.markers[static_cast<std::size_t>(fi)];
+        if (m.left_rect.x() < 0) continue;
+        bundle_.observations.push_back({kf, id, m.left_rect, m.right_rect});
+    }
+    // Current running-mean positions as the initial guess.
+    for (const auto& m : map.markers()) bundle_.markers[m.id] = m.position;
+    last_keyframe_ = r.T_world_camera;
+}
+
+GlobalMarkerReport ScanPipeline::run_bundle_adjustment() {
+    GlobalMarkerReport rep;
+    rep.keyframes = static_cast<int>(bundle_.T_world_camera.size());
+    if (rep.keyframes < 2) {
+        rep.error = "capture markers from at least two positions first";
+        return rep;
+    }
+    // Only markers seen from enough keyframes are adjusted (and kept).
+    std::map<int, std::set<int>> seen;
+    for (const auto& o : bundle_.observations) seen[o.marker].insert(o.frame);
+    optim::MarkerBundle b;
+    b.geometry = bundle_.geometry;
+    b.T_world_camera = bundle_.T_world_camera;
+    for (const auto& o : bundle_.observations)
+        if (static_cast<int>(seen[o.marker].size()) >= params_.global_marker_min_keyframes && bundle_.markers.contains(o.marker)) {
+            b.observations.push_back(o);
+            b.markers[o.marker] = bundle_.markers.at(o.marker);
+        }
+    if (b.markers.size() < 3) {
+        rep.error = "fewer than 3 markers were seen from two or more positions";
+        return rep;
+    }
+    const auto before = b.markers;
+    rep.bundle = optim::optimize(b, params_.bundle);
+    // Markers that lost all their observations as outliers are dropped.
+    std::map<int, std::set<int>> kept;
+    for (const auto& o : b.observations) kept[o.marker].insert(o.frame);
+    std::map<int, double> diam;
+    for (const auto& m : tracker_.marker_map().markers()) diam[m.id] = m.diameter;
+    std::vector<markers::MapMarker> map;
+    for (const auto& [id, p] : b.markers) {
+        if (static_cast<int>(kept[id].size()) < params_.global_marker_min_keyframes) continue;
+        rep.max_shift_mm = std::max(rep.max_shift_mm, (p - before.at(id)).norm());
+        map.push_back({id, p, diam.contains(id) ? diam[id] : 6.0, static_cast<int>(kept[id].size()), true});
+    }
+    rep.markers = static_cast<int>(map.size());
+    // Keep the refined state so a later capture can extend and re-optimise it.
+    bundle_.T_world_camera = b.T_world_camera;
+    for (const auto& [id, p] : b.markers) bundle_.markers[id] = p;
+    {
+        std::lock_guard lock(global_mutex_);
+        global_map_ = map;
+    }
+    tracker_.set_marker_map(std::move(map));
+    log::info("global markers: {} keyframes, {} markers, reprojection rms {:.3f} -> {:.3f} px, {} outliers, max shift {:.3f} mm",
+              rep.keyframes, rep.markers, rep.bundle.rms_before_px, rep.bundle.rms_after_px, rep.bundle.outliers_removed, rep.max_shift_mm);
+    return rep;
+}
+
+void ScanPipeline::optimize_global_markers(std::function<void(const GlobalMarkerReport&)> done) {
+    post([this, done = std::move(done)] {
+        const auto rep = run_bundle_adjustment();
+        if (rep.error.empty()) {
+            // Tracking restarts on the optimised map (relocalising against it on the next frame).
+            tracker_.reset(true);
+            last_keyframe_.reset();
+            apply_phase();
+        } else {
+            log::warn("global markers: {}", rep.error);
+        }
+        if (done) done(rep);
+    });
+}
+
+void ScanPipeline::clear_global_markers() {
+    post([this] {
+        bundle_ = {};
+        bundle_.geometry = frontend_->rectification().geometry;
+        last_keyframe_.reset();
+        {
+            std::lock_guard lock(global_mutex_);
+            global_map_.clear();
+        }
+        tracker_.reset(false);
+        apply_phase();
+    });
+}
+
+void ScanPipeline::set_global_markers(std::vector<markers::MapMarker> map) {
+    post([this, map = std::move(map)]() mutable {
+        for (auto& m : map) m.fixed = true;
+        {
+            std::lock_guard lock(global_mutex_);
+            global_map_ = map;
+        }
+        tracker_.reset(false);
+        tracker_.set_marker_map(std::move(map));
+        apply_phase();
+    });
+}
+
+void ScanPipeline::set_surface_mode(track::AlignMode mode) {
+    post([this, mode] {
+        surface_mode_ = mode;
+        apply_phase();
+    });
+}
+
+std::vector<markers::MapMarker> ScanPipeline::global_markers() const {
+    std::lock_guard lock(global_mutex_);
+    return global_map_;
+}
+
+void ScanPipeline::fill_marker_overlays(const track::TrackResult& r, const DepthOutput& depth, LiveUpdate& up) const {
+    using render::MarkerState;
+    const auto& frame = depth.frame;
+    const Eigen::Matrix4f T = r.T_world_camera.matrix().cast<float>();
+    std::vector<bool> matched(frame.markers.size(), false);
+    for (const auto& [fi, id] : r.marker_ids) matched[static_cast<std::size_t>(fi)] = true;
+    for (const auto& m : tracker_.marker_map().markers()) {
+        if (!tracker_.marker_map().confirmed(m)) continue;
+        const Vec3f p = m.position.cast<float>();
+        // Map markers carry no normal; drawn as camera-facing discs by the renderer when n = 0.
+        up.markers.push_back({p.x(), p.y(), p.z(), 0, 0, 0, static_cast<float>(0.5 * m.diameter),
+                              render::marker_color(m.fixed ? MarkerState::global_fixed : MarkerState::in_map)});
+    }
+    if (r.accepted)
+        for (std::size_t i = 0; i < frame.markers.size(); ++i) {
+            const auto& m = frame.markers[i];
+            const Vec3f p = (T * m.position.cast<float>().homogeneous()).head<3>();
+            const Vec3f n = T.topLeftCorner<3, 3>() * m.normal.cast<float>();
+            // Slightly larger so the current frame's discs ring the map discs.
+            up.markers.push_back({p.x(), p.y(), p.z(), n.x(), n.y(), n.z(), static_cast<float>(0.5 * m.diameter * 1.3),
+                                  render::marker_color(matched[i] ? MarkerState::in_frame : MarkerState::rejected)});
+        }
+    const double f_half = 0.5 * frontend_->rectification().geometry.f;
+    for (const auto& m : depth.markers) {
+        const double z = m.position.z();
+        up.preview_markers.push_back({static_cast<float>(0.5 * m.left_rect.x()), static_cast<float>(0.5 * m.left_rect.y()),
+                                      static_cast<float>(0.5 * m.diameter * f_half / z), true});
+    }
+    for (const auto& c : depth.unmatched_left)
+        up.preview_markers.push_back({static_cast<float>(0.5 * c.x()), static_cast<float>(0.5 * c.y()), 4.0f, false});
+}
+
 void ScanPipeline::push(usb::FrameGroup&& group) {
     ++frames_in_;
     {
@@ -120,6 +340,7 @@ void ScanPipeline::push(usb::FrameGroup&& group) {
         } else if (queue_.size() >= params_.queue_capacity) {
             queue_.pop_front();
             ++dropped_;
+            ++frames_taken_;
         }
         queue_.push_back(std::move(group));
     }
@@ -136,20 +357,35 @@ void ScanPipeline::run(std::stop_token st) {
         usb::FrameGroup group;
         {
             std::unique_lock lock(mutex_);
-            cv_.wait_for(lock, std::chrono::milliseconds(100), [&] { return !queue_.empty() || st.stop_requested(); });
+            cv_.wait_for(lock, std::chrono::milliseconds(100), [&] {
+                std::lock_guard cl(command_mutex_);
+                return !queue_.empty() || (!commands_.empty() && commands_.front().after_frames <= frames_taken_) || st.stop_requested();
+            });
+        }
+        run_commands();
+        {
+            std::unique_lock lock(mutex_);
             if (queue_.empty()) continue;
             group = std::move(queue_.front());
             queue_.pop_front();
+            ++frames_taken_;
             stats_.queue_depth = static_cast<int>(queue_.size());
         }
         space_cv_.notify_one();
         process(std::move(group));
+        run_commands();
     }
 }
 
 void ScanPipeline::process(usb::FrameGroup&& group) {
     if (reset_requested_.exchange(false)) {
-        tracker_.reset();
+        // Clearing the model keeps an optimised global-marker map (it describes the scene, not the scan).
+        tracker_.reset(true);
+        if (phase_ == ScanPhase::global_markers) {
+            bundle_ = {};
+            bundle_.geometry = frontend_->rectification().geometry;
+            last_keyframe_.reset();
+        }
         cache_.clear();
         std::lock_guard lock(trajectory_mutex_);
         trajectory_.clear();
@@ -161,8 +397,10 @@ void ScanPipeline::process(usb::FrameGroup&& group) {
     auto depth = frontend_->process(group);
     if (!depth) return;
     stereo_times_.add(depth->stereo_ms);
+    marker_times_.add(depth->marker_ms);
 
     const auto r = tracker_.process(depth->frame);
+    if (phase_ == ScanPhase::global_markers) collect_keyframe(r, depth->frame);
     track_times_.add(r.ms);
     ++stats_.frames_processed;
     if (r.accepted) {
@@ -179,6 +417,16 @@ void ScanPipeline::process(usb::FrameGroup&& group) {
     stats_.dropped = dropped_;
     stats_.stereo_ms = stereo_times_.median();
     stats_.track_ms = track_times_.median();
+    stats_.marker_ms = marker_times_.median();
+    stats_.phase = phase_;
+    stats_.markers_in_frame = r.markers_seen;
+    stats_.markers_matched = static_cast<int>(r.marker_ids.size());
+    stats_.map_markers = static_cast<int>(tracker_.marker_map().confirmed_count());
+    stats_.keyframes = static_cast<int>(bundle_.T_world_camera.size());
+    {
+        std::lock_guard lock(global_mutex_);
+        stats_.global_markers = static_cast<int>(global_map_.size());
+    }
     ++fps_frames_;
     if (fps_clock_.elapsed_ms() > 1000) {
         stats_.fps = 1000.0 * static_cast<double>(fps_frames_) / fps_clock_.elapsed_ms();
@@ -242,6 +490,7 @@ void ScanPipeline::process(usb::FrameGroup&& group) {
         up.model_changed = true;
         model_clock_.reset();
     }
+    fill_marker_overlays(r, *depth, up);
     up.preview_left = std::move(depth->rectified_left);
     up.preview_right = std::move(depth->rectified_right);
     up.stats = stats_;

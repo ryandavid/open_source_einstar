@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "einstar/core/timing.hpp"
+#include "einstar/optim/marker_bundle.hpp"
 #include "einstar/pipeline/stereo_frontend.hpp"
 #include "einstar/render/types.hpp"
 #include "einstar/track/tracker.hpp"
@@ -24,6 +25,19 @@
 #include "einstar/usb/stream.hpp"
 
 namespace einstar::pipeline {
+
+// surface: normal scanning (tracking + fusion). global_markers: markers-only capture of the marker
+// constellation (nothing fused), keyframes collected for bundle adjustment; the optimised map then
+// anchors every later surface scan (EXStar's "global markers").
+enum class ScanPhase { surface, global_markers };
+
+struct GlobalMarkerReport {
+    int keyframes = 0;
+    int markers = 0;             // fixed markers in the resulting map
+    optim::BundleReport bundle;
+    double max_shift_mm = 0;     // largest marker correction vs. the running-mean map
+    std::string error;
+};
 
 struct LiveStats {
     std::uint64_t frames_in = 0;
@@ -38,6 +52,13 @@ struct LiveStats {
     int accepted = 0, lost = 0, relocalized = 0;
     float mean_depth_mm = 0;
     std::size_t model_points = 0;
+    ScanPhase phase = ScanPhase::surface;
+    int markers_in_frame = 0;
+    int markers_matched = 0;
+    int map_markers = 0;
+    int global_markers = 0;      // fixed markers of the optimised map in use
+    int keyframes = 0;           // global-marker keyframes collected
+    double marker_ms = 0;        // median
 };
 
 struct LiveUpdate {
@@ -55,6 +76,13 @@ struct LiveUpdate {
     std::optional<SE3> last_good_pose;              // for the lost-tracking ghost
     bool tracking_lost = false;
     ImageU8 preview_left, preview_right;
+    // Marker overlays: world discs (map + current frame) and preview-image ellipses (half-res rectified px).
+    std::vector<render::MarkerInstance> markers;
+    struct PreviewMarker {
+        float x, y, radius;
+        bool matched;
+    };
+    std::vector<PreviewMarker> preview_markers;
     LiveStats stats;
 };
 
@@ -86,6 +114,13 @@ struct ScanPipelineParams {
     double model_refresh_s = 0.25;   // how often the full model snapshot is re-published
     int frame_point_step = 2;        // subsampling of the current-frame overlay
     bool gpu_volume = true;          // Metal TSDF when available, CPU reference otherwise
+    // Global-marker keyframes: a new one after this much motion, with enough identified markers.
+    double keyframe_translation_mm = 25.0;
+    double keyframe_rotation_deg = 10.0;
+    int keyframe_min_markers = 4;
+    int max_keyframes = 2000;
+    int global_marker_min_keyframes = 2;  // a marker must be seen from this many keyframes to be kept
+    optim::BundleParams bundle;
 };
 
 class ScanPipeline {
@@ -98,6 +133,17 @@ public:
     void stop();
     void reset_model();
 
+    // Global markers. Commands run on the worker between frames (thread-safe to call from the UI).
+    void set_phase(ScanPhase phase);
+    // Bundle-adjusts the collected keyframes and installs the result as a fixed map; the report is
+    // delivered through `done` on the worker thread.
+    void optimize_global_markers(std::function<void(const GlobalMarkerReport&)> done = {});
+    void clear_global_markers();
+    void set_global_markers(std::vector<markers::MapMarker> map);  // e.g. loaded from disk
+    // Alignment used while scanning surfaces (geometry falls back to hybrid while a global map is set).
+    void set_surface_mode(track::AlignMode mode);
+    [[nodiscard]] std::vector<markers::MapMarker> global_markers() const;
+
     // Called from the device thread; never blocks.
     void push(usb::FrameGroup&& group);
 
@@ -107,6 +153,12 @@ public:
 private:
     void run(std::stop_token st);
     void process(usb::FrameGroup&& group);
+    void run_commands();
+    void post(std::function<void()> cmd);
+    void apply_phase();
+    void collect_keyframe(const track::TrackResult& r, const track::DepthFrame& frame);
+    GlobalMarkerReport run_bundle_adjustment();
+    void fill_marker_overlays(const track::TrackResult& r, const DepthOutput& depth, LiveUpdate& up) const;
 
     std::unique_ptr<StereoFrontend> frontend_;
     ScanPipelineParams params_;
@@ -115,6 +167,22 @@ private:
     std::unique_ptr<track_metal::MetalIcp> gpu_icp_;
     std::unique_ptr<class GpuOverlay> overlay_;
     ModelPointCache cache_;
+
+    ScanPhase phase_ = ScanPhase::surface;
+    track::AlignMode surface_mode_;
+    optim::MarkerBundle bundle_;     // global-marker keyframes and observations
+    std::optional<SE3> last_keyframe_;
+    std::vector<markers::MapMarker> global_map_;
+    mutable std::mutex global_mutex_;
+    std::mutex command_mutex_;
+    // Commands run in order with frames: each waits until the frames pushed before it were taken.
+    struct Command {
+        std::uint64_t after_frames;
+        std::function<void()> fn;
+    };
+    std::vector<Command> commands_;
+    std::atomic<std::uint64_t> frames_taken_{0};
+    TimingStats marker_times_{64};
 
     std::mutex mutex_;
     std::condition_variable cv_;

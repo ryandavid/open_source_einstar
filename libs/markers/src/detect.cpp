@@ -162,6 +162,9 @@ std::vector<Ellipse> detect_markers(ImageView<const std::uint8_t> img, const Det
         if (b.peak - bg < 40) return;
         const double level = 0.5 * (bg + b.peak);
         auto pts = iso_points(img, x0, y0, x1, y1, level);
+        // Only the blob's own boundary: bright neighbours inside the ROI (speckle around a sticker,
+        // other markers) would otherwise pull the fit.
+        std::erase_if(pts, [&](const Vec2& q) { return q.x() < b.x0 - 2 || q.x() > b.x1 + 2 || q.y() < b.y0 - 2 || q.y() > b.y1 + 2; });
         Ellipse e;
         if (!fit_ellipse(pts, e)) return;
         // Discard contour points of neighbouring structures, then refit.
@@ -183,6 +186,23 @@ std::vector<Ellipse> detect_markers(ImageView<const std::uint8_t> img, const Det
         if (covered < p.min_coverage * 12) return;
         if (e.a / e.b > p.max_axis_ratio || e.residual > p.max_residual_px) return;
         if (2 * e.b < p.min_diameter_px * 0.7 || 2 * e.a > p.max_diameter_px) return;
+        // Marker stickers have a dark ring around the reflective disc; laser speckle dots and specular
+        // highlights sit among other bright structure.
+        if (p.ring_scale > 0) {
+            const double ring_level = bg + p.ring_max_contrast * (b.peak - bg);
+            int bright = 0, n = 0;
+            const double ca = std::cos(e.angle), sa = std::sin(e.angle);
+            for (int k = 0; k < 32; ++k) {
+                const double t = 2 * M_PI * k / 32;
+                const double u = p.ring_scale * e.a * std::cos(t), v = p.ring_scale * e.b * std::sin(t);
+                const int x = static_cast<int>(std::lround(e.center.x() + ca * u - sa * v));
+                const int y = static_cast<int>(std::lround(e.center.y() + sa * u + ca * v));
+                if (x < 0 || y < 0 || x >= img.width || y >= img.height) continue;
+                ++n;
+                bright += img(x, y) > ring_level;
+            }
+            if (n < 16 || bright > p.max_ring_bright_fraction * n) return;
+        }
         e.peak = b.peak;
         found[bi] = e;
         ok[bi] = 1;
