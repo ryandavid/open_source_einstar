@@ -64,6 +64,9 @@ scan started; the degeneracy/relocalisation thresholds were recalibrated for it.
 11. **IR-intensity / colour ICP term**: not implemented. The IR images are lit by the laser speckle, which moves with the scanner, so their intensity is not surface texture. A photometric term needs the RGB texture camera (or strobe-only IR frames), and there are no such recordings to validate it on.
 7. Stereo outlier blobs at silhouettes need an extra consistency filter.
 8. Hardware-only unknowns: exact LED distance-zone semantics, button codes 2/3, exposure units.
+12. **Firmware**: the update package, flash layout, boot chain, runtime and FPGA loading are
+    described in docs/firmware.md, with an assessment of an open replacement (FX3 side feasible,
+    FPGA side needs hardware access; the FPGA vendor is unidentified).
 
 ## First contact with a real scanner
 `einstar-cli probe --verbose` performs read-only identification plus a calibration read and prints a full hex transcript.
