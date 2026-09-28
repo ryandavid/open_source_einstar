@@ -360,6 +360,13 @@ Logic-layer execute names seen in the log, `ReadData(offset, size)` and
   so **0 = none, 1 = single click, 2 = double click, 3 = long click**. [M]
   The log shows only `SingleClick` events: 9× BUTTON0, 32× BUTTON1,
   28× BUTTON2.
+* **What EXStar does with them** (every one of the 69 clicks in the 2026-09-27 service log, from
+  the commands sent right after it): **BUTTON1** toggles scanning (light sources off: LD 0 and
+  strobe 0 on both routes; or back on: LD 60, strobe at the scan level, distance LEDs resumed);
+  **BUTTON2** raises the brightness one step and **BUTTON0** lowers it (a new camera gain and
+  exposure pair for both sensors, e.g. exposure 2400 → 2600 → 2800, then gain 100 → 120 at
+  exposure 4400). The steps follow the `cam_para_config` brightness table (algorithms.md §3). [H]
+  We use the same assignment with our own brightness ladder (`device::brightness_level`).
 * The firmware probably latches these codes until **ClearState** (10/7B) is
   sent. The host only sends ClearState after a reconnect, and the host-side
   cache is cleared on each `HeartBeat` read. Not verified on hardware whether

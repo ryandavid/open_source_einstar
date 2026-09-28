@@ -161,3 +161,30 @@ TEST_CASE("destroying the device without disconnect still switches everything of
     CHECK(obs->state.mono_triggers == 0);
     CHECK(obs->state.laser == 0);
 }
+
+TEST_CASE("scanner buttons: EXStar's assignment") {
+    using device::ButtonAction, device::ButtonCommand;
+    CHECK(device::button_command(1, ButtonAction::single_click) == ButtonCommand::toggle_scan);
+    CHECK(device::button_command(0, ButtonAction::single_click) == ButtonCommand::brightness_down);
+    CHECK(device::button_command(2, ButtonAction::single_click) == ButtonCommand::brightness_up);
+    CHECK(device::button_command(1, ButtonAction::double_click) == ButtonCommand::none);
+    CHECK(device::button_command(1, ButtonAction::long_click) == ButtonCommand::none);
+    CHECK(device::button_command(3, ButtonAction::single_click) == ButtonCommand::none);
+}
+
+TEST_CASE("brightness ladder") {
+    const auto mid = device::brightness_level(device::kDefaultBrightness);
+    CHECK(mid.exposure == 4400);
+    CHECK(mid.gain == 120);
+    double prev = 0;
+    for (int l = 0; l < device::kBrightnessLevels; ++l) {
+        const auto eg = device::brightness_level(l);
+        const double product = static_cast<double>(eg.exposure) * eg.gain;
+        CHECK(product > prev * 1.05);  // every step is visibly brighter
+        CHECK(eg.exposure <= 5600);
+        prev = product;
+    }
+    // Out-of-range levels clamp.
+    CHECK(device::brightness_level(-5).exposure == device::brightness_level(0).exposure);
+    CHECK(device::brightness_level(99).gain == device::brightness_level(device::kBrightnessLevels - 1).gain);
+}

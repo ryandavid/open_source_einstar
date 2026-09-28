@@ -1,3 +1,4 @@
+#include <cmath>
 #include "einstar/device/einstar_device.hpp"
 
 #include <algorithm>
@@ -363,6 +364,25 @@ void EinstarDevice::heartbeat_loop(std::stop_token st) {
             if (a != ButtonAction::none && button_sink_) button_sink_(i, a);
         }
     }
+}
+
+ButtonCommand button_command(int button, ButtonAction action) {
+    if (action != ButtonAction::single_click) return ButtonCommand::none;
+    switch (button) {
+        case 0: return ButtonCommand::brightness_down;
+        case 1: return ButtonCommand::toggle_scan;
+        case 2: return ButtonCommand::brightness_up;
+        default: return ButtonCommand::none;
+    }
+}
+
+ExposureGain brightness_level(int level) {
+    constexpr double kStep = 1.08, kDefaultExposure = 4400, kGain = 120, kMinExposure = 1500, kMaxExposure = 5600;
+    const int l = std::clamp(level, 0, kBrightnessLevels - 1);
+    const double product = kDefaultExposure * kGain * std::pow(kStep, l - kDefaultBrightness);
+    const double exposure = std::clamp(product / kGain, kMinExposure, kMaxExposure);
+    const double gain = std::clamp(product / exposure, 16.0, 400.0);
+    return {static_cast<std::uint32_t>(std::lround(exposure)), static_cast<std::uint16_t>(std::lround(gain))};
 }
 
 void EinstarDevice::disconnect() {

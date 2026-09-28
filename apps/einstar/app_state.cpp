@@ -109,9 +109,14 @@ void AppState::connect(bool emulator) {
     trail_.clear();
     auto s = Session::open(
         emulator, [this](pipeline::LiveUpdate&& u) { on_live_update(std::move(u)); },
-        [this](int, device::ButtonAction a) {
-            // Any single click on the scanner toggles scanning (handled on the UI thread).
-            if (a == device::ButtonAction::single_click) toggle_requested_ = true;
+        [this](int button, device::ButtonAction a) {
+            // Heartbeat thread: hand the command to the UI thread (update()).
+            switch (device::button_command(button, a)) {
+                case device::ButtonCommand::toggle_scan: toggle_requested_ = true; break;
+                case device::ButtonCommand::brightness_down: --brightness_steps_; break;
+                case device::ButtonCommand::brightness_up: ++brightness_steps_; break;
+                case device::ButtonCommand::none: break;
+            }
         });
     if (!s) {
         error_ = s.error().message;
@@ -158,6 +163,14 @@ void AppState::clear_model() {
 
 void AppState::apply_settings() {
     if (session_ && session_->scanning()) (void)session_->apply(settings);
+}
+
+void AppState::set_brightness(int level) {
+    settings.brightness = std::clamp(level, 0, device::kBrightnessLevels - 1);
+    const auto eg = device::brightness_level(settings.brightness);
+    settings.exposure = static_cast<int>(eg.exposure);
+    settings.gain = eg.gain;
+    apply_settings();
 }
 
 void AppState::set_phase(pipeline::ScanPhase phase) {
@@ -221,6 +234,12 @@ std::string AppState::global_marker_status() const {
 
 void AppState::update() {
     if (toggle_requested_.exchange(false)) toggle_scan();
+    if (const int steps = brightness_steps_.exchange(0); steps != 0) {
+        set_brightness(settings.brightness + steps);
+        std::lock_guard lock(mutex_);
+        notice_ = std::format("Brightness {} / {}", settings.brightness + 1, device::kBrightnessLevels);
+        notice_clock_.reset();
+    }
     if (!session_ || housekeeping_.elapsed_ms() < 500) return;
     housekeeping_.reset();
     float depth;
@@ -244,7 +263,9 @@ std::optional<RenderUpdate> AppState::take_render_update() {
 
 Hud AppState::hud() const {
     std::lock_guard lock(mutex_);
-    return hud_;
+    Hud h = hud_;
+    if (notice_clock_.elapsed_ms() < 2000) h.notice = notice_;
+    return h;
 }
 
 void AppState::on_live_update(pipeline::LiveUpdate&& u) {

@@ -14,6 +14,7 @@ namespace einstar::app {
 
 // EXStar's own scan-mode values (from its session log) as defaults.
 struct ScanSettings {
+    int brightness = device::kDefaultBrightness;  // sets exposure and gain (see device::brightness_level)
     int exposure = 4400;
     int gain = 120;
     int laser_percent = 100;

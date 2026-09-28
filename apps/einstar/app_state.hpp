@@ -62,6 +62,7 @@ struct Hud {
     int distance_step = -1;  // 0..9, -1 = out of range
     std::size_t model_points = 0;
     std::uint64_t recorded_frames = 0;
+    std::string notice;  // short-lived message (e.g. a brightness change from the scanner's buttons)
 };
 
 struct ProcessStatus {
@@ -87,6 +88,7 @@ public:
     void clear_model();
     [[nodiscard]] bool scanning() const { return session_ && session_->scanning(); }
     void apply_settings();
+    void set_brightness(int level);  // exposure and gain from the brightness ladder
 
     void update();  // periodic housekeeping from the UI thread (temperature, LEDs)
     [[nodiscard]] std::optional<RenderUpdate> take_render_update();
@@ -120,7 +122,10 @@ private:
     Hud hud_;
     std::vector<Eigen::Vector3f> trail_;
     std::atomic<bool> toggle_requested_{false};
+    std::atomic<int> brightness_steps_{0};  // from the scanner's buttons, applied on the UI thread
     Stopwatch housekeeping_;
+    Stopwatch notice_clock_;
+    std::string notice_;
     float last_depth_ = 0;
     std::string global_status_;
     ProcessStatus process_;

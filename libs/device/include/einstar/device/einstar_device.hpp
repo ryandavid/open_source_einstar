@@ -50,6 +50,23 @@ struct DeviceInfo {
 
 enum class ButtonAction : std::uint8_t { none = 0, single_click = 1, double_click = 2, long_click = 3 };
 
+// What the scanner's buttons do, as in EXStar (its device log: every BUTTON1 click switches the light
+// sources off / on for pause / start, BUTTON0 and BUTTON2 clicks step the camera brightness down / up).
+// Double and long clicks were never observed and do nothing.
+enum class ButtonCommand : std::uint8_t { none, toggle_scan, brightness_down, brightness_up };
+[[nodiscard]] ButtonCommand button_command(int button, ButtonAction action);
+
+// Camera brightness ladder: each level ~8% more exposure x gain than the one below; the middle level is
+// EXStar's scan default (exposure 4400, gain 120). Exposure moves first (up to 5600, to bound motion
+// blur), then gain.
+inline constexpr int kBrightnessLevels = 21;
+inline constexpr int kDefaultBrightness = 10;
+struct ExposureGain {
+    std::uint32_t exposure = 0;
+    std::uint16_t gain = 0;
+};
+[[nodiscard]] ExposureGain brightness_level(int level);  // level clamped to 0..kBrightnessLevels-1
+
 struct DeviceState {
     std::array<ButtonAction, 3> buttons{};
 };

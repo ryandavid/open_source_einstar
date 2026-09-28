@@ -303,9 +303,9 @@ int main(int argc, char** argv) {
             ImGui::Separator();
             ImGui::BeginDisabled(!state.connected());
             if (!state.scanning()) {
-                if (ImGui::Button("Start scan", ImVec2(-1, 0))) state.start_scan();
+                if (ImGui::Button(state.hud().frames > 0 ? "Resume scan" : "Start scan", ImVec2(-1, 0))) state.start_scan();
             } else {
-                if (ImGui::Button("Stop scan", ImVec2(-1, 0))) state.stop_scan();
+                if (ImGui::Button("Pause scan", ImVec2(-1, 0))) state.stop_scan();
             }
             if (ImGui::Button("Clear model", ImVec2(-1, 0))) state.clear_model();
             ImGui::EndDisabled();
@@ -378,19 +378,26 @@ int main(int argc, char** argv) {
             }
             ImGui::Separator();
             ImGui::TextUnformatted("Scanner settings");
-            bool changed = false;
-            changed |= ImGui::SliderInt("Exposure", &state.settings.exposure, 500, 12000);
-            changed |= ImGui::SliderInt("Gain", &state.settings.gain, 16, 400);
-            changed |= ImGui::SliderInt("Laser %", &state.settings.laser_percent, 0, 100);
-            changed |= ImGui::SliderInt("Strobe", &state.settings.strobe, 0, 9000);
-            if (changed) state.apply_settings();
+            {
+                int level = state.settings.brightness + 1;  // shown 1..21 like the scanner's buttons step it
+                if (ImGui::SliderInt("Brightness", &level, 1, device::kBrightnessLevels)) state.set_brightness(level - 1);
+            }
+            if (ImGui::TreeNode("Advanced")) {
+                bool changed = false;
+                changed |= ImGui::SliderInt("Exposure", &state.settings.exposure, 500, 12000);
+                changed |= ImGui::SliderInt("Gain", &state.settings.gain, 16, 400);
+                changed |= ImGui::SliderInt("Laser %", &state.settings.laser_percent, 0, 100);
+                changed |= ImGui::SliderInt("Strobe", &state.settings.strobe, 0, 9000);
+                if (changed) state.apply_settings();
+                ImGui::TreePop();
+            }
             ImGui::Separator();
             ImGui::Checkbox("Follow scanner", &state.follow_scanner);
             ImGui::SliderFloat("Point size (mm)", &settings.point_size_mm, 0.1f, 3.0f);
             ImGui::Checkbox("Lighting", &settings.lighting);
             ImGui::Separator();
             ImGui::TextUnformatted("Left-drag: orbit  Right-drag: pan  Wheel: zoom");
-            ImGui::TextUnformatted("Scanner button: start / stop");
+            ImGui::TextUnformatted("Scanner buttons: start / pause, brightness - / +");
             ImGui::End();
 
             // ---- HUD ----
@@ -399,7 +406,7 @@ int main(int argc, char** argv) {
             ImGui::SetNextWindowBgAlpha(0.6f);
             ImGui::Begin("HUD", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove);
             if (!state.scanning()) {
-                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1), "Idle");
+                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1), "%s", hud.frames > 0 ? "Paused" : "Idle");
             } else if (hud.tracking_lost) {
                 ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1), "TRACKING LOST");
                 ImGui::TextUnformatted("Move back to the grey frustum");
@@ -407,6 +414,7 @@ int main(int argc, char** argv) {
             } else {
                 ImGui::TextColored(ImVec4(0.3f, 1, 0.4f, 1), "Tracking");
             }
+            if (!hud.notice.empty()) ImGui::TextColored(ImVec4(1, 0.85f, 0.3f, 1), "%s", hud.notice.c_str());
             ImGui::Text("FPS            %5.1f", hud.fps);
             ImGui::Text("Frames         %5d", hud.frames);
             ImGui::Text("Model points   %zu", hud.model_points);
