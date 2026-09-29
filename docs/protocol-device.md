@@ -444,8 +444,11 @@ Logic-layer execute names seen in the log, `ReadData(offset, size)` and
      total image size.
   4. Send 0x1001-byte chunks with op 06, pausing 50 ms between chunks.
   5. `Progress` runs 100 → 950, then 1000.
-* `eraseAppHead` (CC/00) presumably invalidates the application so the
-  device boots into the bootloader.
+* `eraseAppHead` (CC/00): the application erases flash 0x000000–0x00FFFF and
+  resets, with no reply (firmware.md 4.5). What the bootloader then does is
+  not known.
+* Device side of the update, and a retry defect that can leave a shifted
+  image booting: firmware.md 4.6 and 5.1.
 * **Do not implement either in the open driver without a recovery path.**
 
 ---
