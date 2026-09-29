@@ -1,6 +1,13 @@
 cmake_minimum_required(VERSION 3.28)
 project(einstar VERSION 0.1.0 LANGUAGES C CXX OBJC OBJCXX)
 
+get_property(EINSTAR_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(NOT EINSTAR_MULTI_CONFIG AND NOT CMAKE_BUILD_TYPE)
+  message(STATUS "No build type specified; defaulting to RelWithDebInfo")
+  set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
+  set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS Debug Release RelWithDebInfo MinSizeRel)
+endif()
+
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
