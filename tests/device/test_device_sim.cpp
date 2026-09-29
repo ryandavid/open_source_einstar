@@ -60,7 +60,7 @@ TEST_CASE("scan configuration matches EXStar's logged bytes") {
     REQUIRE(h.dev->set_exposure(0, 4400).has_value());
     REQUIRE(h.dev->set_gain(1, 120).has_value());
     REQUIRE(h.dev->set_strobe(0, 6000).has_value());
-    REQUIRE(h.dev->set_indication(device::DistanceIndication::zone2, true).has_value());
+    REQUIRE(h.dev->set_indication(device::DistanceIndication::zone2).has_value());
     const auto cmds = h.sim->received();
     REQUIRE(cmds.size() == before + 6);
     auto expect = [&](std::size_t i, std::uint8_t op, std::vector<std::uint8_t> payload) {
@@ -86,6 +86,32 @@ TEST_CASE("unsafe values are clamped before they reach the device") {
     CHECK(s.strobe[0] == device::kMaxStrobeLuminance);
     CHECK(s.exposure[0] == 20000);
     CHECK_FALSE(h.sim->dangerous_command_seen());
+}
+
+TEST_CASE("the IR pair shares one exposure; the colour sensor has its own") {
+    auto h = connect();
+    REQUIRE(h.dev->set_exposure(0, 4400).has_value());
+    REQUIRE(h.dev->set_exposure(2, 3000).has_value());
+    CHECK(h.dev->exposure(1).value() == 4400);
+    REQUIRE(h.dev->set_exposure(1, 5000).has_value());
+    CHECK(h.dev->exposure(0).value() == 5000);
+    CHECK(h.dev->exposure(2).value() == 3000);
+}
+
+TEST_CASE("trigger periods the firmware would ignore are rejected") {
+    auto h = connect();
+    const auto before = h.sim->received().size();
+    CHECK_FALSE(h.dev->set_trigger_period_us(999).has_value());
+    CHECK_FALSE(h.dev->set_trigger_period_us(1000001).has_value());
+    CHECK(h.sim->received().size() == before);
+    REQUIRE(h.dev->set_trigger_period_us(1000).has_value());
+    REQUIRE(h.dev->set_trigger_period_us(1000000).has_value());
+    CHECK(h.sim->state().trigger_period_us == 1000000);
+}
+
+TEST_CASE("connect does not query the colour mode") {
+    auto h = connect();
+    for (const auto& c : h.sim->received()) CHECK_FALSE((c.group == 0x10 && c.opcode == 0x5D));
 }
 
 TEST_CASE("flash reads span pages and return the exact range") {

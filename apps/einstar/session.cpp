@@ -145,10 +145,10 @@ Result<std::unique_ptr<Session>> Session::open(bool force_emulator, UpdateSink u
 }
 
 Result<void> Session::apply(const ScanSettings& st) {
-    for (int sensor = 0; sensor < 2; ++sensor) {
-        if (auto r = device_->set_exposure(sensor, static_cast<std::uint32_t>(st.exposure)); !r) return r;
+    // Sensors 0 and 1 share one exposure register; gain is per sensor.
+    if (auto r = device_->set_exposure(0, static_cast<std::uint32_t>(st.exposure)); !r) return r;
+    for (int sensor = 0; sensor < 2; ++sensor)
         if (auto r = device_->set_gain(sensor, static_cast<std::uint16_t>(st.gain)); !r) return r;
-    }
     if (auto r = device_->set_laser_percent(st.laser_percent); !r) return r;
     if (auto r = device_->set_strobe(0, st.strobe); !r) return r;
     // Recorded with every frame. The device clamps to the sensors' ranges; read the values back.
@@ -190,7 +190,7 @@ void Session::set_distance_indication(float mean_depth_mm) {
     const int zone = mean_depth_mm <= 0 ? last_zone_ : mean_depth_mm < 250 ? 0 : mean_depth_mm > 450 ? 2 : 1;
     if (zone < 0 || zone == last_zone_) return;
     last_zone_ = zone;
-    (void)device_->set_indication(static_cast<device::DistanceIndication>(zone), true);
+    (void)device_->set_indication(static_cast<device::DistanceIndication>(zone));
 }
 
 }  // namespace einstar::app

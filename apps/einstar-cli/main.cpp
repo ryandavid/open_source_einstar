@@ -84,7 +84,7 @@ void print_device(device::EinstarDevice& dev) {
     for (int i = 0; i < info.sensor_count; ++i) {
         const auto& s = info.sensors[static_cast<std::size_t>(i)];
         std::println("sensor {}    {}x{} {}-bit {}  exposure {}..{}  gain {}..{}", i, s.width, s.height, s.pixel_bits,
-                     s.color_mode ? "colour" : "mono", s.exposure_min, s.exposure_max, s.gain_min, s.gain_max);
+                     i == 2 ? "colour" : "mono", s.exposure_min, s.exposure_max, s.gain_min, s.gain_max);
     }
     if (auto t = dev.temperature_c()) std::println("temperature {:.2f} C", *t);
     if (auto blob = dev.read_flash(0, calib::kFlashBlobSize)) {

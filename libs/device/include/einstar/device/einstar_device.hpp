@@ -34,7 +34,8 @@ struct SensorInfo {
     std::uint32_t exposure_min = 0, exposure_max = 0;
     std::uint16_t gain_min = 0, gain_max = 0;
     std::uint8_t pixel_bits = 0;
-    std::uint8_t color_mode = 0;  // 0 = mono
+    // No colour flag: the firmware's colour-mode reply (10/5D) is an unwritten buffer byte for the
+    // payload the protocol uses. Sensor 2 is the colour camera.
 };
 
 struct DeviceInfo {
@@ -71,6 +72,7 @@ struct DeviceState {
     std::array<ButtonAction, 3> buttons{};
 };
 
+// 10/62 DISTANCE. The firmware maps 0/1/2 to FPGA LED/laser modes 4/1/2 (docs/firmware.md 5).
 enum class DistanceIndication : std::uint8_t { zone0 = 0, zone1 = 1, zone2 = 2 };
 
 struct ConnectOptions {
@@ -99,17 +101,21 @@ public:
     Result<std::vector<std::uint8_t>> read_flash(std::uint32_t offset, std::uint32_t size);
     Result<double> temperature_c();
     Result<DeviceState> read_state();
+    // Sensors 0 and 1 (the IR pair) share one exposure register in the scanner: reading or setting
+    // either one reads or sets both. Sensor 2 has its own (docs/firmware.md 5).
     Result<std::uint32_t> exposure(int sensor);
     Result<std::uint16_t> gain(int sensor);
 
     // ---- volatile configuration ----
     Result<void> set_trigger(int mono_count, int rgb_count);
+    // kMinTriggerPeriodUs..kMaxTriggerPeriodUs, else invalid_argument (the firmware would ignore it
+    // and still reply OK).
     Result<void> set_trigger_period_us(std::uint32_t period);
-    Result<void> set_exposure(int sensor, std::uint32_t value);  // clamped to the sensor's range
+    Result<void> set_exposure(int sensor, std::uint32_t value);  // clamped to the sensor's range; 0 and 1 shared
     Result<void> set_gain(int sensor, std::uint16_t value);      // clamped to the sensor's range
     Result<void> set_laser_percent(int percent);                 // clamped to 0..100
     Result<void> set_strobe(int route, int luminance);           // route 0/1, clamped to 0..kMaxStrobeLuminance
-    Result<void> set_indication(DistanceIndication distance, bool active);
+    Result<void> set_indication(DistanceIndication distance);
     Result<void> clear_state();
 
     // EXStar's scan configuration: 3 IR triggers per cycle, no RGB, 68 ms period.

@@ -57,6 +57,7 @@ inline constexpr OpcodeInfo kTemperature{0x10, 0x50, "Temperature", Safety::read
 inline constexpr OpcodeInfo kSensorCount{0x10, 0x51, "SensorCount", Safety::read, Channel::command, 16};
 inline constexpr OpcodeInfo kFlashRead{0x10, 0x57, "FlashRead", Safety::read, Channel::bulk, 5120};
 inline constexpr OpcodeInfo kFlashWrite{0x10, 0x58, "FlashWrite", Safety::dangerous, Channel::bulk, 5120};
+// Not queried: for a 1-byte payload the firmware leaves the reply byte unwritten (docs/firmware.md 5.1).
 inline constexpr OpcodeInfo kColorMode{0x10, 0x5D, "ColorMode", Safety::read, Channel::command, 16};
 inline constexpr OpcodeInfo kIndication{0x10, 0x62, "Indication", Safety::volatile_write, Channel::command, 16};
 inline constexpr OpcodeInfo kGetLaser{0x10, 0x67, "GetLaser", Safety::read, Channel::command, 50};
@@ -102,5 +103,8 @@ static_assert(guard_allows(0x10, 0x57), "flash read is allowed");
 // Hardware limits we never exceed (maxima observed from EXStar's own session).
 inline constexpr int kMaxLaserPercent = 100;
 inline constexpr int kMaxStrobeLuminance = 9000;
+// The firmware ignores trigger periods outside this range but still replies OK.
+inline constexpr std::uint32_t kMinTriggerPeriodUs = 1000;
+inline constexpr std::uint32_t kMaxTriggerPeriodUs = 1000000;
 
 }  // namespace einstar::device

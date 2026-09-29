@@ -157,7 +157,6 @@ Result<void> EinstarDevice::identify() {
         if (auto r = send<op::kMaxGain>(m)) s.gain_max = reply_u16(*r);
         if (auto r = send<op::kMinGain>(m)) s.gain_min = reply_u16(*r);
         if (auto r = send<op::kPixelBits>(m)) s.pixel_bits = reply_u8(*r);
-        if (auto r = send<op::kColorMode>(m)) s.color_mode = reply_u8(*r);
     }
     log::info("connected: {} / {} serial {} firmware {} ({} sensors, {}x{})", info_.vendor_name, info_.product_name,
               info_.serial, info_.firmware, info_.sensor_count, info_.sensors[0].width, info_.sensors[0].height);
@@ -232,6 +231,9 @@ Result<void> EinstarDevice::set_trigger(int mono, int rgb) {
 }
 
 Result<void> EinstarDevice::set_trigger_period_us(std::uint32_t period) {
+    if (period < kMinTriggerPeriodUs || period > kMaxTriggerPeriodUs)
+        return make_error(Errc::invalid_argument, std::format("trigger period {} us outside {}..{}", period,
+                                                              kMinTriggerPeriodUs, kMaxTriggerPeriodUs));
     const auto p = be32(period);
     auto r = send<op::kSetTriggerPeriod>(p);
     if (!r) return std::unexpected(r.error());
@@ -276,8 +278,10 @@ Result<void> EinstarDevice::set_strobe(int route, int luminance) {
     return {};
 }
 
-Result<void> EinstarDevice::set_indication(DistanceIndication distance, bool active) {
-    const std::uint8_t p[2] = {static_cast<std::uint8_t>(distance), static_cast<std::uint8_t>(active ? 1 : 0)};
+Result<void> EinstarDevice::set_indication(DistanceIndication distance) {
+    // The payload must be 2 bytes. The second (EXStar's DEVICESTATE) is ignored by the firmware;
+    // send 1 as EXStar does while scanning.
+    const std::uint8_t p[2] = {static_cast<std::uint8_t>(distance), 1};
     auto r = send<op::kIndication>(p);
     if (!r) return std::unexpected(r.error());
     return {};

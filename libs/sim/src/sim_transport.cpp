@@ -115,11 +115,18 @@ std::vector<std::uint8_t> SimTransport::handle(std::span<const std::uint8_t> req
             case 0x17: put_be16(data, static_cast<std::uint16_t>(config_.height)); break;
             case 0x20: put_be32(data, config_.exposure_max); break;
             case 0x21: put_be32(data, config_.exposure_min); break;
+            // Exposure as in the firmware: one 15-bit FPGA field for selectors 1..3 (sensors 0 and 1),
+            // another for sensor 2; values above 50000 are ignored with status 0.
             case 0x22: if (s >= 0) put_be32(data, state_.exposure[static_cast<std::size_t>(s)]); else status = 2; break;
-            case 0x23:
-                if (s < 0 || payload.size() < 5) status = 2;
-                else state_.exposure[static_cast<std::size_t>(s)] = be32_at(payload, 1);
+            case 0x23: {
+                if (s < 0 || payload.size() < 5) { status = 2; break; }
+                const std::uint32_t v = be32_at(payload, 1);
+                if (v > 50000) break;
+                const std::uint32_t field = v & 0x7FFF;
+                if (s == 2) state_.exposure[2] = field;
+                else state_.exposure[0] = state_.exposure[1] = field;
                 break;
+            }
             case 0x24: put_be16(data, config_.gain_max); break;
             case 0x25: put_be16(data, config_.gain_min); break;
             case 0x26: if (s >= 0) put_be16(data, state_.gain[static_cast<std::size_t>(s)]); else status = 2; break;
@@ -135,7 +142,12 @@ std::vector<std::uint8_t> SimTransport::handle(std::span<const std::uint8_t> req
                 state_.rgb_triggers = payload[0] >> 4;
                 break;
             case 0x48: put_be32(data, state_.trigger_period_us); break;
-            case 0x49: if (payload.size() >= 4) state_.trigger_period_us = be32_at(payload, 0); else status = 2; break;
+            case 0x49: {  // out-of-range periods are ignored with status 0, as in the firmware
+                if (payload.size() < 4) { status = 2; break; }
+                const std::uint32_t v = be32_at(payload, 0);
+                if (v >= 1000 && v <= 1000000) state_.trigger_period_us = v;
+                break;
+            }
             case 0x50: put_be16(data, static_cast<std::uint16_t>(static_cast<std::int16_t>(config_.temperature_c * 128.0))); break;
             case 0x51: data.push_back(3); break;
             case 0x5D: data.push_back(s == 2 ? 1 : 0); break;
