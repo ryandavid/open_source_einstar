@@ -360,9 +360,28 @@ and Δcx = 619.1, which matches the header closely.
   27.89 ± 0.08 mm** triangulated (diagonal 39.5 mm), so the nominal pitch is
   most likely **28 mm**. Four **larger dots** act as orientation markers: three
   sit on one grid column and one sits between rows, off-grid. The visible grid
-  is ≥ 7 × 6 (41 dots matched per frame). **[M]**
+  is ≥ 7 × 6 (41 dots matched per frame). **[M]** (Superseded by §5.1: 8 × 5 dots at 28.0 mm.)
 
 ---
+
+### 5.1 What the captures show (`einstar-cli board-poses`, `calib-solve`) **[H]**
+
+* The board is **8 × 5 dots** (a search three pitches beyond it finds nothing more), 41 dots with the
+  lone large one. The large dots sit at grid (2, 1), (4, 1), (5, 1) and, off the grid, (3.5, 3).
+* The pitch is **28.0 mm**. The board's scale only sets the baseline: solving EXStar's 25 captures with
+  28.0 mm reproduces its stored baseline to 0.1 mm (0.03%), while 27.89 mm (the earlier triangulation
+  with the stored calibration) is 0.6 mm short.
+* EXStar's 25 captures follow its procedure file in this order: face-on at ~190–510 mm, then the right
+  edge near (~+30° about the scanner's vertical), left edge near, bottom edge near, top edge near, each
+  at five distances from ~220–300 to ~600 mm (the ±18° in the XML is not what is captured; its angle
+  checks are `valid="false"`). None of them put dots in the image corners.
+* **The quick calibration keeps the factory distortion.** The quick (FQFQ) and factory (FAFA) sections
+  hold identical k1..k3/p1/p2, but different focal lengths, principal points and extrinsics; the XML's
+  `cameraInExAlgMethod` is false. Our solve with the factory distortion held reproduces EXStar's quick
+  values from its own captures: focal lengths within 1 px, principal points within 1.2 (x) / 4.5 (y) px,
+  the rig rotation within 0.1°, rectified rows 0.064 px (EXStar's 0.058). EXStar's calibration reprojects
+  its own captures at 0.68 px against our 0.29 px, so it probably also uses a measured board model
+  (the `boardData` blob of §5) rather than a perfect grid.
 
 ## 6. Validation performed
 
@@ -425,3 +444,35 @@ in the repo.
 8. **Write-back.** To write a new calibration to the device, generate fresh
    tails (each value 0..9) and apply the §2.1 table. EXStar's reader does not
    check whether the tail values are random, but this is untested on hardware.
+
+## 8. Host-side calibration (`EinstarCalibration.app`, `libs/calibrate`)
+
+* **Board** (`calibrate/board.hpp`): marker detection (sizes widened for close boards), the four large dots
+  fix the grid (every choice of four large candidates is tried when there are more), a homography
+  associates the grid dots within 0.3 pitch, and a planar PnP gives the board pose.
+* **Plan and guidance** (`calibrate/plan.hpp`): EXStar's 25 views (§5.1). Poses are measured in the scanner
+  frame (midway between the IR cameras, z along the bisector of their axes). The live view draws the
+  board's outline now and where the next view wants it; the side panel shows one distance ladder per
+  orientation (climbed in any order: the nearest uncaptured step is the target), a distance gauge and a
+  tilt target. A view is captured once the board is within 25 mm, 7° and 45 mm of centre and held still
+  for 0.6 s, or with the scanner's start / pause button. The top LED shows red / green / blue for too
+  near / in range / too far. Lighting defaults to EXStar's (exposure 1500, gain 400, ring light 1000,
+  white LEDs 300, projector off, texture mode).
+* **Solve** (`calibrate/solve.hpp`): independent of any stored calibration. Focal lengths come from the
+  board homographies (principal point at the image centre), then the board poses and the left → right
+  pose, then a Ceres bundle adjustment of both cameras (fx, fy, cx, cy, then with distortion), the rig
+  and every board pose, with one outlier pass. "Keep the factory distortion" does what EXStar's quick
+  calibration does. The flash (quick) and factory calibrations are evaluated on the same captures, with
+  only the board poses fitted, and compared parameter by parameter. Rectified row error is the number
+  that matters for stereo.
+* **Output**: captures are saved as `imageLeftN.pgm` / `imageRightN.pgm` / `imageTexN.pgm` (EXStar's naming)
+  under `~/Documents/Einstar/Calibration/<serial>/<time>/`, plus `calibration.txt` (text, OpenCV convention)
+  and `report.txt`. "Use for scanning" copies it to `<serial>/active.txt`, which the Einstar app then uses
+  instead of the flash (its status line names the calibration in use); "Revert to flash" removes it.
+  `einstar-cli` accepts the file wherever it takes a calibration.
+* **Emulator**: the board is rendered through a rig whose right camera has moved (0.25°, cy +1.5 px, fx
+  +0.8 px) since the calibration in the emulated flash. The virtual scanner moves to each asked-for pose,
+  so the whole procedure runs unattended (`EinstarCalibration --snapshot out.png --complete`). It recovers
+  the change (0.262°, +1.78, +0.86) with rows at 0.08 px, while the flash calibration leaves 3.5 px.
+* **Tests** (`test_calibrate`): synthetic views recover the rendering rig (focal length and principal
+  point within 1.5 px, rig within 0.05°); EXStar's captures reproduce its calibration as above.

@@ -63,7 +63,8 @@
   to the other plus small intrinsic shifts. A calibration fitted to three of our board poses brings the
   rows of independent captures to ~0.2 px, markers match (7 of 10 close, 9 of 10 far) and valid depth
   triples. Fix: recalibrate (EXStar's calibration, which rewrites the flash; or a host-side calibration
-  from more board views). Raw captures: `einstar-cli hw-capture` (local, fixtures-data/).
+  with `EinstarCalibration.app`, docs/calibration.md §8). Raw captures: `einstar-cli hw-capture` (local,
+  fixtures-data/).
 - 10/62 DISTANCE 0/1/2 turns the top LED red / green / blue (idle and scanning). Button codes (`einstar-cli
   hw-ui`): 1 single, 2 double, 3 long on start/pause, each cleared once read; the brightness buttons report
   a double click as two singles and a long press as 3 then, 1-2 s later, 2.

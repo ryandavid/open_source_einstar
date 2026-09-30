@@ -48,6 +48,9 @@ target_link_libraries(debug_track PRIVATE einstar::pipeline einstar::synth)
 einstar_add_test(test_markers markers/test_markers.cpp)
 target_link_libraries(test_markers PRIVATE einstar::markers einstar::calib einstar::fixtures)
 
+einstar_add_test(test_calibrate calibrate/test_calibrate.cpp)
+target_link_libraries(test_calibrate PRIVATE einstar::calibrate einstar::fixtures)
+
 einstar_add_test(test_optim optim/test_marker_bundle.cpp)
 target_link_libraries(test_optim PRIVATE einstar::optim)
 add_executable(debug_markers pipeline/debug_markers.cpp)

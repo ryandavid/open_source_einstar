@@ -1,0 +1,5 @@
+add_library(einstar_calibrate src/board.cpp src/plan.cpp src/solve.cpp src/captures.cpp src/synthetic.cpp)
+add_library(einstar::calibrate ALIAS einstar_calibrate)
+target_include_directories(einstar_calibrate PUBLIC include)
+target_link_libraries(einstar_calibrate PUBLIC einstar::core einstar::calib einstar::markers einstar::optim PRIVATE einstar::synth TBB::tbb)
+einstar_target_defaults(einstar_calibrate)

@@ -57,6 +57,10 @@
 
 #include "einstar/calib/device_calibration.hpp"
 #include "einstar/calib/rectify.hpp"
+#include "einstar/calibrate/board.hpp"
+#include "einstar/calibrate/captures.hpp"
+#include "einstar/calibrate/plan.hpp"
+#include "einstar/calibrate/solve.hpp"
 #include "einstar/core/log.hpp"
 #include "einstar/core/timing.hpp"
 #include "einstar/device/einstar_device.hpp"
@@ -90,6 +94,8 @@ int usage() {
                  "       hw-capture [--out DIR] [--label NAME] [--groups N] |\n"
                  "       rig-fit <calibration dir> <dir>... |\n"
                  "       board-check <calibration dir> <dir>... |\n"
+                 "       board-poses <calibration> <dir>... [--pad N] |\n"
+                 "       calib-solve <captures dir> [--reference <calibration>] [--save <file>] [--no-distortion | --distortion-from <calibration>] |\n"
                  "       fixture-pack --out DIR [--mustang <Project1.ir_E10_prj>] [--stl mesh.stl] [--board <dir>] |\n"
                  "       track-fixture <project.ir_E10_prj> [--start N] [--count N] [--skip K] [--stl ref.stl] [--cpu] [--mode geometry|hybrid|markers] [--global-markers] [--marker-confirm N] [--record out.estr] [--quiet] |\n"
                  "       process <session.estr> [-o mesh.stl|ply|obj] [--voxel MM] [--no-optimize] [--smooth N] [--stl reference.stl] [--reference-poses file] |\n"
@@ -866,6 +872,20 @@ Result<calib::DeviceCalibration> load_calibration(std::string_view arg) {
     }
     const bool factory = arg.starts_with("factory:");
     const std::string path(factory ? arg.substr(8) : arg);
+    if (std::filesystem::is_regular_file(path) && !path.ends_with(".bin")) {  // einstar-calibrate's file
+        auto file = calibrate::read_calibration_file(path);
+        if (!file) return std::unexpected(file.error());
+        calib::DeviceCalibration cal;
+        cal.left.model = file->rig.left;
+        cal.right.model = file->rig.right;
+        cal.texture.model = file->rig.texture;
+        cal.right.R_cam_world = file->rig.T_right_left.linear();
+        cal.right.t_cam_world = file->rig.T_right_left.translation();
+        cal.texture.R_cam_world = file->rig.T_texture_left.linear();
+        cal.texture.t_cam_world = file->rig.T_texture_left.translation();
+        cal.calibration_time = file->created;
+        return cal;
+    }
     if (!path.ends_with(".bin")) return calib::load_ccf_directory(path);
     std::ifstream f(path, std::ios::binary);
     std::vector<std::uint8_t> blob((std::istreambuf_iterator<char>(f)), {});
@@ -1568,6 +1588,168 @@ int board_check(std::span<char*> args) {
     return 0;
 }
 
+// Board poses of saved calibration images (EXStar's imageLeftN / our gNNN_s0): dots found, grid extent
+// and the board's pose in each camera. --pad N searches N extra grid rows/columns around the 8 x 5 grid.
+int board_poses(std::span<char*> args) {
+    namespace fs = std::filesystem;
+    if (args.size() < 2) return usage();
+    auto cal = load_calibration(args[0]);
+    if (!cal) {
+        std::println(stderr, "{}", cal.error().message);
+        return 1;
+    }
+    const RigCalibration rig = cal->rig();
+    const int pad = static_cast<int>(arg_int(args, "--pad", 0));
+    calibrate::BoardSpec spec;
+    spec.cols += 2 * pad, spec.rows += 2 * pad;
+    for (auto& l : spec.large) l += Vec2(pad, pad);
+    std::map<std::pair<int, int>, int> seen;
+    const double deg = 180.0 / M_PI;
+    for (std::size_t a = 1; a < args.size(); ++a) {
+        if (std::string_view(args[a]).starts_with("--") || std::string_view(args[a - 1]).starts_with("--")) continue;
+        std::vector<fs::path> lefts;
+        for (const auto& e : fs::directory_iterator(args[a])) {
+            const auto name = e.path().filename().string();
+            if (name.ends_with("_s0.pgm") || (name.starts_with("imageLeft") && name.ends_with(".pgm"))) lefts.push_back(e.path());
+        }
+        std::ranges::sort(lefts, [](const fs::path& x, const fs::path& y) {
+            auto num = [](const fs::path& p) { std::string n = p.stem().string(); n.erase(std::remove_if(n.begin(), n.end(), [](char c) { return !std::isdigit(c); }), n.end()); return n.empty() ? 0 : std::stoi(n); };
+            return num(x) < num(y);
+        });
+        for (const auto& lp : lefts) {
+            const auto name = lp.filename().string();
+            const fs::path rp = lp.parent_path() / (name.starts_with("imageLeft") ? "imageRight" + name.substr(9) : name.substr(0, name.size() - 7) + "_s1.pgm");
+            std::print("{:24}", name);
+            for (int cam = 0; cam < 2; ++cam) {
+                const auto img = read_pgm(cam == 0 ? lp : rp);
+                const auto d = img ? calibrate::detect_board(img->view(), spec) : std::nullopt;
+                if (!d) {
+                    std::print("  {:>58}", "-");
+                    continue;
+                }
+                int c0 = 99, c1 = -99, r0 = 99, r1 = -99;
+                for (const auto& g : d->grid) {
+                    c0 = std::min(c0, int(g.x()) - pad), c1 = std::max(c1, int(g.x()) - pad), r0 = std::min(r0, int(g.y()) - pad), r1 = std::max(r1, int(g.y()) - pad);
+                    ++seen[{int(g.x()) - pad, int(g.y()) - pad}];
+                }
+                const auto pose = calibrate::board_pose(*d, cam == 0 ? rig.left : rig.right, spec);
+                if (!pose) continue;
+                const Mat3 R = pose->T_cam_board.linear();
+                const Vec3 c = pose->T_cam_board * spec.centre();
+                const Vec3 n = R.col(2);
+                std::print("  {:2} dots c{:+d}..{:+d} r{:+d}..{:+d} res {:.2f} rms {:.2f} | z {:5.1f} tilt {:+5.1f} {:+5.1f} roll {:+6.1f}", d->size(), c0, c1, r0, r1,
+                           d->residual_px, pose->rms_px, c.z(), std::atan2(n.y(), n.z()) * deg, std::atan2(n.x(), n.z()) * deg,
+                           std::atan2(R(1, 0), R(0, 0)) * deg);
+            }
+            std::println("");
+        }
+    }
+    if (pad > 0) {
+        std::println("grid positions seen (column, row: count):");
+        for (const auto& [k, v] : seen) std::print(" ({},{}):{}", k.first, k.second, v);
+        std::println("");
+    }
+    return 0;
+}
+
+// Calibrates the IR pair from a folder of board captures (einstar-calibrate's or EXStar's imageLeftN /
+// imageRightN), independently of any stored calibration, and compares the result with a reference
+// calibration (e.g. the scanner's flash, which EXStar made) evaluated on the same captures.
+int calib_solve(std::span<char*> args) {
+    if (args.empty()) return usage();
+    const auto loaded = calibrate::load_captures(args[0]);
+    if (!loaded) {
+        std::println(stderr, "{}", loaded.error().message);
+        return 1;
+    }
+    std::optional<RigCalibration> reference;
+    if (const char* ref = arg_str(args, "--reference")) {
+        auto cal = load_calibration(ref);
+        if (!cal) {
+            std::println(stderr, "{}", cal.error().message);
+            return 1;
+        }
+        reference = cal->rig();
+    }
+    calibrate::SolveOptions so;
+    so.free_distortion = !has_flag(args, "--no-distortion");
+    if (const char* from = arg_str(args, "--distortion-from")) {
+        auto cal = load_calibration(from);
+        if (!cal) {
+            std::println(stderr, "{}", cal.error().message);
+            return 1;
+        }
+        so.fixed_distortion = std::array{cal->left.model.dist, cal->right.model.dist};
+    }
+    Stopwatch sw;
+    auto ours = calibrate::solve_stereo(loaded->captures, loaded->width, loaded->height, {}, so);
+    if (!ours) {
+        std::println(stderr, "solve failed: {}", ours.error().message);
+        return 1;
+    }
+    std::println("solved in {:.0f} ms: {} views, {} dots ({} outliers dropped)", sw.elapsed_ms(), std::ranges::count_if(ours->views, &calibrate::ViewReport::used), ours->dots, ours->dropped);
+    std::optional<calibrate::CalibrationReport> ref_report;
+    if (reference) {
+        if (auto r = calibrate::evaluate_calibration(*reference, loaded->captures)) ref_report = std::move(*r);
+        else std::println(stderr, "reference: {}", r.error().message);
+    }
+    std::println("{:18} {:>4} {:>6} {:>13} | {:>8} {:>8}{}", "view", "dots", "dist", "tilt x/y", "rms", "row rms", ref_report ? " | reference rms / row rms" : "");
+    for (std::size_t i = 0; i < ours->views.size(); ++i) {
+        const auto& v = ours->views[i];
+        const auto& c = loaded->captures[i];
+        if (!v.used) {
+            std::println("{:18} not used (left {} dots, right {})", v.name, c.left.size(), c.right.size());
+            continue;
+        }
+        std::print("{:18} {:>4} {:>6.0f} {:>+6.1f} {:>+6.1f} | {:>8.3f} {:>8.3f}", v.name, v.dots, v.distance_mm, v.tilt_x_deg, v.tilt_y_deg, v.rms_px, v.row_rms_px);
+        if (ref_report) std::print(" | {:>8.3f} {:>8.3f}", ref_report->views[i].rms_px, ref_report->views[i].row_rms_px);
+        std::println("");
+    }
+    std::println("{:18} {:>4} {:>6} {:>13} | {:>8.3f} {:>8.3f}{}", "all", ours->dots, "", "", ours->rms_px, ours->row_rms_px,
+                 ref_report ? std::format(" | {:>8.3f} {:>8.3f}", ref_report->rms_px, ref_report->row_rms_px) : "");
+    auto camera_line = [](const char* name, const CameraModel& m) {
+        std::println("  {:6} f {:9.3f} {:9.3f}  c {:8.3f} {:8.3f}  k {:+.5f} {:+.5f} {:+.6f} {:+.6f} {:+.5f}", name, m.fx, m.fy, m.cx, m.cy, m.dist[0], m.dist[1],
+                     m.dist[2], m.dist[3], m.dist[4]);
+    };
+    auto rig_line = [](const RigCalibration& r) {
+        const Eigen::AngleAxisd aa(r.T_right_left.linear());
+        const Vec3 rv = aa.axis() * aa.angle() * 180.0 / M_PI;
+        const Vec3 t = r.T_right_left.translation();
+        std::println("  rig    rot ({:+.4f}, {:+.4f}, {:+.4f}) deg  t ({:+.3f}, {:+.3f}, {:+.3f}) mm  baseline {:.3f} mm", rv.x(), rv.y(), rv.z(), t.x(), t.y(), t.z(), r.baseline_mm());
+    };
+    std::println("ours:");
+    camera_line("left", ours->rig.left);
+    camera_line("right", ours->rig.right);
+    rig_line(ours->rig);
+    if (reference) {
+        std::println("reference:");
+        camera_line("left", reference->left);
+        camera_line("right", reference->right);
+        rig_line(*reference);
+        const auto d = calibrate::compare_calibrations(*reference, ours->rig);
+        std::println("ours - reference:");
+        for (const auto& [name, c] : {std::pair{"left", d.left}, std::pair{"right", d.right}})
+            std::println("  {:6} f {:+.3f} {:+.3f}  c {:+.3f} {:+.3f}  distortion alone up to {:.3f} px, ray mapping up to {:.3f} px", name, c.dfx, c.dfy, c.dcx,
+                         c.dcy, c.distortion_px, c.mapping_px);
+        std::println("  rig    rot ({:+.4f}, {:+.4f}, {:+.4f}) deg  t ({:+.3f}, {:+.3f}, {:+.3f}) mm  baseline {:+.3f} mm", d.rotation_deg.x(), d.rotation_deg.y(),
+                     d.rotation_deg.z(), d.translation_mm.x(), d.translation_mm.y(), d.translation_mm.z(), d.baseline_mm);
+    }
+    if (const char* out = arg_str(args, "--save")) {
+        calibrate::CalibrationFile f;
+        f.rig = ours->rig;
+        if (reference) f.rig.texture = reference->texture, f.rig.T_texture_left = reference->T_texture_left;
+        f.source = std::format("einstar-cli calib-solve {}", args[0]);
+        f.rms_px = ours->rms_px, f.row_rms_px = ours->row_rms_px;
+        f.views = static_cast<int>(std::ranges::count_if(ours->views, &calibrate::ViewReport::used));
+        if (auto r = calibrate::write_calibration_file(out, f); !r) {
+            std::println(stderr, "{}", r.error().message);
+            return 1;
+        }
+        std::println("saved {}", out);
+    }
+    return 0;
+}
+
 int fixture_pack(std::span<char*> args) {
     namespace fs = std::filesystem;
     const char* out_arg = arg_str(args, "--out");
@@ -2203,6 +2385,8 @@ int main(int argc, char** argv) {
     if (cmd == "hw-capture") return hw_capture(rest);
     if (cmd == "rig-fit") return rig_fit(rest);
     if (cmd == "board-check") return board_check(rest);
+    if (cmd == "board-poses") return board_poses(rest);
+    if (cmd == "calib-solve") return calib_solve(rest);
     if (cmd == "track-fixture" && argc >= 3) return track_fixture(argv[2], rest);
     if (cmd == "inspect" && argc >= 3) return inspect_cmd(argv[2]);
     if (cmd == "process" && argc >= 3) return process_cmd(argv[2], std::span<char*>(argv + 3, static_cast<std::size_t>(argc - 3)));

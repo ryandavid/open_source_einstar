@@ -7,6 +7,7 @@
 #include <format>
 
 #include "einstar/calib/device_calibration.hpp"
+#include "einstar/calibrate/solve.hpp"
 #include "einstar/core/log.hpp"
 #include "einstar/sim/sim_transport.hpp"
 #include "einstar/synth/demo.hpp"
@@ -121,6 +122,18 @@ Result<std::unique_ptr<Session>> Session::open(bool force_emulator, UpdateSink u
     } else {
         return make_error(Errc::protocol, "could not decode the scanner's calibration: " + cal.error().message);
     }
+    // A host-side calibration made with einstar-calibrate ("Use for scanning") replaces the flash one.
+    std::string calibration_source = "flash";
+    // (Not for the emulator: it renders through the flash calibration, and reports the real unit's serial.)
+    if (const auto host = calibrate::active_calibration_path(s->device_->info().serial); !s->emulated_ && std::filesystem::exists(host)) {
+        if (auto file = calibrate::read_calibration_file(host.string())) {
+            rig = file->rig;
+            calibration_source = std::format("host file {} ({})", host.string(), file->created);
+            log::info("calibration from {} ({}, rows {:.3f} px) instead of the flash", host.string(), file->created, file->row_rms_px);
+        } else {
+            log::warn("ignoring {}: {}", host.string(), file.error().message);
+        }
+    }
 
     pipeline::ScanPipelineParams pp;
     pp.block_when_full = s->emulated_;  // the emulator can wait; a real scanner cannot
@@ -145,8 +158,8 @@ Result<std::unique_ptr<Session>> Session::open(bool force_emulator, UpdateSink u
     else if (const char* home = std::getenv("HOME")) s->pipeline_->set_recording_directory(std::string(home) + "/Documents/Einstar/Scans");
     s->pipeline_->start();
 
-    s->description_ = std::format("{} {} (serial {}, firmware {})", s->emulated_ ? "Emulated" : "Scanner", info.product_name,
-                                  info.serial, info.firmware);
+    s->description_ = std::format("{} {} (serial {}, firmware {}); calibration: {}", s->emulated_ ? "Emulated" : "Scanner", info.product_name,
+                                  info.serial, info.firmware, calibration_source);
     return s;
 }
 
