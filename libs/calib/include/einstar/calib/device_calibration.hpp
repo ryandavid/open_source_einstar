@@ -67,6 +67,9 @@ decode_ccf_pair(std::span<const std::uint8_t> left_file, std::span<const std::ui
                                                          std::span<const std::uint8_t> right_file,
                                                          std::span<const std::uint8_t> tex_file);
 [[nodiscard]] Result<DeviceCalibration> decode_flash_blob(std::span<const std::uint8_t> blob);
+// The blob's factory section (FAFA, plain CameraCalibParam per camera; docs/calibration.md 1.1), which
+// holds a separate calibration from the quick CCF files that decode_flash_blob reads.
+[[nodiscard]] Result<DeviceCalibration> decode_factory_section(std::span<const std::uint8_t> blob);
 
 // The three CCF files stored in the flash blob's quick-calibration section: byte-for-byte what EXStar
 // writes to its cache directory (LeftCCF.txt, RightCCF.txt, TexCCF.txt).

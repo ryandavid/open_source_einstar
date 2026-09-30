@@ -51,10 +51,19 @@
   smooth plastic and a specular highlight, not by exposure. Marker detection: 10 of 10 stickers (was 4-5)
   after giving saturated blobs a looser dark-ring test and raising the minimum size to 6 px (on the
   scanner's IR the sticker surround is barely darker than the surface; real speckle and glints are
-  under 7 px). Stereo matching still fails: rectified rows of matching markers disagree by up to ~7 px,
-  position-dependent, while EXStar's captures of the same board agree to 0.05 px with the same
-  calibration, so our raw frames differ geometrically from EXStar's. Raw captures for working on it
-  offline: `einstar-cli hw-capture` (local, fixtures-data/).
+  under 7 px).
+- **The scanner no longer matches its stored calibration.** With the flash calibration, rectified rows of
+  matching markers disagree by up to ~7 px (stereo markers fail, depth is sparse), while EXStar's own
+  captures from that calibration run (tests/fixtures/external/calibration_board) fit it to 0.05 px.
+  EXStar forms frames exactly as we do (its saved right images carry the per-frame metadata at the end,
+  reversed: the same 180-degree turn; nothing else in its configuration or command log touches the
+  pixel geometry). A stereo bundle adjustment (`einstar-cli board-check ... --ba`) fits EXStar's views
+  alone and ours alone equally well (0.31 / 0.35 px) but no single model fits both (ours 1.1+ px): the
+  cameras' geometry changed after 2026-09-27, mainly a ~0.2-0.3 degree rotation of one camera relative
+  to the other plus small intrinsic shifts. A calibration fitted to three of our board poses brings the
+  rows of independent captures to ~0.2 px, markers match (7 of 10 close, 9 of 10 far) and valid depth
+  triples. Fix: recalibrate (EXStar's calibration, which rewrites the flash; or a host-side calibration
+  from more board views). Raw captures: `einstar-cli hw-capture` (local, fixtures-data/).
 - 10/62 DISTANCE 0/1/2 turns the top LED red / green / blue (idle and scanning). Button codes (`einstar-cli
   hw-ui`): 1 single, 2 double, 3 long on start/pause, each cleared once read; the brightness buttons report
   a double click as two singles and a long press as 3 then, 1-2 s later, 2.

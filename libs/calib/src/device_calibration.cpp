@@ -171,6 +171,35 @@ Result<void> write_ccf_directory(const CcfFiles& files, const std::string& dir) 
     return {};
 }
 
+Result<DeviceCalibration> decode_factory_section(std::span<const std::uint8_t> blob) {
+    if (blob.size() < kFlashBlobSize) return make_error(Errc::invalid_argument, "flash blob must be 6568 bytes");
+    if (load_le<std::uint32_t>(blob.data()) != 1 || !tag_at(blob, 0x2F4, "FAFA"))
+        return make_error(Errc::not_found, "flash blob has no factory calibration section");
+    // CameraCalibParam: fc[2], cc[2], kc[5], alpha, R[9] (row-major, world -> camera), T[3] (mm).
+    auto camera = [&](std::size_t off) {
+        std::array<double, 22> d{};
+        for (std::size_t i = 0; i < d.size(); ++i) d[i] = load_le<double>(blob.data() + off + 8 * i);
+        CameraCalibration c;
+        c.model.width = 1280;
+        c.model.height = 1024;
+        c.model.fx = d[0];
+        c.model.fy = d[1];
+        c.model.cx = d[2];
+        c.model.cy = d[3];
+        c.model.dist = {d[4], d[5], d[6], d[7], d[8]};
+        c.model.skew = d[9] * d[0];
+        for (int i = 0; i < 9; ++i) c.R_cam_world(i / 3, i % 3) = d[static_cast<std::size_t>(10 + i)];
+        c.t_cam_world = Vec3(d[19], d[20], d[21]);
+        return c;
+    };
+    DeviceCalibration cal;
+    cal.left = camera(0x00C);
+    cal.right = camera(0x104);
+    cal.texture = camera(0x1FC);
+    cal.calibration_time = "factory";
+    return cal;
+}
+
 Result<DeviceCalibration> decode_flash_blob(std::span<const std::uint8_t> blob) {
     auto files = extract_ccf_files(blob);
     if (!files) return std::unexpected(files.error());

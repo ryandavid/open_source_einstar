@@ -12,5 +12,5 @@ einstar_target_defaults(einstar-app)
 endif()
 
 add_executable(einstar-cli einstar-cli/main.cpp)
-target_link_libraries(einstar-cli PRIVATE einstar::device einstar::sim einstar::calib einstar::fixtures einstar::track einstar::track_metal einstar::session einstar::recon einstar::eval einstar::pipeline)
+target_link_libraries(einstar-cli PRIVATE einstar::device einstar::sim einstar::calib einstar::fixtures einstar::track einstar::track_metal einstar::session einstar::recon einstar::eval einstar::pipeline einstar::optim)
 einstar_target_defaults(einstar-cli)

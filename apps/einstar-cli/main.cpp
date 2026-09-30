@@ -14,6 +14,10 @@
 //                                     depth and marker row offsets on a saved raw pair (as is and turned 180)
 //   hw-capture [--out DIR] [--label NAME] [--groups N]
 //                                     raw captures of the current pose under standard lighting conditions
+//   rig-fit <calibration dir> <dir>...
+//                                     how far raw pairs are from the calibration, and the rig correction that fits them
+//   board-check <calibration dir> <dir>...
+//                                     homography residual of the calibration board in each camera (model fit)
 //   fixture-pack --out DIR [--mustang <Project1.ir_E10_prj>] [--stl mesh.stl] [--board <dir>]
 //                                     pack the excerpts of real EXStar data the tests read
 //                                     (tests/fixtures/external/README.md)
@@ -37,7 +41,9 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <mutex>
+#include <numeric>
 #include <tuple>
 #include <map>
 #include <cstring>
@@ -50,11 +56,14 @@
 #include <vector>
 
 #include "einstar/calib/device_calibration.hpp"
+#include "einstar/calib/rectify.hpp"
 #include "einstar/core/log.hpp"
 #include "einstar/core/timing.hpp"
 #include "einstar/device/einstar_device.hpp"
 #include "einstar/eval/evaluation.hpp"
 #include "einstar/markers/detect.hpp"
+#include "einstar/markers/stereo.hpp"
+#include "einstar/optim/stereo_calibration.hpp"
 #include "einstar/pipeline/stereo_frontend.hpp"
 #include "einstar/fixtures/exstar_project.hpp"
 #include "einstar/fixtures/packaging.hpp"
@@ -79,6 +88,8 @@ int usage() {
                  "       markers-debug <ir.pgm> [--threshold T] [--ring-scale S] [--ring-contrast C] [--ring-bright F] |\n"
                  "       stereo-debug <left.pgm> <right.pgm> <calibration dir> |\n"
                  "       hw-capture [--out DIR] [--label NAME] [--groups N] |\n"
+                 "       rig-fit <calibration dir> <dir>... |\n"
+                 "       board-check <calibration dir> <dir>... |\n"
                  "       fixture-pack --out DIR [--mustang <Project1.ir_E10_prj>] [--stl mesh.stl] [--board <dir>] |\n"
                  "       track-fixture <project.ir_E10_prj> [--start N] [--count N] [--skip K] [--stl ref.stl] [--cpu] [--mode geometry|hybrid|markers] [--global-markers] [--marker-confirm N] [--record out.estr] [--quiet] |\n"
                  "       process <session.estr> [-o mesh.stl|ply|obj] [--voxel MM] [--no-optimize] [--smooth N] [--stl reference.stl] [--reference-poses file] |\n"
@@ -835,12 +846,38 @@ int markers_debug(std::span<char*> args) {
     return 0;
 }
 
+// A calibration argument: a CCF directory, a flash blob (.bin: its quick CCF section) or
+// "factory:<flash blob>" (its factory section).
+Result<calib::DeviceCalibration> load_calibration(std::string_view arg) {
+    if (arg.starts_with("rig:")) {  // written by board-check --ba --save-rig
+        std::ifstream f(std::string(arg.substr(4)));
+        calib::DeviceCalibration cal;
+        for (auto* c : {&cal.left, &cal.right}) {
+            auto& m = c->model;
+            m.width = 1280, m.height = 1024;
+            f >> m.fx >> m.fy >> m.cx >> m.cy >> m.skew;
+            for (auto& d : m.dist) f >> d;
+        }
+        for (int i = 0; i < 9; ++i) f >> cal.right.R_cam_world(i / 3, i % 3);
+        for (int i = 0; i < 3; ++i) f >> cal.right.t_cam_world(i);
+        cal.texture = cal.left;
+        if (!f) return make_error(Errc::invalid_argument, std::format("cannot read rig file {}", arg.substr(4)));
+        return cal;
+    }
+    const bool factory = arg.starts_with("factory:");
+    const std::string path(factory ? arg.substr(8) : arg);
+    if (!path.ends_with(".bin")) return calib::load_ccf_directory(path);
+    std::ifstream f(path, std::ios::binary);
+    std::vector<std::uint8_t> blob((std::istreambuf_iterator<char>(f)), {});
+    return factory ? calib::decode_factory_section(blob) : calib::decode_flash_blob(blob);
+}
+
 // Stereo on a saved raw IR pair (PGM) with a calibration directory: valid depth and the rectified row
 // offsets of markers matched by nearest row, as delivered and with both images turned 180 degrees.
 int stereo_debug(std::span<char*> args) {
     if (args.size() < 3) return usage();
     auto l = read_pgm(args[0]), r = read_pgm(args[1]);
-    auto cal = calib::load_ccf_directory(args[2]);
+    auto cal = load_calibration(args[2]);
     if (!l || !r || !cal) {
         std::println(stderr, "need <left.pgm> <right.pgm> <calibration dir>");
         return 1;
@@ -850,6 +887,44 @@ int stereo_debug(std::span<char*> args) {
         std::ranges::reverse(img.pixels());
         return img;
     };
+    if (has_flag(args, "--orientations")) {
+        // Every flip / rotation of each image and both assignments of the cameras, scored by the row
+        // error of the markers after rectification (the calibration's own convention fits to ~0.05 px).
+        auto transformed = [](const ImageU8& in, int t) {  // 0 identity, 1 horizontal flip, 2 vertical flip, 3 rotate 180
+            ImageU8 o(in.width(), in.height());
+            const bool h = t == 1 || t == 3, v = t == 2 || t == 3;
+            for (int y = 0; y < in.height(); ++y)
+                for (int x = 0; x < in.width(); ++x) o(x, y) = in(h ? in.width() - 1 - x : x, v ? in.height() - 1 - y : y);
+            return o;
+        };
+        const char* names[] = {"id", "hflip", "vflip", "rot180"};
+        const auto& ms = fe.marker_stereo();
+        struct Row { double rms; int matched; std::string what; };
+        std::vector<Row> rows;
+        for (int swap = 0; swap < 2; ++swap)
+            for (int tl = 0; tl < 4; ++tl)
+                for (int tr = 0; tr < 4; ++tr) {
+                    const ImageU8 L = transformed(swap ? *r : *l, tl), R = transformed(swap ? *l : *r, tr);
+                    const auto el = markers::detect_markers(L.view()), er = markers::detect_markers(R.view());
+                    double ss = 0;
+                    int n = 0;
+                    for (const auto& a : el) {
+                        const Vec2 ra = ms.rectify_left(a.center);
+                        double best = 1e9;
+                        for (const auto& b : er) {
+                            const Vec2 rb = ms.rectify_right(b.center);
+                            if (rb.x() < ra.x() && std::abs(rb.y() - ra.y()) < std::abs(best)) best = rb.y() - ra.y();
+                        }
+                        if (std::abs(best) < 30) ss += best * best, ++n;
+                    }
+                    rows.push_back({n ? std::sqrt(ss / n) : 1e9, n,
+                                    std::format("left = {} {:6}, right = {} {:6}", swap ? "sensor 1" : "sensor 0", names[tl], swap ? "sensor 0" : "sensor 1",
+                                                names[tr])});
+                }
+        std::ranges::sort(rows, [](const Row& a, const Row& b) { return a.matched * 1.0 / (1 + a.rms) > b.matched * 1.0 / (1 + b.rms); });
+        for (const auto& row : rows) std::println("  {}: {} matched, row rms {:.3f} px", row.what, row.matched, row.rms);
+        return 0;
+    }
     for (const bool rot : {false, true}) {
         const ImageU8 L = rot ? rotated(*l) : *l, R = rot ? rotated(*r) : *r;
         auto d = fe.process(L, R);
@@ -983,6 +1058,513 @@ int hw_capture(std::span<char*> args) {
         std::println("  {:20} {} groups", c.name, groups.size());
     }
     std::println("saved {}", (root / label).string());
+    return 0;
+}
+
+// Is the calibration still right for these frames? Matches markers / board dots in raw pairs with the
+// given calibration, then fits small corrections to the rig (right-camera rotation; + baseline direction;
+// + right focal scale) that minimise the rectified row differences, and reports what is left.
+// Directories hold gNNN_s0.pgm / gNNN_s1.pgm or imageLeftK.pgm / imageRightK.pgm pairs.
+int rig_fit(std::span<char*> args) {
+    namespace fs = std::filesystem;
+    if (args.size() < 2) return usage();
+    auto cal = load_calibration(args[0]);
+    if (!cal) {
+        std::println(stderr, "{}", cal.error().message);
+        return 1;
+    }
+    const RigCalibration base = cal->rig();
+    struct Match { Vec2 left, right; };
+    std::vector<Match> matches;
+    {
+        const auto rect = calib::compute_rectification(base);
+        const markers::MarkerStereo ms(base, rect, {});
+        for (std::size_t a = 1; a < args.size(); ++a) {
+            if (std::string_view(args[a]).starts_with("--")) continue;
+            std::vector<std::pair<fs::path, fs::path>> pairs;
+            for (const auto& e : fs::directory_iterator(args[a])) {
+                const auto name = e.path().filename().string();
+                if (name.ends_with("_s0.pgm")) pairs.emplace_back(e.path(), e.path().parent_path() / (name.substr(0, name.size() - 7) + "_s1.pgm"));
+                if (name.starts_with("imageLeft") && name.ends_with(".pgm"))
+                    pairs.emplace_back(e.path(), e.path().parent_path() / ("imageRight" + name.substr(9)));
+            }
+            int n = 0;
+            for (const auto& [lp, rp] : pairs) {
+                auto l = read_pgm(lp), r = read_pgm(rp);
+                if (!l || !r) continue;
+                const auto el = markers::detect_markers(l->view()), er = markers::detect_markers(r->view());
+                for (const auto& e : el) {
+                    const Vec2 ra = ms.rectify_left(e.center);
+                    const markers::Ellipse* best = nullptr;
+                    double bd = 12;  // true row errors stay under ~7 px; wider gates pick neighbouring board rows
+                    for (const auto& f : er) {
+                        const Vec2 rb = ms.rectify_right(f.center);
+                        if (rb.x() < ra.x() && std::abs(rb.y() - ra.y()) < bd) bd = std::abs(rb.y() - ra.y()), best = &f;
+                    }
+                    if (best) matches.push_back({e.center, best->center}), ++n;
+                }
+            }
+            std::println("{}: {} pairs, {} matched points", args[a], pairs.size(), n);
+        }
+    }
+    if (matches.size() < 10) {
+        std::println(stderr, "too few matched points");
+        return 1;
+    }
+    {   // Trim mismatches: fit dy = a + b x + c y (rectified) to all points, drop those > 3 sigma, repeat.
+        const auto rect = calib::compute_rectification(base);
+        const markers::MarkerStereo ms(base, rect, {});
+        for (int pass = 0; pass < 3; ++pass) {
+            Eigen::MatrixXd A(static_cast<Eigen::Index>(matches.size()), 3);
+            Eigen::VectorXd d(static_cast<Eigen::Index>(matches.size()));
+            for (std::size_t i = 0; i < matches.size(); ++i) {
+                const Vec2 l = ms.rectify_left(matches[i].left);
+                A.row(static_cast<Eigen::Index>(i)) << 1, l.x(), l.y();
+                d(static_cast<Eigen::Index>(i)) = ms.rectify_right(matches[i].right).y() - l.y();
+            }
+            const Eigen::Vector3d c = A.colPivHouseholderQr().solve(d);
+            const Eigen::VectorXd r = d - A * c;
+            const double sigma = std::sqrt(r.squaredNorm() / static_cast<double>(r.size()));
+            std::vector<Match> kept;
+            for (std::size_t i = 0; i < matches.size(); ++i)
+                if (std::abs(r(static_cast<Eigen::Index>(i))) < std::max(3 * sigma, 0.3)) kept.push_back(matches[i]);
+            if (kept.size() == matches.size()) break;
+            std::println("  trimmed {} mismatched points", matches.size() - kept.size());
+            matches = std::move(kept);
+        }
+    }
+    // Parameters: [0..2] right-camera rotation (rad, applied in the right camera frame), [3..4] baseline
+    // direction (y, z components added to the translation, mm), [5] right focal scale - 1.
+    auto rig_of = [&](const std::array<double, 6>& q) {
+        RigCalibration rig = base;
+        const Mat3 dR = (Eigen::AngleAxisd(q[0], Vec3::UnitX()) * Eigen::AngleAxisd(q[1], Vec3::UnitY()) * Eigen::AngleAxisd(q[2], Vec3::UnitZ())).toRotationMatrix();
+        rig.T_right_left.linear() = dR * base.T_right_left.linear();
+        rig.T_right_left.translation() = dR * base.T_right_left.translation() + Vec3(0, q[3], q[4]);
+        rig.right.fx *= 1 + q[5];
+        rig.right.fy *= 1 + q[5];
+        return rig;
+    };
+    auto cost = [&](const std::array<double, 6>& q) {
+        const RigCalibration rig = rig_of(q);
+        const auto rect = calib::compute_rectification(rig);
+        const markers::MarkerStereo ms(rig, rect, {});
+        double ss = 0;
+        for (const auto& m : matches) {
+            const double d = ms.rectify_right(m.right).y() - ms.rectify_left(m.left).y();
+            ss += d * d;
+        }
+        return std::sqrt(ss / static_cast<double>(matches.size()));
+    };
+    // Nelder-Mead over the parameters a model frees.
+    auto fit = [&](std::vector<int> free) {
+        std::array<double, 6> q{};
+        const std::size_t n = free.size();
+        const double steps[6] = {1e-3, 1e-3, 1e-3, 0.5, 0.5, 1e-3};
+        std::vector<std::array<double, 6>> simplex(n + 1, q);
+        for (std::size_t i = 0; i < n; ++i) simplex[i + 1][static_cast<std::size_t>(free[i])] += steps[free[i]];
+        std::vector<double> f(n + 1);
+        for (std::size_t i = 0; i <= n; ++i) f[i] = cost(simplex[i]);
+        for (int it = 0; it < 600; ++it) {
+            std::vector<std::size_t> o(n + 1);
+            std::iota(o.begin(), o.end(), 0);
+            std::ranges::sort(o, [&](std::size_t a, std::size_t b) { return f[a] < f[b]; });
+            const auto best = simplex[o[0]];
+            const auto worst = simplex[o[n]];
+            std::array<double, 6> c{};
+            for (std::size_t i = 0; i < n; ++i)
+                for (int k : free) c[static_cast<std::size_t>(k)] += simplex[o[i]][static_cast<std::size_t>(k)] / static_cast<double>(n);
+            auto along = [&](double t) {
+                std::array<double, 6> p = best;
+                for (int k : free) p[static_cast<std::size_t>(k)] = c[static_cast<std::size_t>(k)] + t * (worst[static_cast<std::size_t>(k)] - c[static_cast<std::size_t>(k)]);
+                return p;
+            };
+            const auto xr = along(-1);
+            const double fr = cost(xr);
+            if (fr < f[o[0]]) {
+                const auto xe = along(-2);
+                const double fe = cost(xe);
+                if (fe < fr) simplex[o[n]] = xe, f[o[n]] = fe;
+                else simplex[o[n]] = xr, f[o[n]] = fr;
+            } else if (fr < f[o[n - 1]]) {
+                simplex[o[n]] = xr, f[o[n]] = fr;
+            } else {
+                const auto xc = along(0.5);
+                const double fc = cost(xc);
+                if (fc < f[o[n]]) {
+                    simplex[o[n]] = xc, f[o[n]] = fc;
+                } else {
+                    for (std::size_t i = 1; i <= n; ++i) {
+                        for (int k : free)
+                            simplex[o[i]][static_cast<std::size_t>(k)] = best[static_cast<std::size_t>(k)] + 0.5 * (simplex[o[i]][static_cast<std::size_t>(k)] - best[static_cast<std::size_t>(k)]);
+                        f[o[i]] = cost(simplex[o[i]]);
+                    }
+                }
+            }
+        }
+        const auto it = std::ranges::min_element(f);
+        return std::pair{simplex[static_cast<std::size_t>(it - f.begin())], *it};
+    };
+    // Gauss-Newton on the per-point row differences (numeric Jacobian), from the Nelder-Mead result.
+    auto refine = [&](std::array<double, 6> q, const std::vector<int>& free) {
+        auto residuals = [&](const std::array<double, 6>& p) {
+            const RigCalibration rig = rig_of(p);
+            const auto rect = calib::compute_rectification(rig);
+            const markers::MarkerStereo ms(rig, rect, {});
+            Eigen::VectorXd r(static_cast<Eigen::Index>(matches.size()));
+            for (std::size_t i = 0; i < matches.size(); ++i)
+                r(static_cast<Eigen::Index>(i)) = ms.rectify_right(matches[i].right).y() - ms.rectify_left(matches[i].left).y();
+            return r;
+        };
+        for (int it = 0; it < 15; ++it) {
+            const Eigen::VectorXd r0 = residuals(q);
+            Eigen::MatrixXd J(r0.size(), static_cast<Eigen::Index>(free.size()));
+            for (std::size_t k = 0; k < free.size(); ++k) {
+                auto qp = q;
+                const double h = free[k] >= 3 && free[k] <= 4 ? 1e-3 : 1e-6;
+                qp[static_cast<std::size_t>(free[k])] += h;
+                J.col(static_cast<Eigen::Index>(k)) = (residuals(qp) - r0) / h;
+            }
+            const Eigen::VectorXd step = -(J.transpose() * J + 1e-9 * Eigen::MatrixXd::Identity(J.cols(), J.cols())).ldlt().solve(J.transpose() * r0);
+            for (std::size_t k = 0; k < free.size(); ++k) q[static_cast<std::size_t>(free[k])] += step(static_cast<Eigen::Index>(k));
+        }
+        return q;
+    };
+    std::println("{} matched points; row rms with the calibration as is: {:.3f} px", matches.size(), cost({}));
+    // Frame-formation models: an affine warp of one camera's raw pixel coordinates (before undistortion),
+    // with the rig as calibrated. Gauss-Newton on the row residuals with a little damping (the warp's x
+    // terms are only weakly observable from rows).
+    {
+        const auto rect = calib::compute_rectification(base);
+        const markers::MarkerStereo ms(base, rect, {});
+        for (const int cam : {1, 0}) {
+            Eigen::Matrix<double, 6, 1> w = Eigen::Matrix<double, 6, 1>::Zero();  // x' = x + w0 + w1 (x-cx) + w2 (y-cy); y' = y + w3 + w4 (x-cx) + w5 (y-cy)
+            const double cx = 640, cy = 512;
+            auto warp = [&](const Vec2& p, const Eigen::Matrix<double, 6, 1>& q) {
+                const double dx = p.x() - cx, dy = p.y() - cy;
+                return Vec2(p.x() + q(0) + q(1) * dx + q(2) * dy, p.y() + q(3) + q(4) * dx + q(5) * dy);
+            };
+            auto residuals = [&](const Eigen::Matrix<double, 6, 1>& q) {
+                Eigen::VectorXd r(static_cast<Eigen::Index>(matches.size()));
+                for (std::size_t i = 0; i < matches.size(); ++i) {
+                    const Vec2 L = cam == 0 ? warp(matches[i].left, q) : matches[i].left;
+                    const Vec2 R = cam == 1 ? warp(matches[i].right, q) : matches[i].right;
+                    r(static_cast<Eigen::Index>(i)) = ms.rectify_right(R).y() - ms.rectify_left(L).y();
+                }
+                return r;
+            };
+            for (int it = 0; it < 20; ++it) {
+                const Eigen::VectorXd r0 = residuals(w);
+                Eigen::MatrixXd J(r0.size(), 6);
+                for (int k = 0; k < 6; ++k) {
+                    auto q = w;
+                    const double h = (k == 0 || k == 3) ? 1e-3 : 1e-6;
+                    q(k) += h;
+                    J.col(k) = (residuals(q) - r0) / h;
+                }
+                const Eigen::Matrix<double, 6, 1> step = -(J.transpose() * J + 1e-6 * Eigen::Matrix<double, 6, 6>::Identity()).ldlt().solve(J.transpose() * r0);
+                w += step;
+            }
+            const Eigen::VectorXd r = residuals(w);
+            std::println("  affine warp of the {} raw image: row rms {:.3f} px  (shift ({:+.2f}, {:+.2f}) px, x' scale {:+.5f} shear {:+.5f}, y' shear {:+.5f} scale {:+.5f})",
+                         cam == 0 ? "left" : "right", std::sqrt(r.squaredNorm() / static_cast<double>(r.size())), w(0), w(3), w(1), w(2), w(4), w(5));
+        }
+    }
+    const double deg = 180.0 / M_PI;
+    for (const auto& [name, free] : {std::pair{"rotation of the right camera", std::vector<int>{0, 1, 2}},
+                                     std::pair{"+ baseline direction", std::vector<int>{0, 1, 2, 3, 4}},
+                                     std::pair{"+ right focal scale", std::vector<int>{0, 1, 2, 3, 4, 5}}}) {
+        auto [q0, rms0] = fit(free);
+        const auto q = refine(q0, free);
+        const double rms = cost(q);
+        std::println("  {:30} row rms {:.3f} px  (rx {:+.4f} ry {:+.4f} rz {:+.4f} deg, ty {:+.3f} tz {:+.3f} mm, f x{:.5f})", name, rms,
+                     q[0] * deg, q[1] * deg, q[2] * deg, q[3], q[4], 1 + q[5]);
+    }
+    return 0;
+}
+
+// Does each camera's image of the flat calibration board fit its own intrinsics? The dots, undistorted
+// with the camera's calibration, must lie on an exact homography of the 5 x 8 grid; the residual (in
+// pixels) says how far the image departs from the camera model, independently of the other camera.
+int board_check(std::span<char*> args) {
+    namespace fs = std::filesystem;
+    if (args.size() < 2) return usage();
+    auto cal = load_calibration(args[0]);
+    if (!cal) {
+        std::println(stderr, "{}", cal.error().message);
+        return 1;
+    }
+    const RigCalibration rig = cal->rig();
+    auto homography = [](const std::vector<Vec2>& src, const std::vector<Vec2>& dst) {  // DLT, dst ~ H src
+        Eigen::MatrixXd A(2 * src.size(), 9);
+        for (std::size_t i = 0; i < src.size(); ++i) {
+            const double x = src[i].x(), y = src[i].y(), u = dst[i].x(), v = dst[i].y();
+            A.row(static_cast<Eigen::Index>(2 * i)) << -x, -y, -1, 0, 0, 0, u * x, u * y, u;
+            A.row(static_cast<Eigen::Index>(2 * i + 1)) << 0, 0, 0, -x, -y, -1, v * x, v * y, v;
+        }
+        Eigen::JacobiSVD<Eigen::MatrixXd> svd(A, Eigen::ComputeFullV);
+        const Eigen::VectorXd h = svd.matrixV().col(8);
+        Mat3 H;
+        H << h(0), h(1), h(2), h(3), h(4), h(5), h(6), h(7), h(8);
+        return H;
+    };
+    auto apply = [](const Mat3& H, const Vec2& p) {
+        const Vec3 q = H * Vec3(p.x(), p.y(), 1);
+        return Vec2(q.x() / q.z(), q.y() / q.z());
+    };
+    // Grid positions of the board's dots from its four large ones (three in grid row 1 at columns 2, 4, 5,
+    // one between columns 3 and 4 of row 3), which also fix the orientation. Returns grid -> undistorted normalised.
+    struct GridView { std::vector<Vec2> grid, normalised, raw; double residual_px = 0; };
+    auto view_of = [&](const fs::path& path, const CameraModel& cam) -> std::optional<GridView> {
+        auto img = read_pgm(path);
+        if (!img) return std::nullopt;
+        const auto dots = markers::detect_markers(img->view());
+        if (dots.size() < 30) return std::nullopt;
+        std::vector<double> sizes;
+        for (const auto& d : dots) sizes.push_back(d.a);
+        std::ranges::sort(sizes);
+        const double med = sizes[sizes.size() / 2];
+        std::vector<Vec2> n, big, raw;
+        for (const auto& d : dots) {
+            raw.push_back(d.center);
+            n.push_back(calib::undistort_to_normalized(cam, d.center));
+            if (d.a > 1.5 * med) big.push_back(n.back());
+        }
+        if (big.size() != 4) return std::nullopt;
+        // The lone large dot is the one farthest from the line through the other three.
+        std::size_t lone = 0;
+        double worst = -1;
+        for (std::size_t i = 0; i < 4; ++i) {
+            std::vector<Vec2> o;
+            for (std::size_t j = 0; j < 4; ++j)
+                if (j != i) o.push_back(big[j]);
+            const Vec2 d = (o[2] - o[0]).normalized();
+            const double off = std::abs(d.x() * (o[1] - o[0]).y() - d.y() * (o[1] - o[0]).x());
+            if (off < worst || worst < 0) worst = off, lone = i;  // the three others are collinear
+        }
+        std::vector<Vec2> row;
+        for (std::size_t j = 0; j < 4; ++j)
+            if (j != lone) row.push_back(big[j]);
+        // Columns 2, 4, 5: the endpoints are the farthest-apart pair; column 2 is the one farther from the middle.
+        std::size_t e1 = 0, e2 = 1;
+        for (std::size_t i = 0; i < 3; ++i)
+            for (std::size_t j = i + 1; j < 3; ++j)
+                if ((row[i] - row[j]).norm() > (row[e1] - row[e2]).norm()) e1 = i, e2 = j;
+        const Vec2 mid = row[3 - e1 - e2];
+        const bool first_is_col2 = (row[e1] - mid).norm() > (row[e2] - mid).norm();
+        const std::vector<Vec2> r1 = {first_is_col2 ? row[e1] : row[e2], mid, first_is_col2 ? row[e2] : row[e1]};
+        // Initial map: affine from the four large dots (three are collinear, so no homography yet).
+        Mat3 H = Mat3::Identity();
+        {
+            const Vec2 g[4] = {{2, 1}, {4, 1}, {5, 1}, {3.5, 3}};  // (the lone one sits between columns 3 and 4)
+            const Vec2 m[4] = {r1[0], r1[1], r1[2], big[lone]};
+            Eigen::Matrix<double, 8, 6> A = Eigen::Matrix<double, 8, 6>::Zero();
+            Eigen::Matrix<double, 8, 1> b;
+            for (int i = 0; i < 4; ++i) {
+                A.row(2 * i) << g[i].x(), g[i].y(), 1, 0, 0, 0;
+                A.row(2 * i + 1) << 0, 0, 0, g[i].x(), g[i].y(), 1;
+                b(2 * i) = m[i].x();
+                b(2 * i + 1) = m[i].y();
+            }
+            const Eigen::Matrix<double, 6, 1> a = A.colPivHouseholderQr().solve(b);
+            H << a(0), a(1), a(2), a(3), a(4), a(5), 0, 0, 1;
+        }
+        GridView v;
+        for (int iter = 0; iter < 3; ++iter) {
+            v.grid.clear();
+            v.normalised.clear();
+            v.raw.clear();
+            for (int gy = 0; gy < 5; ++gy)
+                for (int gx = 0; gx < 8; ++gx) {
+                    const Vec2 pred = apply(H, Vec2(gx, gy));
+                    std::size_t best = n.size();
+                    double bd = 1e9;
+                    for (std::size_t i = 0; i < n.size(); ++i)
+                        if ((n[i] - pred).norm() < bd) bd = (n[i] - pred).norm(), best = i;
+                    if (best < n.size() && bd * cam.fx < 12) v.grid.emplace_back(gx, gy), v.normalised.push_back(n[best]), v.raw.push_back(raw[best]);
+                }
+            if (v.grid.size() >= 8) H = homography(v.grid, v.normalised);
+        }
+        double ss = 0;
+        for (std::size_t i = 0; i < v.grid.size(); ++i) ss += (apply(H, v.grid[i]) - v.normalised[i]).squaredNorm() * cam.fx * cam.fx;
+        v.residual_px = std::sqrt(ss / static_cast<double>(std::max<std::size_t>(v.grid.size(), 1)));
+        if (v.grid.size() < 20) return std::nullopt;
+        return v;
+    };
+    // Board pose in a camera from the normalised homography (grid in pitch units), refined by Gauss-Newton
+    // on the reprojection error.
+    constexpr double kPitch = 27.89;  // mm (EXStar's own analysis of this board)
+    auto pose_of = [&](const GridView& v) {
+        const Mat3 H = homography(v.grid, v.normalised);
+        const double lambda = 1.0 / H.col(0).norm();
+        Mat3 R;
+        R.col(0) = lambda * H.col(0);
+        R.col(1) = lambda * H.col(1);
+        R.col(2) = R.col(0).cross(R.col(1));
+        Eigen::JacobiSVD<Mat3> svd(R, Eigen::ComputeFullU | Eigen::ComputeFullV);
+        R = svd.matrixU() * svd.matrixV().transpose();
+        if (R.determinant() < 0) R = -R;
+        Vec3 t = lambda * H.col(2) * kPitch;
+        if (t.z() < 0) R.col(0) = -R.col(0), R.col(1) = -R.col(1), t = -t;
+        SE3 T = SE3::Identity();  // board (mm) -> camera
+        T.linear() = R;
+        T.translation() = t;
+        for (int it = 0; it < 10; ++it) {  // Gauss-Newton, 6 dof, numeric Jacobian
+            Eigen::MatrixXd J(2 * v.grid.size(), 6);
+            Eigen::VectorXd e(2 * v.grid.size());
+            auto residuals = [&](const SE3& P, Eigen::VectorXd& out) {
+                for (std::size_t i = 0; i < v.grid.size(); ++i) {
+                    const Vec3 c = P * Vec3(v.grid[i].x() * kPitch, v.grid[i].y() * kPitch, 0);
+                    out(static_cast<Eigen::Index>(2 * i)) = c.x() / c.z() - v.normalised[i].x();
+                    out(static_cast<Eigen::Index>(2 * i + 1)) = c.y() / c.z() - v.normalised[i].y();
+                }
+            };
+            residuals(T, e);
+            for (int k = 0; k < 6; ++k) {
+                Eigen::Matrix<double, 6, 1> d = Eigen::Matrix<double, 6, 1>::Zero();
+                d(k) = k < 3 ? 1e-6 : 1e-4;
+                SE3 P = T;
+                P.linear() = Eigen::AngleAxisd(d.head<3>().norm() > 0 ? d.head<3>().norm() : 0, d.head<3>().norm() > 0 ? Vec3(d.head<3>().normalized()) : Vec3::UnitX()).toRotationMatrix() * T.linear();
+                P.translation() = T.translation() + d.tail<3>();
+                Eigen::VectorXd e2(e.size());
+                residuals(P, e2);
+                J.col(k) = (e2 - e) / d(k);
+            }
+            const Eigen::Matrix<double, 6, 1> step = -(J.transpose() * J).ldlt().solve(J.transpose() * e);
+            const Vec3 w = step.head<3>();
+            if (w.norm() > 0) T.linear() = Eigen::AngleAxisd(w.norm(), w.normalized()).toRotationMatrix() * T.linear();
+            T.translation() += step.tail<3>();
+        }
+        return T;
+    };
+    // Focal scale of a camera from one board view: board pose + a common scale of fx, fy (the tilt of the
+    // board separates focal length from distance). Returns the scale relative to the calibration.
+    auto focal_scale_of = [&](const GridView& v) {
+        SE3 T = pose_of(v);
+        double sc = 1.0;
+        for (int it = 0; it < 20; ++it) {
+            auto residuals = [&](const SE3& P, double f, Eigen::VectorXd& out) {
+                for (std::size_t i = 0; i < v.grid.size(); ++i) {
+                    const Vec3 c = P * Vec3(v.grid[i].x() * kPitch, v.grid[i].y() * kPitch, 0);
+                    out(static_cast<Eigen::Index>(2 * i)) = f * c.x() / c.z() - v.normalised[i].x();
+                    out(static_cast<Eigen::Index>(2 * i + 1)) = f * c.y() / c.z() - v.normalised[i].y();
+                }
+            };
+            Eigen::VectorXd e(2 * static_cast<Eigen::Index>(v.grid.size()));
+            residuals(T, sc, e);
+            Eigen::MatrixXd J(e.size(), 7);
+            for (int k = 0; k < 7; ++k) {
+                SE3 P = T;
+                double f = sc;
+                const double h = k < 3 ? 1e-6 : k < 6 ? 1e-4 : 1e-6;
+                if (k < 3) P.linear() = Eigen::AngleAxisd(h, Vec3::Unit(k)).toRotationMatrix() * T.linear();
+                else if (k < 6) P.translation()(k - 3) += h;
+                else f += h;
+                Eigen::VectorXd e2(e.size());
+                residuals(P, f, e2);
+                J.col(k) = (e2 - e) / h;
+            }
+            const Eigen::Matrix<double, 7, 1> step = -(J.transpose() * J).ldlt().solve(J.transpose() * e);
+            const Vec3 w = step.head<3>();
+            if (w.norm() > 0) T.linear() = Eigen::AngleAxisd(w.norm(), w.normalized()).toRotationMatrix() * T.linear();
+            T.translation() += step.segment<3>(3);
+            sc += step(6);
+        }
+        return sc;
+    };
+    // (Normalised coordinates scale inversely with the focal length: the camera's true focal length is the
+    // calibrated one divided by the fitted factor on the normalised image.)
+    const double deg = 180.0 / M_PI;
+    const SE3 T_cal = rig.T_right_left;
+    const bool ba = has_flag(args, "--ba");
+    std::vector<optim::BoardView> views;
+    std::vector<std::string> set_names;
+    for (std::size_t a = 1; a < args.size(); ++a) {
+        if (std::string_view(args[a]).starts_with("--") || std::string_view(args[a - 1]) == "--save-rig") continue;
+        set_names.emplace_back(args[a]);
+        std::vector<fs::path> lefts;
+        for (const auto& e : fs::directory_iterator(args[a])) {
+            const auto name = e.path().filename().string();
+            if (name.ends_with("_s0.pgm") || (name.starts_with("imageLeft") && name.ends_with(".pgm"))) lefts.push_back(e.path());
+        }
+        std::ranges::sort(lefts);
+        for (const auto& lp : lefts) {
+            const auto name = lp.filename().string();
+            const fs::path rp = lp.parent_path() / (name.starts_with("imageLeft") ? "imageRight" + name.substr(9) : name.substr(0, name.size() - 7) + "_s1.pgm");
+            const auto l = view_of(lp, rig.left), r = view_of(rp, rig.right);
+            std::print("{:52} left {:>13}  right {:>13}", lp.string(), l ? std::format("{:.3f} px ({})", l->residual_px, l->grid.size()) : "-",
+                       r ? std::format("{:.3f} px ({})", r->residual_px, r->grid.size()) : "-");
+            if (l && r && ba) {
+                optim::BoardView bv;
+                bv.set = static_cast<int>(set_names.size()) - 1;
+                bv.T_left_board = pose_of(*l);
+                for (std::size_t i = 0; i < l->grid.size(); ++i)
+                    for (std::size_t j = 0; j < r->grid.size(); ++j)
+                        if (l->grid[i] == r->grid[j]) {
+                            bv.board.emplace_back(l->grid[i].x() * kPitch, l->grid[i].y() * kPitch, 0);
+                            bv.left.push_back(l->raw[i]);
+                            bv.right.push_back(r->raw[j]);
+                        }
+                if (bv.board.size() >= 20) views.push_back(std::move(bv));
+            }
+            if (l && r) {
+                const SE3 T_rl = pose_of(*r) * pose_of(*l).inverse();  // left camera -> right camera
+                const SE3 D = T_cal.inverse() * T_rl;                 // difference, in the left camera frame
+                const Eigen::AngleAxisd aa(D.linear());
+                const Vec3 axis = aa.axis() * aa.angle() * deg;
+                std::print("  vs calibration: rotation ({:+.3f}, {:+.3f}, {:+.3f}) deg, translation ({:+.2f}, {:+.2f}, {:+.2f}) mm, baseline {:.2f} mm",
+                           axis.x(), axis.y(), axis.z(), D.translation().x(), D.translation().y(), D.translation().z(),
+                           T_rl.translation().norm());
+                if (has_flag(args, "--focal"))
+                    std::print("; focal scale left {:.4f} right {:.4f}", 1.0 / focal_scale_of(*l), 1.0 / focal_scale_of(*r));
+            }
+            std::println("");
+        }
+    }
+    if (!ba || views.empty()) return 0;
+    auto report = [&](const char* title, const optim::StereoCalibResult& r) {
+        std::print("  {:34} rms", title);
+        for (std::size_t si = 0; si < r.rms_by_set.size(); ++si) std::print(" [{}] {:.3f}", si, r.rms_by_set[si]);
+        const SE3 D = rig.T_right_left.inverse() * r.rig.T_right_left;
+        const Eigen::AngleAxisd aa(D.linear());
+        const Vec3 rv = aa.axis() * aa.angle() * deg;
+        std::println(" px | left f {:+.2f}/{:+.2f} c {:+.2f}/{:+.2f}, right f {:+.2f}/{:+.2f} c {:+.2f}/{:+.2f} px, rig rot ({:+.3f}, {:+.3f}, {:+.3f}) deg t ({:+.2f}, {:+.2f}, {:+.2f}) mm",
+                     r.rig.left.fx - rig.left.fx, r.rig.left.fy - rig.left.fy, r.rig.left.cx - rig.left.cx, r.rig.left.cy - rig.left.cy,
+                     r.rig.right.fx - rig.right.fx, r.rig.right.fy - rig.right.fy, r.rig.right.cx - rig.right.cx, r.rig.right.cy - rig.right.cy,
+                     rv.x(), rv.y(), rv.z(), D.translation().x(), D.translation().y(), D.translation().z());
+    };
+    std::println("== stereo bundle adjustment ({} views; sets:{}) ==", views.size(), [&] {
+        std::string t;
+        for (std::size_t i = 0; i < set_names.size(); ++i) t += std::format(" [{}] {}", i, set_names[i]);
+        return t;
+    }());
+    optim::StereoCalibOptions fixed;
+    fixed.free_intrinsics = fixed.free_rig = false;
+    report("calibration as stored (poses only)", optim::refine_stereo_calibration(rig, views, fixed));
+    report("joint: intrinsics + rig free", optim::refine_stereo_calibration(rig, views, {}));
+    optim::StereoCalibOptions with_dist;
+    with_dist.free_distortion = true;
+    report("joint: + distortion free", optim::refine_stereo_calibration(rig, views, with_dist));
+    for (std::size_t si = 0; si < set_names.size(); ++si) {
+        std::vector<optim::BoardView> one;
+        for (const auto& v : views)
+            if (v.set == static_cast<int>(si)) one.push_back(v), one.back().set = 0;
+        if (one.size() < 2) continue;
+        const auto r = optim::refine_stereo_calibration(rig, one, {});
+        report(std::format("set [{}] alone: intrinsics + rig free", si).c_str(), r);
+        if (const char* out = arg_str(args, "--save-rig"); out && si + 1 == set_names.size()) {  // the last set's model
+            std::ofstream f(out);
+            for (const auto* m : {&r.rig.left, &r.rig.right}) {
+                f << std::format("{:.9g} {:.9g} {:.9g} {:.9g} {:.9g}", m->fx, m->fy, m->cx, m->cy, m->skew);
+                for (const double d : m->dist) f << std::format(" {:.9g}", d);
+                f << '\n';
+            }
+            for (int i = 0; i < 9; ++i) f << std::format("{:.12g} ", r.rig.T_right_left.linear()(i / 3, i % 3));
+            f << '\n';
+            for (int i = 0; i < 3; ++i) f << std::format("{:.9g} ", r.rig.T_right_left.translation()(i));
+            f << '\n';
+            std::println("  saved the set [{}] model to {} (use as rig:{})", si, out, out);
+        }
+    }
     return 0;
 }
 
@@ -1619,6 +2201,8 @@ int main(int argc, char** argv) {
     if (cmd == "markers-debug") return markers_debug(rest);
     if (cmd == "stereo-debug") return stereo_debug(rest);
     if (cmd == "hw-capture") return hw_capture(rest);
+    if (cmd == "rig-fit") return rig_fit(rest);
+    if (cmd == "board-check") return board_check(rest);
     if (cmd == "track-fixture" && argc >= 3) return track_fixture(argv[2], rest);
     if (cmd == "inspect" && argc >= 3) return inspect_cmd(argv[2]);
     if (cmd == "process" && argc >= 3) return process_cmd(argv[2], std::span<char*>(argv + 3, static_cast<std::size_t>(argc - 3)));
