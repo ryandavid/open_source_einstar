@@ -209,10 +209,12 @@ StereoFrontend::FittedMarkers StereoFrontend::fit_gpu_blobs(const ImageU8& raw_l
     };
     FittedMarkers f;
     f.candidates = static_cast<int>(blobs[0].size() + blobs[1].size());
-    // On this thread only: the fits overlap the GPU stereo, so spreading them over TBB workers would
-    // gain no wall time and cost CPU in workers spinning while the frame waits for the GPU.
-    tbb::task_arena this_thread_only(1);
-    this_thread_only.execute([&] {
+    // Two threads: the fits overlap the GPU stereo. The whole TBB pool spent ~10 ms of CPU per frame in
+    // workers spinning while the frame waits for the GPU; one thread alone no longer hides ~440
+    // candidates behind the stereo (+3 ms per frame). Two keep the wall time and most of the saving
+    // (einstar-bench pipeline, M4 Max: CPU 19 -> 8.9 ms/frame, wall 8.4 -> 8.1 ms).
+    tbb::task_arena fit_arena(2);
+    fit_arena.execute([&] {
         f.left = markers::fit_blobs(raw_left.view(), to_blobs(blobs[0]), params_.marker_detect);
         f.right = markers::fit_blobs(raw_right.view(), to_blobs(blobs[1]), params_.marker_detect);
     });

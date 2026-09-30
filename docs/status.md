@@ -114,8 +114,8 @@ the float GPU solve well conditioned and makes the degeneracy analysis independe
 scan started; the degeneracy/relocalisation thresholds were recalibrated for it.
 
 ## Known issues / next steps
-1. **CPU use** (`einstar-bench pipeline`, emulated frames with markers, recording on): 24.1 → 3.6 ms of CPU per frame across all threads. The work moved to the GPU:
-   - marker blob search: threshold, connected components, per-blob box, size, peak and moments, gates, and a dark-ring pre-check on the moment ellipse; about 100 candidates per frame reach the CPU's sub-pixel fit;
+1. **CPU use** (`einstar-bench pipeline`, emulated frames with markers, recording on): 24.1 → 3.6 ms of CPU per frame across all threads, now 8.9 ms (M4 Max, 2026-09-30): the real-IR marker detection (looser ring test for saturated blobs, a GPU pre-check kept as its superset) raised the candidates reaching the CPU fit from ~100 to ~440 per frame, and fitting them over the whole TBB pool had cost 19 ms (workers spinning while the frame waits for the GPU); the fits now run in a 2-thread arena. Tightening the GPU pre-check again is the next lever. The work moved to the GPU:
+   - marker blob search: threshold, connected components, per-blob box, size, peak and moments, gates, and a dark-ring pre-check on the moment ellipse; about 100 candidates per frame reached the CPU's sub-pixel fit (~440 since the real-IR changes);
    - camera previews: textures copied GPU to GPU;
    - raw IR: the camera frames are used by the GPU in place (page-aligned image storage, no-copy buffers);
    - recording: depth packing on the GPU, zstd level 1.
