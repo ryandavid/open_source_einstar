@@ -43,6 +43,7 @@
 #include "einstar/core/timing.hpp"
 #include "einstar/device/einstar_device.hpp"
 #include "einstar/eval/evaluation.hpp"
+#include "einstar/markers/detect.hpp"
 #include "einstar/pipeline/stereo_frontend.hpp"
 #include "einstar/fixtures/exstar_project.hpp"
 #include "einstar/fixtures/packaging.hpp"
@@ -423,6 +424,35 @@ int hw_test(std::span<char*> args) {
         std::println("  {:14} {:6.1f} / {:6.1f}", name, mean_of(g, 0), mean_of(g, 1));
         if (!g.empty()) write_pgm(out / std::format("light_{}_sensor0.pgm", laser * 100000 + strobe), g.back().sensors[0]->pixels);
     }
+    // 10/62 DISTANCE selects the FPGA laser mode (0/1/2 -> modes 4/1/2, docs/firmware.md 5): what the
+    // "LD" level (10/68) and the strobe do in each. Detail = mean |Laplacian| (speckle shows up there).
+    auto detail_of = [](const std::vector<usb::FrameGroup>& groups, int sensor) {
+        if (groups.empty() || !groups.back().sensors[static_cast<std::size_t>(sensor)]) return -1.0;
+        const auto& img = groups.back().sensors[static_cast<std::size_t>(sensor)]->pixels;
+        double acc = 0;
+        std::size_t n = 0;
+        for (int y = 1; y + 1 < img.height(); y += 2)
+            for (int x = 1; x + 1 < img.width(); x += 2) {
+                const int c = img(x, y);
+                acc += std::abs(4 * c - img(x - 1, y) - img(x + 1, y) - img(x, y - 1) - img(x, y + 1));
+                ++n;
+            }
+        return acc / static_cast<double>(n);
+    };
+    std::println("== laser mode x level (sensor 0: mean / detail) ==");
+    std::println("  {:10} {:>14} {:>14} {:>14} {:>14}", "DISTANCE", "off", "LD 100", "strobe 6000", "both");
+    for (int zone = 0; zone < 3; ++zone) {
+        (void)dev->set_indication(static_cast<device::DistanceIndication>(zone));
+        std::string row = std::format("  {:<10}", zone);
+        for (const auto& [laser, strobe] : {std::pair{0, 0}, std::pair{100, 0}, std::pair{0, 6000}, std::pair{100, 6000}}) {
+            const auto g = stream("laser mode", laser, strobe, 1.0, false, 8, 4400, 120, true);
+            row += std::format(" {:6.1f} / {:5.1f}", mean_of(g, 0), detail_of(g, 0));
+            if (!g.empty()) write_pgm(out / std::format("mode{}_ld{}_strobe{}_sensor0.pgm", zone, laser, strobe), g.back().sensors[0]->pixels);
+        }
+        std::println("{}", row);
+    }
+    (void)dev->set_indication(device::DistanceIndication::zone2);  // the firmware's start-up laser mode
+
     std::println("== exposure / gain (lights off: ambient only; mean IR level, sensors 0 / 1) ==");
     for (const auto& [e, gn] : {std::pair{250u, 120}, std::pair{1000u, 120}, std::pair{4000u, 120}, std::pair{1000u, 30}, std::pair{1000u, 480}}) {
         const auto g = stream("exposure", 0, 0, 1.0, false, 8, e, static_cast<std::uint16_t>(gn), true);
@@ -447,6 +477,20 @@ int hw_test(std::span<char*> args) {
             if (!d) continue;
             d->frame.ensure_cpu();
             const auto& pts = d->frame.points;
+            if (&g == &scan.front()) {
+                // Depth of the first frame (150..700 mm -> bright..dark, black = none) and its z range.
+                ImageU8 depth_img(pts.width(), pts.height());
+                float zmin = 1e9f, zmax = 0;
+                for (int y = 0; y < pts.height(); ++y)
+                    for (int x = 0; x < pts.width(); ++x) {
+                        const float z = pts(x, y).z();
+                        depth_img(x, y) = z > 0 ? static_cast<std::uint8_t>(std::clamp(255.0f - (z - 150.0f) * 200.0f / 550.0f, 30.0f, 255.0f)) : 0;
+                        if (z > 0) zmin = std::min(zmin, z), zmax = std::max(zmax, z);
+                    }
+                write_pgm(out / "depth_frame0.pgm", depth_img);
+                std::println("  frame 0: depth {:.0f}..{:.0f} mm; {} stereo markers, {} left detections unmatched", zmin, zmax,
+                             d->markers.size(), d->unmatched_left.size());
+            }
             valid.push_back(static_cast<double>(std::ranges::count_if(pts.pixels(), [](const Vec3f& p) { return p.z() > 0; })) /
                             static_cast<double>(pts.size()));
             stereo_ms.push_back(d->stereo_ms);
@@ -462,6 +506,87 @@ int hw_test(std::span<char*> args) {
                      valid.size(), 100 * median(valid), 100 * (valid.empty() ? 0.0 : std::ranges::min(valid)), median(stereo_ms),
                      median(left_markers), median(stereo_markers));
         check(!valid.empty() && median(valid) > 0.05, "depth from real IR");
+
+        {  // The rectified pair of the first frame (half resolution), for offline checks.
+            pipeline::StereoFrontendParams rp;
+            rp.cpu_previews = true;
+            pipeline::StereoFrontend rfe(cal->rig(), rp);
+            if (auto d = rfe.process(scan.front().sensors[0]->pixels, scan.front().sensors[1]->pixels); !d.rectified_left.empty()) {
+                write_pgm(out / "rectified_left.pgm", d.rectified_left);
+                write_pgm(out / "rectified_right.pgm", d.rectified_right);
+            }
+        }
+        // Epipolar check on the markers: after rectification, a marker must sit on the same row in both
+        // images (SGM and the marker matcher search along rows).
+        {
+            const auto& g = scan.front();
+            const auto l = markers::detect_markers(g.sensors[0]->pixels.view());
+            const auto r = markers::detect_markers(g.sensors[1]->pixels.view());
+            const auto& ms = fe.marker_stereo();
+            std::vector<double> ly, ry;
+            for (const auto& e : l) ly.push_back(ms.rectify_left(e.center).y());
+            for (const auto& e : r) ry.push_back(ms.rectify_right(e.center).y());
+            std::vector<double> dy;
+            for (const double y : ly) {
+                double best = 1e9;
+                for (const double y2 : ry) best = std::abs(y2 - y) < std::abs(best) ? y2 - y : best;
+                if (std::abs(best) < 1e8) dy.push_back(best);
+            }
+            std::ranges::sort(dy);
+            std::print("  markers: {} left, {} right; rectified row offset to the nearest right marker (px):", l.size(), r.size());
+            for (const double d : dy) std::print(" {:.1f}", d);
+            std::println("");
+        }
+
+        // What exposure and gain do with the scanner's own light (projector + strobe on): brightness,
+        // valid depth and stereo markers per setting.
+        std::println("== exposure / gain with the projector and strobe on (mean IR / valid depth / stereo markers) ==");
+        for (const auto& [e, gn] : {std::pair{1100u, 120}, std::pair{2200u, 120}, std::pair{4400u, 120}, std::pair{8800u, 120},
+                                    std::pair{4400u, 240}, std::pair{4400u, 480}, std::pair{8800u, 240}}) {
+            const auto groups = stream("brightness", 100, 6000, 1.0, false, 6, e, static_cast<std::uint16_t>(gn), true);
+            if (groups.empty()) continue;
+            std::vector<double> v;
+            std::vector<int> mk;
+            for (std::size_t i = std::min<std::size_t>(2, groups.size() - 1); i < groups.size(); ++i) {  // (settled frames)
+                auto d = fe.process(groups[i]);
+                if (!d) continue;
+                d->frame.ensure_cpu();
+                v.push_back(static_cast<double>(std::ranges::count_if(d->frame.points.pixels(), [](const Vec3f& p) { return p.z() > 0; })) /
+                            static_cast<double>(d->frame.points.size()));
+                mk.push_back(static_cast<int>(d->markers.size()));
+            }
+            std::println("  exposure {:5} gain {:3}: {:6.1f} / {:5.1f}% / {}", e, gn, mean_of(groups, 0), 100 * median(v), median(mk));
+            write_pgm(out / std::format("bright_e{}_g{}_sensor0.pgm", e, gn), groups.back().sensors[0]->pixels);
+        }
+
+        // Image orientation: which flip of each IR image matches the flash calibration? (On the first
+        // hardware run sensor 1 looked vertically mirrored relative to sensors 0 and 2.)
+        std::println("== IR image orientation vs the calibration (valid depth / stereo markers, median of 10 frames) ==");
+        auto flipped = [](const ImageU8& in, bool vertical, bool horizontal) {
+            ImageU8 o(in.width(), in.height());
+            for (int y = 0; y < in.height(); ++y)
+                for (int x = 0; x < in.width(); ++x) o(x, y) = in(horizontal ? in.width() - 1 - x : x, vertical ? in.height() - 1 - y : y);
+            return o;
+        };
+        const std::pair<const char*, std::pair<bool, bool>> variants[] = {
+            {"as delivered", {false, false}}, {"vertical flip", {true, false}}, {"horizontal flip", {false, true}}, {"rotate 180", {true, true}}};
+        for (int which = 0; which < 2; ++which)
+            for (const auto& [name, vh] : variants) {
+                if (which == 1 && !vh.first && !vh.second) continue;  // (same as sensor 0's "as delivered")
+                std::vector<double> v;
+                std::vector<int> mk;
+                for (std::size_t i = 0; i < std::min<std::size_t>(scan.size(), 10); ++i) {
+                    const auto& g = scan[i];
+                    ImageU8 l = g.sensors[0]->pixels, r = g.sensors[1]->pixels;
+                    (which == 0 ? r : l) = flipped(which == 0 ? r : l, vh.first, vh.second);
+                    auto d = fe.process(l, r);
+                    d.frame.ensure_cpu();
+                    v.push_back(static_cast<double>(std::ranges::count_if(d.frame.points.pixels(), [](const Vec3f& p) { return p.z() > 0; })) /
+                                static_cast<double>(d.frame.points.size()));
+                    mk.push_back(static_cast<int>(d.markers.size()));
+                }
+                std::println("  sensor {} {:16} {:5.1f}% / {}", which == 0 ? 1 : 0, name, 100 * median(v), median(mk));
+            }
     }
 
     if (texture_seconds > 0) {
