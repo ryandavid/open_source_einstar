@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <tbb/parallel_invoke.h>
+#include <tbb/task_arena.h>
 
 #include <Eigen/Eigenvalues>
 
@@ -208,8 +209,13 @@ StereoFrontend::FittedMarkers StereoFrontend::fit_gpu_blobs(const ImageU8& raw_l
     };
     FittedMarkers f;
     f.candidates = static_cast<int>(blobs[0].size() + blobs[1].size());
-    f.left = markers::fit_blobs(raw_left.view(), to_blobs(blobs[0]), params_.marker_detect);
-    f.right = markers::fit_blobs(raw_right.view(), to_blobs(blobs[1]), params_.marker_detect);
+    // On this thread only: the fits overlap the GPU stereo, so spreading them over TBB workers would
+    // gain no wall time and cost CPU in workers spinning while the frame waits for the GPU.
+    tbb::task_arena this_thread_only(1);
+    this_thread_only.execute([&] {
+        f.left = markers::fit_blobs(raw_left.view(), to_blobs(blobs[0]), params_.marker_detect);
+        f.right = markers::fit_blobs(raw_right.view(), to_blobs(blobs[1]), params_.marker_detect);
+    });
     f.ms = sw.elapsed_ms();
     return f;
 }
