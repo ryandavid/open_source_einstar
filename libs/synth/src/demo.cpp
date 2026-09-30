@@ -29,8 +29,8 @@ RigCalibration synthetic_einstar_rig() {
     rig.right.cx = 633.8;
     rig.right.cy = 506.0;
     SE3 T = SE3::Identity();
-    T.linear() = Eigen::AngleAxisd(-22.15 * M_PI / 180, Vec3::UnitY()).toRotationMatrix();
-    T.translation() = -T.linear() * Vec3(156.9, 0.2, -30.7);
+    T.linear() = Eigen::AngleAxisd(22.15 * M_PI / 180, Vec3::UnitY()).toRotationMatrix();
+    T.translation() = -T.linear() * Vec3(156.9, 0.2, 30.7);
     rig.T_right_left = T;
     return rig;
 }
