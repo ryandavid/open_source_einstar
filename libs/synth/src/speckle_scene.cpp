@@ -119,8 +119,10 @@ DotPattern DotPattern::random(int width, int height, int num_dots, double sigma_
 
 float DotPattern::sample(double u, double v) const {
     const double x = u - 0.5, y = v - 0.5;
+    // Range-check before converting: points far off-axis or behind the projector project to values beyond
+    // int (converting them is undefined; on arm64 it saturates, and x0 + 1 then overflows past the check).
+    if (!(x >= 0 && y >= 0 && x < width - 1 && y < height - 1)) return 0.0f;
     const int x0 = static_cast<int>(std::floor(x)), y0 = static_cast<int>(std::floor(y));
-    if (x0 < 0 || y0 < 0 || x0 + 1 >= width || y0 + 1 >= height) return 0.0f;
     const float fx = static_cast<float>(x - x0), fy = static_cast<float>(y - y0);
     const float a = intensity(x0, y0), b = intensity(x0 + 1, y0);
     const float c = intensity(x0, y0 + 1), d = intensity(x0 + 1, y0 + 1);
