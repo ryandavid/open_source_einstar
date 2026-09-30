@@ -126,7 +126,7 @@ Result<void> CalibrationController::connect(bool emulator) {
         }
         emu->truth = moved_rig(stored);
         // Start well away from the first pose so the guidance has something to say.
-        emu->hand = calibrate::target_pose(plan_.front(), 90, stored);
+        emu->hand = calibrate::target_pose(plan_.front(), plan_.front().roll_deg, stored);
         emu->hand.translation() += Vec3(40, -30, 160);
         sim->set_frame_provider([emu](int sensor, std::uint32_t frame_id, ImageU8& out) {
             std::lock_guard lk(emu->mutex);
@@ -293,8 +293,14 @@ void CalibrationController::worker_loop(std::stop_token st) {
 }
 
 int CalibrationController::guided_target(const calibrate::BoardMeasure* m) const {
-    // The active group's uncaptured step nearest the current distance (the ladder is climbed in any
-    // order); once a group is complete, the next incomplete one.
+    // Near an uncaptured view (within 1.5 tolerances of its distance and tilt): that one, on whichever line
+    // it is -- any dot can be gone for. Otherwise the active group's uncaptured step nearest the current
+    // distance (a line is climbed in any order); once a group is complete, the next incomplete one.
+    if (m) {
+        std::vector<bool> done(plan_.size());
+        for (std::size_t i = 0; i < plan_.size(); ++i) done[i] = captures_[i].has_value();
+        if (const auto n = calibrate::nearest_target(plan_, done, *m); n.index >= 0 && n.error <= 1.5) return n.index;
+    }
     const int groups = plan_.back().group + 1;
     for (int k = 0; k < groups; ++k) {
         const int g = (group_.load() + k) % groups;
@@ -382,7 +388,10 @@ void CalibrationController::process(usb::FrameGroup&& g) {
     if (auto emu = std::static_pointer_cast<Emulator>(emulator_)) {
         std::lock_guard elk(emu->mutex);
         emu->has_goal = live_.target >= 0;
-        if (emu->has_goal) emu->goal = calibrate::target_pose(plan_[static_cast<std::size_t>(live_.target)], 90, guidance_rig_);
+        if (emu->has_goal) {
+            const auto& t = plan_[static_cast<std::size_t>(live_.target)];
+            emu->goal = calibrate::target_pose(t, t.roll_deg, guidance_rig_);
+        }
     }
 }
 

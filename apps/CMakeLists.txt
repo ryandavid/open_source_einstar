@@ -12,7 +12,8 @@ einstar_target_defaults(einstar-app)
 
 add_executable(einstar-calibrate MACOSX_BUNDLE
   einstar-calibrate/main.mm
-  einstar-calibrate/calibration_controller.cpp)
+  einstar-calibrate/calibration_controller.cpp
+  einstar-calibrate/board_view.cpp)
 set_target_properties(einstar-calibrate PROPERTIES OUTPUT_NAME EinstarCalibration)
 target_include_directories(einstar-calibrate PRIVATE einstar-calibrate)
 target_compile_definitions(einstar-calibrate PRIVATE EINSTAR_CALIBRATION_FIXTURE="${PROJECT_SOURCE_DIR}/tests/fixtures/calibration/einstar_e10")

@@ -10,6 +10,11 @@
 //
 // Poses are measured in the scanner frame: origin midway between the two IR cameras, z along the
 // bisector of their optical axes, x towards the right camera, y = z x x.
+//
+// Roll (the board's in-plane rotation in the view) is held at 90 +- 20 degrees: the board's long axis runs
+// along the image's vertical, as in all of EXStar's 25 captures (76..107 degrees). The tilted groups are
+// defined in the image's terms ("right edge near"), so a fixed roll makes each group one direction from
+// the board: seen from the board, the plan is five lines from its centre with five distances on each.
 
 #include <string>
 #include <vector>
@@ -27,7 +32,7 @@ struct BoardMeasure {
     Vec2 offset_mm{0, 0};      // board centre off the scanner's axis (x, y)
     double tilt_x_deg = 0;     // about the scanner's x axis (bottom edge nearer, image down being +y: +)
     double tilt_y_deg = 0;     // about the y axis (right edge nearer: +)
-    double roll_deg = 0;       // board's in-plane rotation (not constrained by the plan)
+    double roll_deg = 0;       // board's in-plane rotation: board x from the scanner's x towards its y
 };
 // T_left_board: board -> left camera (board_pose).
 [[nodiscard]] BoardMeasure measure_board(const SE3& T_left_board, const RigCalibration& rig, const BoardSpec& board = {});
@@ -37,24 +42,43 @@ struct PoseTarget {
     std::string label;  // e.g. "face-on, 280 mm"
     double distance_mm = 0;
     double tilt_x_deg = 0, tilt_y_deg = 0;
+    double roll_deg = 90;
     double distance_tol_mm = 25;
     double tilt_tol_deg = 7;
     double offset_tol_mm = 45;
+    double roll_tol_deg = 20;
 };
 [[nodiscard]] std::vector<PoseTarget> default_plan();
 
-// The target's board pose in the left camera, keeping the board's current roll (so the drawn target
-// outline only asks for distance, tilt and centring).
+// The target's board pose in the left camera, at the given roll (the target's own: t.roll_deg).
 [[nodiscard]] SE3 target_pose(const PoseTarget& target, double roll_deg, const RigCalibration& rig, const BoardSpec& board = {});
 
+// ---- the board-centred view: poses in board coordinates ----
+// The board pose in the scanner frame that `m` describes (the inverse of measure_board, rig-free).
+[[nodiscard]] SE3 scanner_from_board(const BoardMeasure& m, const BoardSpec& board = {});
+// A target as a measure: on the scanner's axis (no offset), at its own roll.
+[[nodiscard]] BoardMeasure target_measure(const PoseTarget& t);
+// The scanner (its frame) in board coordinates, for a measure or a target.
+[[nodiscard]] inline SE3 board_from_scanner(const BoardMeasure& m, const BoardSpec& board = {}) { return scanner_from_board(m, board).inverse(); }
+[[nodiscard]] inline SE3 board_from_scanner(const PoseTarget& t, const BoardSpec& board = {}) { return board_from_scanner(target_measure(t), board); }
+
+// The uncaptured target nearest the measured pose, and how near: the largest of its distance and tilt
+// errors in units of their tolerances (<= 1: within both). -1 when all are captured.
+struct NearestTarget {
+    int index = -1;
+    double error = 0;
+};
+[[nodiscard]] NearestTarget nearest_target(const std::vector<PoseTarget>& plan, const std::vector<bool>& captured, const BoardMeasure& m);
+
 struct Guidance {
-    bool distance_ok = false, tilt_ok = false, offset_ok = false;
+    bool distance_ok = false, tilt_ok = false, offset_ok = false, roll_ok = false;
     double distance_error_mm = 0;  // measured - target
     Vec2 tilt_error_deg{0, 0};     // measured - target (x, y)
     Vec2 offset_mm{0, 0};
+    double roll_error_deg = 0;     // measured - target, -180..180
     std::vector<std::string> hints;  // what to change, most important first (empty when in position)
 
-    [[nodiscard]] bool ok() const { return distance_ok && tilt_ok && offset_ok; }
+    [[nodiscard]] bool ok() const { return distance_ok && tilt_ok && offset_ok && roll_ok; }
     // 0..1 closeness across all criteria (for a progress-style indicator).
     [[nodiscard]] double score(const PoseTarget& t) const;
 };

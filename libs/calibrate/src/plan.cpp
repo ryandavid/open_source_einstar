@@ -80,17 +80,46 @@ std::vector<PoseTarget> default_plan() {
     return plan;
 }
 
-SE3 target_pose(const PoseTarget& t, double roll_deg, const RigCalibration& rig, const BoardSpec& board) {
-    const Vec3 n = normal_from_tilts(t.tilt_x_deg, t.tilt_y_deg);
+SE3 scanner_from_board(const BoardMeasure& m, const BoardSpec& board) {
+    const Vec3 n = normal_from_tilts(m.tilt_x_deg, m.tilt_y_deg);
     SE3 T_S_board = SE3::Identity();
-    T_S_board.linear() = rotation_between(Vec3::UnitZ(), n) * Eigen::AngleAxisd(roll_deg / kDeg, Vec3::UnitZ()).toRotationMatrix();
-    T_S_board.translation() = Vec3(0, 0, t.distance_mm) - T_S_board.linear() * board.centre();
-    return scanner_from_left(rig).inverse() * T_S_board;
+    T_S_board.linear() = rotation_between(Vec3::UnitZ(), n) * Eigen::AngleAxisd(m.roll_deg / kDeg, Vec3::UnitZ()).toRotationMatrix();
+    T_S_board.translation() = Vec3(m.offset_mm.x(), m.offset_mm.y(), m.distance_mm) - T_S_board.linear() * board.centre();
+    return T_S_board;
+}
+
+BoardMeasure target_measure(const PoseTarget& t) {
+    BoardMeasure m;
+    m.distance_mm = t.distance_mm;
+    m.tilt_x_deg = t.tilt_x_deg;
+    m.tilt_y_deg = t.tilt_y_deg;
+    m.roll_deg = t.roll_deg;
+    return m;
+}
+
+SE3 target_pose(const PoseTarget& t, double roll_deg, const RigCalibration& rig, const BoardSpec& board) {
+    BoardMeasure m = target_measure(t);
+    m.roll_deg = roll_deg;
+    return scanner_from_left(rig).inverse() * scanner_from_board(m, board);
+}
+
+NearestTarget nearest_target(const std::vector<PoseTarget>& plan, const std::vector<bool>& captured, const BoardMeasure& m) {
+    NearestTarget best;
+    best.error = 1e18;
+    for (std::size_t i = 0; i < plan.size(); ++i) {
+        if (i < captured.size() && captured[i]) continue;
+        const auto& t = plan[i];
+        const double e = std::max(std::abs(m.distance_mm - t.distance_mm) / t.distance_tol_mm,
+                                  std::hypot(m.tilt_x_deg - t.tilt_x_deg, m.tilt_y_deg - t.tilt_y_deg) / t.tilt_tol_deg);
+        if (e < best.error) best = {static_cast<int>(i), e};
+    }
+    if (best.index < 0) best.error = 0;
+    return best;
 }
 
 double Guidance::score(const PoseTarget& t) const {
     const double worst = std::max({std::abs(distance_error_mm) / t.distance_tol_mm, tilt_error_deg.norm() / t.tilt_tol_deg,
-                                   offset_mm.norm() / t.offset_tol_mm});
+                                   offset_mm.norm() / t.offset_tol_mm, std::abs(roll_error_deg) / t.roll_tol_deg});
     return std::clamp(1.0 - (worst - 1.0) / 4.0, 0.0, 1.0) * (worst <= 1.0 ? 1.0 : 0.9);
 }
 
@@ -99,9 +128,11 @@ Guidance guide(const BoardMeasure& m, const PoseTarget& t) {
     g.distance_error_mm = m.distance_mm - t.distance_mm;
     g.tilt_error_deg = Vec2(m.tilt_x_deg - t.tilt_x_deg, m.tilt_y_deg - t.tilt_y_deg);
     g.offset_mm = m.offset_mm;
+    g.roll_error_deg = std::remainder(m.roll_deg - t.roll_deg, 360.0);
     g.distance_ok = std::abs(g.distance_error_mm) <= t.distance_tol_mm;
     g.tilt_ok = g.tilt_error_deg.norm() <= t.tilt_tol_deg;
     g.offset_ok = g.offset_mm.norm() <= t.offset_tol_mm;
+    g.roll_ok = std::abs(g.roll_error_deg) <= t.roll_tol_deg;
     // Hints in the camera view's terms (image right = scanner +x, image down = +y), largest error first.
     struct Hint {
         double weight;
@@ -125,6 +156,15 @@ Guidance guide(const BoardMeasure& m, const PoseTarget& t) {
         const Vec2 o = g.offset_mm;
         const char* dir = std::abs(o.x()) >= std::abs(o.y()) ? (o.x() > 0 ? "right" : "left") : (o.y() > 0 ? "down" : "up");
         hints.push_back({o.norm() / t.offset_tol_mm, std::format("Centre the board: aim the scanner {} ({:.0f} mm)", dir, o.norm())});
+    }
+    if (!g.roll_ok) {
+        // Turning the scanner clockwise (seen from behind it) turns the board anticlockwise in the view,
+        // lowering its roll. Far off (the board sideways or upside down): say how the board should lie.
+        const double e = g.roll_error_deg;
+        hints.push_back({std::abs(e) / t.roll_tol_deg,
+                         std::abs(e) > 60 ? std::format("Turn the scanner {} {:.0f} deg: the board's long side should run up the view",
+                                                        e > 0 ? "clockwise" : "anticlockwise", std::abs(e))
+                                          : std::format("Turn the scanner {} ({:.0f} deg)", e > 0 ? "clockwise" : "anticlockwise", std::abs(e))});
     }
     std::ranges::sort(hints, [](const Hint& a, const Hint& b) { return a.weight > b.weight; });
     for (auto& h : hints) g.hints.push_back(std::move(h.text));

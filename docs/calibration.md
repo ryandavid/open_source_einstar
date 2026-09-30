@@ -451,11 +451,23 @@ in the repo.
   fix the grid (every choice of four large candidates is tried when there are more), a homography
   associates the grid dots within 0.3 pitch, and a planar PnP gives the board pose.
 * **Plan and guidance** (`calibrate/plan.hpp`): EXStar's 25 views (§5.1). Poses are measured in the scanner
-  frame (midway between the IR cameras, z along the bisector of their axes). The live view draws the
-  board's outline now and where the next view wants it; the side panel shows one distance ladder per
-  orientation (climbed in any order: the nearest uncaptured step is the target), a distance gauge and a
-  tilt target. A view is captured once the board is within 25 mm, 7° and 45 mm of centre and held still
-  for 0.6 s, or with the scanner's start / pause button. The top LED shows red / green / blue for too
+  frame (midway between the IR cameras, z along the bisector of their axes). The board's roll is held at
+  90° ± 20° (its long side up the view), as in all 25 of EXStar's captures (76–107°): the tilted groups are
+  named in the image's terms ("right edge near"), so with the roll fixed each group is one direction from
+  the board. Seen from the board, the plan is then five lines from its centre (the normal, and four 30° off
+  it), with the five distances as points along each (`board_from_scanner`).
+  **The Live tab is a 3D view centred on the board** (`apps/einstar-calibrate/board_view.cpp`): the board with
+  its dot grid, the five lines and their dots (grey: to do, pulsing cyan: next with its acceptance disc and
+  distance band, amber: in position -- hold still, with the hold-still ring, green: captured), each
+  captured view's camera baseline, and the scanner's live pose (from the board pose) with its field of
+  view and aim line on the board (green on the centre), greyed at its last pose while the board is out of
+  view. It opens on an operator view (from the image-bottom side of a face-on scanner, above the board,
+  the board's normal up); drag orbits, scroll zooms, double-click resets. The live left image, with the
+  detection and the board's outline now and at the target, is an inset. The target is any uncaptured view
+  within 1.5 tolerances of the scanner's distance and tilt, else the active group's nearest step (the side
+  panel keeps a distance ladder per group, a distance gauge and a tilt target). A view is captured once the
+  board is within 25 mm, 7°, 45 mm of centre and 20° of roll and held still for 0.6 s, or with the
+  scanner's start / pause button; hints include which way to turn the scanner for the roll. The top LED shows red / green / blue for too
   near / in range / too far. Lighting defaults to EXStar's (exposure 1500, gain 400, ring light 1000,
   white LEDs 300, projector off, texture mode).
 * **Solve** (`calibrate/solve.hpp`): independent of any stored calibration. Focal lengths come from the
@@ -487,6 +499,6 @@ in the repo.
 * **Emulator**: the board is rendered through a rig whose right camera has moved (0.25°, cy +1.5 px, fx
   +0.8 px) since the calibration in the emulated flash. The virtual scanner moves to each asked-for pose,
   so the whole procedure runs unattended (`EinstarCalibration --snapshot out.png --complete`). It recovers
-  the change (0.262°, +1.78, +0.86) with rows at 0.08 px, while the flash calibration leaves 3.5 px.
+  the change (0.245°, +1.71, +0.73) with rows at 0.08 px, while the flash calibration leaves 3.5 px.
 * **Tests** (`test_calibrate`): synthetic views recover the rendering rig (focal length and principal
   point within 1.5 px, rig within 0.05°); EXStar's captures reproduce its calibration as above.

@@ -34,6 +34,7 @@
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_metal.h"
 
+#include "board_view.hpp"
 #include "calibration_controller.hpp"
 #include "einstar/core/timing.hpp"
 
@@ -560,6 +561,7 @@ int main(int argc, char** argv) {
     app::CalibrationController::WritePlan write_plan;
     bool write_confirmed = false;
     std::string write_result, restore_path;
+    app::BoardView board_view;
 
     while (!glfwWindowShouldClose(window)) {
         @autoreleasepool {
@@ -640,67 +642,58 @@ int main(int argc, char** argv) {
                                 ImGui::TextDisabled("  |  %s", live.guidance->hints[i].c_str());
                             }
                     }
+                    // The board-centred 3D guide, with the live left image as an inset.
                     const ImVec2 avail = ImGui::GetContentRegionAvail();
+                    const ImVec2 view_o = ImGui::GetCursorScreenPos();
+                    {
+                        app::BoardViewInput bv;
+                        bv.plan = &ctl.plan();
+                        bv.captured.resize(caps.size());
+                        bv.ghosts.resize(caps.size());
+                        for (std::size_t i = 0; i < caps.size(); ++i)
+                            if (caps[i]) {
+                                bv.captured[i] = true;
+                                bv.ghosts[i] = calibrate::board_from_scanner(caps[i]->measure);
+                            }
+                        bv.target = live.target;
+                        if (meas) bv.scanner = calibrate::board_from_scanner(*meas);
+                        bv.in_position = live.guidance && live.guidance->ok();
+                        bv.aim_ok = live.guidance && live.guidance->offset_ok;
+                        bv.steady_frac = live.steady_s / std::max(1e-3, live.steady_needed_s);
+                        board_view.draw(bv, avail);
+                    }
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
                     if (tex_left.texture) {
-                        const float right_w = std::min(360.0f, avail.x * 0.28f);
-                        const float lw = std::min(avail.x - right_w - 12, (avail.y - 4) * 1280.0f / 1024.0f);
+                        const float lw = std::min(460.0f, avail.x * 0.32f);
                         const float s = lw / static_cast<float>(tex_left.width);
-                        const ImVec2 o = ImGui::GetCursorScreenPos();
-                        ImGui::Image((ImTextureID)(__bridge void*)tex_left.texture, ImVec2(lw, tex_left.height * s));
-                        ImDrawList* dl = ImGui::GetWindowDrawList();
+                        const float lh = static_cast<float>(tex_left.height) * s;
+                        const ImVec2 o(view_o.x + avail.x - lw - 12, view_o.y + avail.y - lh - 40);  // bottom right
+                        dl->AddImage((ImTextureID)(__bridge void*)tex_left.texture, o, ImVec2(o.x + lw, o.y + lh));
+                        dl->AddRect(ImVec2(o.x - 1, o.y - 1), ImVec2(o.x + lw + 1, o.y + lh + 1), IM_COL32(120, 120, 128, 255));
                         const ImageFrame f{o, s};
+                        dl->PushClipRect(o, ImVec2(o.x + lw, o.y + lh), true);
                         if (live.det_left) draw_detection(dl, f, *live.det_left);
-                        if (target) {
-                            const double roll = meas ? meas->roll_deg : 90.0;
-                            draw_outline(dl, f, grig.left, calibrate::target_pose(*target, roll, grig), kCyan, true, 2.5f);
-                        }
+                        if (target) draw_outline(dl, f, grig.left, calibrate::target_pose(*target, target->roll_deg, grig), kCyan, true, 2.0f);
                         if (live.pose) {
                             const bool ok = live.guidance && live.guidance->ok();
-                            draw_outline(dl, f, grig.left, live.pose->T_cam_board, ok ? kGreen : kAmber, false, 2.5f);
-                            // Arrow: board centre now -> where the target puts it.
-                            if (target && live.guidance && !live.guidance->offset_ok) {
-                                const BoardSpec b;
-                                const Vec2 from = grig.left.project(live.pose->T_cam_board * b.centre());
-                                const Vec2 to = grig.left.project(calibrate::target_pose(*target, meas->roll_deg, grig) * b.centre());
-                                const ImVec2 a = f.at(from), e = f.at(to);
-                                dl->AddLine(a, e, kCyan, 3);
-                                const float dx = e.x - a.x, dy = e.y - a.y, len = std::max(1.0f, std::sqrt(dx * dx + dy * dy));
-                                const ImVec2 u(dx / len, dy / len);
-                                dl->AddTriangleFilled(e, ImVec2(e.x - 14 * u.x + 7 * u.y, e.y - 14 * u.y - 7 * u.x), ImVec2(e.x - 14 * u.x - 7 * u.y, e.y - 14 * u.y + 7 * u.x), kCyan);
-                            }
+                            draw_outline(dl, f, grig.left, live.pose->T_cam_board, ok ? kGreen : kAmber, false, 2.0f);
                         }
-                        // Steadiness ring in the corner.
-                        if (live.guidance && live.guidance->ok() && ctl.auto_capture) {
-                            const ImVec2 c(o.x + lw - 40, o.y + 40);
-                            const float frac = static_cast<float>(std::clamp(live.steady_s / std::max(1e-3, live.steady_needed_s), 0.0, 1.0));
-                            dl->AddCircle(c, 24, IM_COL32(255, 255, 255, 60), 40, 5);
-                            dl->PathArcTo(c, 24, -1.5708f, -1.5708f + frac * 6.2832f, 40);
-                            dl->PathStroke(kGreen, 0, 5);
-                        }
-                        dl->AddText(ImVec2(o.x + 8, o.y + 6), IM_COL32(230, 230, 230, 255), "Left camera");
-                        ImGui::SameLine(0, 12);
-                        ImGui::BeginGroup();
-                        if (tex_right.texture) {
-                            const float rs = right_w / static_cast<float>(tex_right.width);
-                            const ImVec2 ro = ImGui::GetCursorScreenPos();
-                            ImGui::Image((ImTextureID)(__bridge void*)tex_right.texture, ImVec2(right_w, tex_right.height * rs));
-                            if (live.det_right) draw_detection(dl, ImageFrame{ro, rs}, *live.det_right);
-                            dl->AddText(ImVec2(ro.x + 6, ro.y + 4), IM_COL32(230, 230, 230, 255), "Right camera");
-                        }
-                        ImGui::Text("Dots: left %zu, right %zu, both %d", live.det_left ? live.det_left->size() : 0, live.det_right ? live.det_right->size() : 0,
-                                    live.common_dots);
-                        ImGui::Text("Image level %d, saturated %.1f%%", live.mean_level, live.saturated_permille / 10.0);
-                        ImGui::Text("%.1f fps, detection %.0f ms", live.fps, live.detect_ms);
+                        dl->AddText(ImVec2(o.x + 6, o.y + 4), IM_COL32(230, 230, 230, 255), "Left camera");
+                        dl->PopClipRect();
+                        // Numbers under the inset.
+                        std::vector<std::string> lines;
+                        lines.push_back(std::format("Dots: left {}, right {}, both {}", live.det_left ? live.det_left->size() : 0,
+                                                    live.det_right ? live.det_right->size() : 0, live.common_dots));
+                        lines.push_back(std::format("Image level {}, saturated {:.1f}%   {:.1f} fps", live.mean_level, live.saturated_permille / 10.0, live.fps));
                         if (meas) {
-                            ImGui::Separator();
-                            ImGui::Text("Distance   %6.0f mm", meas->distance_mm);
-                            ImGui::Text("Tilt x / y %+5.1f / %+5.1f deg", meas->tilt_x_deg, meas->tilt_y_deg);
-                            ImGui::Text("Off centre %6.0f mm", meas->offset_mm.norm());
-                            if (live.pose) ImGui::Text("Pose fit   %6.2f px", live.pose->rms_px);
+                            lines.push_back(std::format("Distance {:.0f} mm   off centre {:.0f} mm", meas->distance_mm, meas->offset_mm.norm()));
+                            lines.push_back(std::format("Tilt x / y {:+.1f} / {:+.1f} deg   roll {:+.0f} deg", meas->tilt_x_deg, meas->tilt_y_deg, meas->roll_deg));
                         }
-                        ImGui::EndGroup();
-                    } else {
-                        ImGui::TextDisabled("No image yet.");
+                        float y = o.y - 6 - static_cast<float>(lines.size()) * (ImGui::GetTextLineHeight() + 1);  // above the inset
+                        for (const auto& l : lines) {
+                            dl->AddText(ImVec2(o.x, y), IM_COL32(170, 170, 170, 255), l.c_str());
+                            y += ImGui::GetTextLineHeight() + 1;
+                        }
                     }
                     ImGui::EndTabItem();
                 }

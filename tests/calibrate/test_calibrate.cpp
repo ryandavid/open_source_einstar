@@ -40,7 +40,7 @@ TEST_CASE("plan targets measure back as themselves") {
             CHECK(std::abs(m.tilt_y_deg - t.tilt_y_deg) < 1e-6);
             CHECK(std::abs(std::remainder(m.roll_deg - roll, 360.0)) < 1e-6);
             CHECK(m.offset_mm.norm() < 1e-6);
-            CHECK(guide(m, t).ok());
+            CHECK(guide(m, t).ok() == (roll == 90.0));  // the plan holds the board's roll at 90 degrees
         }
     }
     // Off target: the largest error leads the hints.
@@ -196,4 +196,71 @@ TEST_CASE("a solve becomes a flash blob that decodes to it and keeps everything 
     CHECK(rotation_deg(back->rig().T_texture_left, old.T_texture_left) < 1e-9);
     CHECK((back->left.t_cam_world - world.translation()).norm() < 1e-9);
     CHECK(!build_flash_update(std::vector<std::uint8_t>(calib::kFlashBlobSize, 0), ours, world, "x", 1));
+}
+
+TEST_CASE("roll guidance: the hint's direction brings the roll back") {
+    const auto rig = flash_rig();
+    // Face-on: turning the scanner about its own axis changes the roll only. (For a tilted view it also
+    // swings which edge is near, and the tilt hint then follows.)
+    const auto t = default_plan()[2];
+    CHECK(t.roll_deg == 90.0);
+    const SE3 off = target_pose(t, 125, rig);  // board turned 35 degrees too far in the view
+    const auto m = measure_board(off, rig);
+    const auto g = guide(m, t);
+    REQUIRE_FALSE(g.roll_ok);
+    CHECK(std::abs(g.roll_error_deg - 35) < 1e-6);
+    REQUIRE_FALSE(g.hints.empty());
+    CHECK(g.hints.front().starts_with("Turn the scanner clockwise"));
+    // Turning the scanner clockwise (seen from behind it) about its axis by those 35 degrees fixes it.
+    const SE3 S_from_left = scanner_from_left(rig);
+    SE3 turn = SE3::Identity();
+    turn.linear() = Eigen::AngleAxisd(35.0 * M_PI / 180.0, Vec3::UnitZ()).toRotationMatrix().transpose();
+    const auto fixed = measure_board(S_from_left.inverse() * turn * S_from_left * off, rig);
+    CHECK(std::abs(std::remainder(fixed.roll_deg - 90, 360.0)) < 1e-6);
+    CHECK(guide(fixed, t).ok());
+    CHECK(guide(measure_board(target_pose(t, 180, rig), rig), t).hints.front().find("long side") != std::string::npos);
+}
+
+TEST_CASE("the plan seen from the board: five lines from its centre, the distances along them") {
+    const auto rig = flash_rig();
+    const BoardSpec board;
+    const auto plan = default_plan();
+    std::array<Vec3, 5> dir{};
+    for (const auto& t : plan) {
+        // The same pose whether it comes from the target or from measuring the target's board pose.
+        const SE3 B_S = board_from_scanner(t);
+        const SE3 B_S_measured = board_from_scanner(measure_board(target_pose(t, t.roll_deg, rig), rig));
+        CHECK((B_S.translation() - B_S_measured.translation()).norm() < 1e-6);
+        CHECK(rotation_deg(B_S, B_S_measured) < 1e-6);
+        // The scanner sits t.distance_mm from the board centre, looking at it.
+        const Vec3 v = B_S.translation() - board.centre();
+        CHECK(std::abs(v.norm() - t.distance_mm) < 1e-6);
+        CHECK((B_S.linear().col(2) + v.normalized()).norm() < 1e-9);
+        // ... on its group's line: one direction per group, the face-on one along the normal (the dots face -z).
+        auto& d = dir[static_cast<std::size_t>(t.group)];
+        if (t.step == 0) d = v.normalized();
+        else CHECK((v.normalized() - d).norm() < 1e-9);
+    }
+    CHECK((dir[0] + Vec3::UnitZ()).norm() < 1e-9);
+    for (int g = 1; g < 5; ++g) CHECK(std::abs(std::acos(-dir[static_cast<std::size_t>(g)].z()) * 180 / M_PI - 30) < 1e-6);
+    // Opposite groups lie opposite each other across the normal.
+    CHECK((dir[1] + dir[2]).normalized().dot(-Vec3::UnitZ()) > 1 - 1e-9);
+    CHECK((dir[3] + dir[4]).normalized().dot(-Vec3::UnitZ()) > 1 - 1e-9);
+}
+
+TEST_CASE("nearest target: the uncaptured view the scanner is closest to") {
+    const auto plan = default_plan();
+    std::vector<bool> captured(plan.size(), false);
+    auto m = target_measure(plan[13]);
+    m.distance_mm += 10;
+    auto n = nearest_target(plan, captured, m);
+    CHECK(n.index == 13);
+    CHECK(n.error < 1);
+    captured[13] = true;
+    n = nearest_target(plan, captured, m);
+    CHECK(n.index != 13);
+    CHECK(plan[static_cast<std::size_t>(n.index)].group == plan[13].group);  // the next step on the same line
+    CHECK(n.error > 1);
+    std::fill(captured.begin(), captured.end(), true);
+    CHECK(nearest_target(plan, captured, m).index == -1);
 }
