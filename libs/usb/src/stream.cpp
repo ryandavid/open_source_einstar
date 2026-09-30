@@ -35,7 +35,8 @@ void FrameAssembler::start_frame(std::span<const std::uint8_t> packet) {
 
 void FrameAssembler::push(std::span<const std::uint8_t> packet) {
     ++stats_.packets;
-    if (packet.size() <= kStreamHeaderSize || packet.size() > kStreamPacketSize) {
+    stats_.max_packet = std::max(stats_.max_packet, packet.size());
+    if (packet.size() <= kStreamHeaderSize || packet.size() > kStreamTransferSize) {
         ++stats_.bad_packets;
         return;
     }

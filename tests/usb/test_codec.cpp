@@ -52,8 +52,8 @@ namespace {
 std::vector<std::vector<std::uint8_t>> packetize(int sensor, std::uint32_t frame_id, std::uint64_t ts,
                                                  const std::vector<std::uint8_t>& pixels) {
     std::vector<std::vector<std::uint8_t>> out;
-    for (std::size_t off = 0; off < pixels.size(); off += kStreamPayloadPerPacket) {
-        const std::size_t n = std::min(kStreamPayloadPerPacket, pixels.size() - off);
+    for (std::size_t off = 0; off < pixels.size(); off += kStreamMaxPayload) {
+        const std::size_t n = std::min(kStreamMaxPayload, pixels.size() - off);
         std::vector<std::uint8_t> p(kStreamHeaderSize + n, 0);
         p[2] = static_cast<std::uint8_t>((1u << sensor) << 3) | 0x5;
         p[8] = off + n == pixels.size() ? 1 : 0;

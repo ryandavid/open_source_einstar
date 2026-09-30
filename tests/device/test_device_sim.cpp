@@ -11,6 +11,8 @@
 
 #include "einstar/device/einstar_device.hpp"
 #include "einstar/sim/sim_transport.hpp"
+#include "einstar/usb/command.hpp"
+#include "einstar/usb/constants.hpp"
 
 using namespace einstar;
 using namespace std::chrono_literals;
@@ -18,20 +20,46 @@ using namespace std::chrono_literals;
 namespace {
 
 struct Harness {
-    sim::SimTransport* sim = nullptr;
+    std::shared_ptr<sim::SimDevice> sim;
     std::unique_ptr<device::EinstarDevice> dev;
 };
 
-Harness connect(sim::SimConfig cfg = {}, int heartbeat_ms = 0) {
-    auto t = std::make_unique<sim::SimTransport>(cfg);
+Harness connect(sim::SimConfig cfg = {}, int heartbeat_ms = 0, bool reconnect = false) {
+    auto [emulator, transport] = sim::make_sim_scanner(cfg);
     Harness h;
-    h.sim = t.get();
+    h.sim = emulator;
     device::ConnectOptions opts;
     opts.heartbeat_ms = heartbeat_ms;
-    auto d = device::EinstarDevice::connect(std::move(t), opts);
+    if (reconnect) {
+        opts.reopen = [d = h.sim] { return d->connect(); };
+        opts.reconnect_interval_ms = 50;
+    }
+    auto d = device::EinstarDevice::connect(std::move(transport), opts);
     REQUIRE(d.has_value());
     h.dev = std::move(*d);
     return h;
+}
+
+// Polls up to `polls` times, 5 ms apart. Counting polls rather than wall time keeps the limit meaningful
+// when the whole test process is descheduled for a while (seen for many seconds on a loaded machine).
+template <typename Pred>
+bool wait_for(Pred pred, int polls = 1000) {
+    for (int i = 0; i < polls; ++i) {
+        if (pred()) return true;
+        std::this_thread::sleep_for(5ms);
+    }
+    return pred();
+}
+
+// A raw request straight to the emulated firmware (bypassing EinstarDevice and its guard).
+std::vector<std::uint8_t> raw_command(sim::SimDevice& d, std::uint8_t seq, std::uint8_t group, std::uint8_t op,
+                                      std::vector<std::uint8_t> payload, std::size_t size = 16) {
+    auto t = d.connect();
+    REQUIRE(t.has_value());
+    const auto req = usb::build_device_request({seq, group, op}, payload, size);
+    auto r = (*t)->command(req, 64, 1000);
+    REQUIRE(r.has_value());
+    return *r;
 }
 
 }  // namespace
@@ -51,11 +79,62 @@ TEST_CASE("connect identifies the device with read-only commands only") {
     }
 }
 
-TEST_CASE("masked replies are decoded transparently") {
-    sim::SimConfig cfg;
-    cfg.mask_replies = true;
-    auto h = connect(cfg);
-    CHECK(h.dev->info().serial == "0009011402CF0C20");
+TEST_CASE("the emulator frames replies as the firmware does") {
+    auto d = std::make_shared<sim::SimDevice>();
+    // Byte 1 is always 2 ("not masked"); status and BE32 length follow.
+    auto r = raw_command(*d, 1, 0x10, 0x16, {0x01});
+    CHECK(r[1] == 0x02);
+    CHECK(r[4] == 0);
+    CHECK(usb::read_be32(r, 5) == 2);
+    CHECK(((r[9] << 8) | r[10]) == 1280);
+    // Wrong payload length: status 2, no data. Unknown key: status 3 on the command channel.
+    r = raw_command(*d, 2, 0x10, 0x16, {});
+    CHECK(r[4] == 2);
+    CHECK(r.size() == 9);
+    r = raw_command(*d, 3, 0x10, 0x99, {});
+    CHECK(r[4] == 3);
+    // Device state declares 20 bytes and fills 14; the serial declares 12 and fills 8.
+    r = raw_command(*d, 4, 0x00, 0x07, {}, 50);
+    CHECK(usb::read_be32(r, 5) == 20);
+    CHECK(r.size() == 29);
+    r = raw_command(*d, 5, 0x00, 0x04, {}, 64);
+    CHECK(usb::read_be32(r, 5) == 12);
+    // PID as the firmware reports it (the USB descriptor says 3).
+    r = raw_command(*d, 6, 0x10, 0x01, {});
+    CHECK(((r[9] << 8) | r[10]) == 1);
+}
+
+TEST_CASE("bulk requests must fill the firmware's 5120-byte buffer and replies have its fixed sizes") {
+    auto d = std::make_shared<sim::SimDevice>();
+    auto t = d->connect();
+    REQUIRE(t.has_value());
+    const std::uint8_t page[2] = {0, 0};
+    const auto req = usb::build_device_request({1, 0x10, 0x57}, page, 5120);
+    auto r = (*t)->bulk(req, usb::kBulkPageReplySize, 1000);
+    REQUIRE(r.has_value());
+    CHECK(r->size() == usb::kBulkPageReplySize);
+    CHECK(usb::read_be32(*r, 5) == 4096);
+    // Asking for more than the firmware sends times out (it ends on a full packet, no zero-length packet).
+    const std::uint8_t bad_page[2] = {0x01, 0x00};  // page 256: status 2 in a 1024-byte reply
+    const auto req2 = usb::build_device_request({2, 0x10, 0x57}, bad_page, 5120);
+    auto r2 = (*t)->bulk(req2, usb::kBulkPageReplySize, 1000);
+    CHECK_FALSE(r2.has_value());
+    const auto req3 = usb::build_device_request({3, 0x10, 0x57}, bad_page, 5120);
+    auto r3 = (*t)->bulk(req3, usb::kBulkReplySize, 1000);
+    REQUIRE(r3.has_value());
+    CHECK((*r3)[4] == 2);
+}
+
+TEST_CASE("register quirks: gain rounds through the sensor register, the laser keeps half steps") {
+    auto h = connect();
+    REQUIRE(h.dev->set_gain(0, 110).has_value());
+    CHECK(h.dev->gain(0).value() == 109);
+    REQUIRE(h.dev->set_gain(0, 125).has_value());
+    CHECK(h.dev->gain(0).value() == 125);
+    REQUIRE(h.dev->set_gain(1, 120).has_value());
+    CHECK(h.dev->gain(1).value() == 119);
+    REQUIRE(h.dev->set_laser_percent(61).has_value());
+    CHECK(h.sim->state().laser == 60);
 }
 
 TEST_CASE("scan configuration matches EXStar's logged bytes") {
@@ -89,7 +168,7 @@ TEST_CASE("unsafe values are clamped before they reach the device") {
     const auto s = h.sim->state();
     CHECK(s.laser == 100);
     CHECK(s.strobe[0] == device::kMaxStrobeLuminance);
-    CHECK(s.exposure[0] == 20000);
+    CHECK(s.exposure[0] == 10000);  // the firmware reports 1..10000
     CHECK_FALSE(h.sim->dangerous_command_seen());
 }
 
@@ -218,8 +297,7 @@ TEST_CASE("a request repeating the previous session's sequence number is dropped
     // start on the same command number, and its first flash read on the same bulk number.
     sim::SimConfig cfg;
     cfg.previous_command_sequence = 9;
-    auto t = std::make_unique<sim::SimTransport>(cfg);
-    auto* sim = t.get();
+    auto [sim, t] = sim::make_sim_scanner(cfg);
     device::ConnectOptions opts;
     opts.heartbeat_ms = 0;
     opts.first_sequence = 9;
@@ -232,8 +310,7 @@ TEST_CASE("a request repeating the previous session's sequence number is dropped
 TEST_CASE("sessions start at a random sequence number") {
     std::set<std::uint8_t> firsts;
     for (int i = 0; i < 8; ++i) {
-        auto t = std::make_unique<sim::SimTransport>();
-        auto* sim = t.get();
+        auto [sim, t] = sim::make_sim_scanner();
         device::ConnectOptions opts;
         opts.heartbeat_ms = 0;
         auto dev = device::EinstarDevice::connect(std::move(t), opts);  // (owns the emulator)
@@ -262,24 +339,94 @@ TEST_CASE("disconnect turns light sources and triggers off") {
     REQUIRE(h.dev->configure_scan_mode().has_value());
     REQUIRE(h.dev->set_laser_percent(60).has_value());
     REQUIRE(h.dev->set_strobe(0, 3000).has_value());
-    auto obs = h.sim->observer();  // outlives the transport
+    REQUIRE(h.dev->set_strobe(1, 2000).has_value());
     h.dev->disconnect();
-    std::lock_guard lock(obs->mutex);
-    CHECK(obs->state.mono_triggers == 0);
-    CHECK(obs->state.rgb_triggers == 0);
-    CHECK(obs->state.laser == 0);
-    CHECK(obs->state.strobe[0] == 0);
+    const auto s = h.sim->state();
+    CHECK(s.mono_triggers == 0);
+    CHECK(s.rgb_triggers == 0);
+    CHECK(s.laser == 0);
+    CHECK(s.strobe[0] == 0);
+    CHECK(s.strobe[1] == 0);
 }
 
 TEST_CASE("destroying the device without disconnect still switches everything off") {
     auto h = connect();
     REQUIRE(h.dev->configure_scan_mode().has_value());
     REQUIRE(h.dev->set_laser_percent(60).has_value());
-    auto obs = h.sim->observer();
     h.dev.reset();
-    std::lock_guard lock(obs->mutex);
-    CHECK(obs->state.mono_triggers == 0);
-    CHECK(obs->state.laser == 0);
+    CHECK(h.sim->state().mono_triggers == 0);
+    CHECK(h.sim->state().laser == 0);
+}
+
+TEST_CASE("a cleared image-endpoint halt restarts the scanner; the device reconnects, replays and streams on") {
+    auto h = connect({}, 20, true);
+    REQUIRE(h.dev->set_exposure(0, 4400).has_value());
+    REQUIRE(h.dev->set_gain(0, 120).has_value());
+    REQUIRE(h.dev->set_gain(1, 125).has_value());
+    REQUIRE(h.dev->set_laser_percent(60).has_value());
+    REQUIRE(h.dev->set_strobe(0, 3000).has_value());
+    REQUIRE(h.dev->set_indication(device::DistanceIndication::zone1).has_value());
+    REQUIRE(h.dev->configure_scan_mode(30000).has_value());
+    std::atomic<int> groups{0};
+    REQUIRE(h.dev->start_stream([&](usb::FrameGroup&&) { ++groups; }).has_value());
+    REQUIRE(wait_for([&] { return groups >= 3; }));
+
+    // The halt is cleared by the transport; the next heartbeat 00/07 then restarts the firmware (USB off,
+    // FPGA and sensors reset), which the device survives by reopening and replaying.
+    h.sim->stall_image_endpoint();
+    REQUIRE(wait_for([&] { return h.dev->reconnects() == 1 && h.dev->online(); }));
+    CHECK(h.sim->restarts() == 1);
+    const auto s = h.sim->state();
+    CHECK(s.exposure[0] == 4400);
+    CHECK(s.gain[0] == 119);
+    CHECK(s.gain[1] == 125);
+    CHECK(s.laser == 60);
+    CHECK(s.strobe[0] == 3000);
+    CHECK(s.indication_distance == 1);
+    CHECK(s.mono_triggers == 3);
+    CHECK(s.trigger_period_us == 30000);
+    CHECK(s.control == 4);  // ClearState after the replay, as EXStar
+    const int before = groups;
+    CHECK(wait_for([&] { return groups >= before + 3; }));
+    h.dev->stop_stream();
+}
+
+TEST_CASE("after a reboot without reconnection, commands fail at once") {
+    auto h = connect({}, 20, false);
+    h.sim->reboot();
+    REQUIRE(wait_for([&] { return !h.dev->online(); }));
+    const auto t0 = std::chrono::steady_clock::now();
+    auto r = h.dev->set_laser_percent(10);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().code == Errc::disconnected);
+    CHECK(std::chrono::steady_clock::now() - t0 < 100ms);
+}
+
+TEST_CASE("reconnection only accepts the same scanner") {
+    sim::SimConfig other_cfg;
+    other_cfg.serial = {1, 2, 3, 4, 5, 6, 7, 8};
+    auto other = std::make_shared<sim::SimDevice>(other_cfg);
+    auto scanner = sim::make_sim_scanner();
+    auto ours = scanner.device;
+    std::atomic<bool> offer_ours{false};
+    device::ConnectOptions opts;
+    opts.heartbeat_ms = 20;
+    opts.reconnect_interval_ms = 20;
+    // Reopening first finds another scanner.
+    opts.reopen = [&] { return offer_ours ? ours->connect() : other->connect(); };
+    auto transport = std::move(scanner.transport);
+    auto dev = device::EinstarDevice::connect(std::move(transport), opts);
+    REQUIRE(dev.has_value());
+    REQUIRE((*dev)->set_laser_percent(40).has_value());
+    ours->reboot();
+    REQUIRE(wait_for([&] { return !(*dev)->online(); }));
+    std::this_thread::sleep_for(400ms);  // several reopen attempts, all on the other scanner
+    CHECK_FALSE((*dev)->online());
+    CHECK(other->state().laser == 0);  // nothing replayed onto it
+    offer_ours = true;
+    REQUIRE(wait_for([&] { return (*dev)->online(); }));
+    CHECK(ours->state().laser == 40);
+    dev->reset();
 }
 
 TEST_CASE("scanner buttons: EXStar's assignment") {

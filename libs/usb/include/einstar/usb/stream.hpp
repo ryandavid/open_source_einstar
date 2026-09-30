@@ -29,7 +29,8 @@ struct StreamFrame {
 
 struct StreamStats {
     std::uint64_t packets = 0;
-    std::uint64_t bad_packets = 0;      // length outside (32, packet size]
+    std::uint64_t bad_packets = 0;      // length outside (32, transfer size]
+    std::size_t max_packet = 0;         // longest packet seen (the firmware's DMA buffer allows 0xA020)
     std::uint64_t frames = 0;
     std::uint64_t resyncs = 0;          // EOF arrived with the wrong byte count
     std::uint64_t overflows = 0;        // more bytes than a frame holds before EOF

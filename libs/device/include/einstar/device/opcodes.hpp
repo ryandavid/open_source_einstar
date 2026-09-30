@@ -23,7 +23,9 @@ struct OpcodeInfo {
     std::string_view name;
     Safety safety;
     Channel channel;
-    std::uint16_t buffer;  // request buffer size = reply capacity
+    std::uint16_t buffer;  // request size; on the command channel also the reply capacity
+    // Bulk channel: the exact reply size the firmware sends (usb::kBulkReplySize / kBulkPageReplySize).
+    std::uint16_t bulk_reply = 0;
 };
 
 namespace op {
@@ -32,7 +34,7 @@ inline constexpr OpcodeInfo kVendorName{0x00, 0x00, "VendorName", Safety::read, 
 inline constexpr OpcodeInfo kProductName{0x00, 0x01, "ProductName", Safety::read, Channel::command, 100};
 inline constexpr OpcodeInfo kSerial{0x00, 0x04, "Serial", Safety::read, Channel::command, 64};
 inline constexpr OpcodeInfo kFirmwareVersion{0x00, 0x05, "FirmwareVersion", Safety::read, Channel::command, 64};
-inline constexpr OpcodeInfo kFirmwareUpdate{0x00, 0x06, "FirmwareUpdate", Safety::dangerous, Channel::bulk, 5120};
+inline constexpr OpcodeInfo kFirmwareUpdate{0x00, 0x06, "FirmwareUpdate", Safety::dangerous, Channel::bulk, 5120, 1024};
 inline constexpr OpcodeInfo kDeviceState{0x00, 0x07, "DeviceState", Safety::read, Channel::command, 50};
 inline constexpr OpcodeInfo kReboot{0x00, 0x08, "Reboot", Safety::dangerous, Channel::command, 10};
 // group 0x10: controller / sensor registers
@@ -55,8 +57,8 @@ inline constexpr OpcodeInfo kGetTriggerPeriod{0x10, 0x48, "GetTriggerPeriod", Sa
 inline constexpr OpcodeInfo kSetTriggerPeriod{0x10, 0x49, "SetTriggerPeriod", Safety::volatile_write, Channel::command, 50};
 inline constexpr OpcodeInfo kTemperature{0x10, 0x50, "Temperature", Safety::read, Channel::command, 50};
 inline constexpr OpcodeInfo kSensorCount{0x10, 0x51, "SensorCount", Safety::read, Channel::command, 16};
-inline constexpr OpcodeInfo kFlashRead{0x10, 0x57, "FlashRead", Safety::read, Channel::bulk, 5120};
-inline constexpr OpcodeInfo kFlashWrite{0x10, 0x58, "FlashWrite", Safety::dangerous, Channel::bulk, 5120};
+inline constexpr OpcodeInfo kFlashRead{0x10, 0x57, "FlashRead", Safety::read, Channel::bulk, 5120, 5120};
+inline constexpr OpcodeInfo kFlashWrite{0x10, 0x58, "FlashWrite", Safety::dangerous, Channel::bulk, 5120, 1024};
 // Not queried: for a 1-byte payload the firmware leaves the reply byte unwritten (docs/firmware.md 5.1).
 inline constexpr OpcodeInfo kColorMode{0x10, 0x5D, "ColorMode", Safety::read, Channel::command, 16};
 inline constexpr OpcodeInfo kIndication{0x10, 0x62, "Indication", Safety::volatile_write, Channel::command, 16};
@@ -65,7 +67,7 @@ inline constexpr OpcodeInfo kSetLaser{0x10, 0x68, "SetLaser", Safety::volatile_w
 inline constexpr OpcodeInfo kGetStrobe{0x10, 0x6F, "GetStrobe", Safety::read, Channel::command, 50};
 inline constexpr OpcodeInfo kSetStrobe{0x10, 0x70, "SetStrobe", Safety::volatile_write, Channel::command, 50};
 inline constexpr OpcodeInfo kClearState{0x10, 0x7B, "ClearState", Safety::volatile_write, Channel::command, 10};
-// group 0xCC: bootloader
+// group 0xCC: handled by the application (CC/00 erases flash block 0 and resets, no reply; docs/firmware.md 4)
 inline constexpr OpcodeInfo kEraseAppHeader{0xCC, 0x00, "EraseAppHeader", Safety::dangerous, Channel::command, 16};
 }  // namespace op
 
@@ -96,11 +98,12 @@ concept SafeOpcode = Op.safety != Safety::dangerous;
 
 static_assert(!guard_allows(0x10, 0x58), "flash write must be blocked");
 static_assert(!guard_allows(0x00, 0x06), "firmware update must be blocked");
-static_assert(!guard_allows(0xCC, 0x00), "bootloader erase must be blocked");
+static_assert(!guard_allows(0xCC, 0x00), "application-header erase must be blocked");
 static_assert(!guard_allows(0x10, 0x99), "unknown opcodes must be blocked");
 static_assert(guard_allows(0x10, 0x57), "flash read is allowed");
 
-// Hardware limits we never exceed (maxima observed from EXStar's own session).
+// Hardware limits we never exceed (maxima observed from EXStar's own session). The firmware itself clamps
+// the laser to 100 and wraps strobe luminance above 16383.
 inline constexpr int kMaxLaserPercent = 100;
 inline constexpr int kMaxStrobeLuminance = 9000;
 // The firmware ignores trigger periods outside this range but still replies OK.

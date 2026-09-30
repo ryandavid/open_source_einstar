@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <format>
 
 #include "einstar/usb/command.hpp"
 #include "einstar/usb/constants.hpp"
@@ -10,18 +11,26 @@
 namespace einstar::sim {
 namespace {
 
-std::uint32_t be32_at(std::span<const std::uint8_t> b, std::size_t o) { return usb::read_be32(b, o); }
+using clock = std::chrono::steady_clock;
 
-void put_be16(std::vector<std::uint8_t>& v, std::uint16_t x) {
-    v.push_back(static_cast<std::uint8_t>(x >> 8));
-    v.push_back(static_cast<std::uint8_t>(x));
-}
-void put_be32(std::vector<std::uint8_t>& v, std::uint32_t x) {
-    for (int s = 24; s >= 0; s -= 8) v.push_back(static_cast<std::uint8_t>(x >> s));
+// Reply bytes the firmware does not write hold stale heap data; the emulator fills them with this so the
+// host can never come to depend on their value.
+constexpr std::uint8_t kStale = 0xCD;
+
+// Status codes (firmware/include/protocol.h)
+constexpr std::uint8_t kOk = 0, kUnknownBulk = 1, kBadLength = 2, kFailed = 3;
+
+// FPGA registers (firmware/include/fpga_regs.h)
+constexpr int kRegExposure = 1, kRegTriggerPeriod = 2, kRegTriggerSwitch = 3, kRegStrobe0 = 4, kRegStrobe1 = 5,
+              kRegTriggerAux = 7, kRegLdBrightness = 8, kRegMode = 10, kRegControl = 12;
+
+bool is_dangerous(std::uint8_t group, std::uint8_t op) {
+    return (group == 0x10 && op == 0x58) || (group == 0x00 && (op == 0x06 || op == 0x08)) || group == 0xCC;
 }
 
-int sensor_from_mask(std::uint8_t m) {
-    switch (m) {
+// Camera selector -> index into the sensor gain registers (the firmware's I2C targets 1, 2, 4).
+int camera_index(std::uint8_t selector) {
+    switch (selector) {
         case 1: return 0;
         case 2: return 1;
         case 4: return 2;
@@ -29,15 +38,55 @@ int sensor_from_mask(std::uint8_t m) {
     }
 }
 
-bool is_dangerous(std::uint8_t group, std::uint8_t op) {
-    return (group == 0x10 && op == 0x58) || (group == 0x00 && (op == 0x06 || op == 0x08)) || group == 0xCC;
+// Gain percent <-> sensor register (1/32 steps), with the firmware's float rounding: nearest, halves down.
+std::uint16_t gain_to_register(std::uint16_t percent) {
+    const float g = static_cast<float>(percent) * 32.0f / 100.0f;
+    auto r = static_cast<std::uint16_t>(g);
+    if (g - 0.5 > r) ++r;
+    return r;
 }
+std::uint16_t register_to_gain(std::uint16_t reg) {
+    const float g = static_cast<float>(reg) * 100.0f / 32.0f;
+    auto r = static_cast<std::uint16_t>(g);
+    if (g - 0.5 > r) ++r;
+    return r;
+}
+
+// Laser mode written by 10/62 for DISTANCE 0/1/2; anything else selects mode 0.
+int distance_to_mode(std::uint8_t d) { return d == 0 ? 4 : d == 1 ? 1 : d == 2 ? 2 : 0; }
+int mode_to_distance(int mode) { return mode == 4 ? 0 : mode == 1 ? 1 : mode == 2 ? 2 : -1; }
+
+// A reply under construction: header, status, declared length, data (stale until written).
+struct ReplyBuilder {
+    std::vector<std::uint8_t> bytes;
+    ReplyBuilder(std::uint8_t seq, std::uint8_t group, std::uint8_t op) : bytes{seq, 0x02, group, op} {}
+    // reply_status(): OK with `reply_len` data bytes when the payload length matches, else status 2.
+    bool check(std::uint32_t length, std::uint32_t expected, std::uint32_t reply_len) {
+        const bool ok = length == expected;
+        set_status(ok ? kOk : kBadLength, ok ? reply_len : 0);
+        return ok;
+    }
+    void set_status(std::uint8_t status, std::uint32_t len) {
+        bytes.resize(9);
+        bytes[4] = status;
+        usb::write_be32(bytes, 5, len);
+        bytes.resize(9 + len, kStale);
+    }
+    std::uint8_t& data(std::size_t i) { return bytes[9 + i]; }
+    void put_be(std::size_t at, std::uint32_t v, int n) {
+        for (int i = 0; i < n; ++i) data(at + static_cast<std::size_t>(i)) = static_cast<std::uint8_t>(v >> (8 * (n - 1 - i)));
+    }
+};
 
 }  // namespace
 
-SimTransport::SimTransport(SimConfig config) : config_(std::move(config)), flash_(1u << 20, 0xFF), rng_(config_.seed) {
+// ---------------------------------------------------------------------------------------------------------
+// SimDevice
+
+SimDevice::SimDevice(SimConfig config) : config_(std::move(config)), flash_(1u << 20, 0xFF), rng_(config_.seed) {
     last_command_seq_ = config_.previous_command_sequence;
     last_bulk_seq_ = config_.previous_bulk_sequence;
+    power_on_locked();
     provider_ = [](int sensor, std::uint32_t frame_id, ImageU8& out) {
         // Default content: a moving gradient so frames are distinguishable.
         for (int y = 0; y < out.height(); ++y)
@@ -46,200 +95,466 @@ SimTransport::SimTransport(SimConfig config) : config_(std::move(config)), flash
     };
 }
 
-SimTransport::~SimTransport() { stop_stream(); }
+void SimDevice::power_on_locked() {
+    // Register values after a (re)start. The FPGA's own power-on values are not known; these are
+    // assumptions (trigger off, so nothing streams until the host configures it). The rest is what the
+    // firmware writes while starting: sensor tables (gain register 0xA0 = 500 %) and laser mode 2 with the
+    // status LED "ok".
+    fpga_.fill(0);
+    fpga_[kRegExposure] = (1000u << 16) | 1000u;
+    fpga_[kRegTriggerPeriod] = 200000;
+    fpga_[kRegMode] = (2u << 4) | 2u;
+    gain_register_.fill(0xA0);
+    buttons_ = {};
+    ep83_halt_cleared_ = false;
+    image_halted_ = false;
+}
 
-void SimTransport::set_frame_provider(FrameProvider p) {
+void SimDevice::restart_locked(bool reboot) {
+    ++generation_;
+    restarts_.fetch_add(1);
+    off_bus_until_ = clock::now() + config_.restart_time;
+    power_on_locked();
+    // A reboot also resets the firmware's sequence memory; app_restart() (after a cleared halt) does not.
+    if (reboot) last_command_seq_ = last_bulk_seq_ = std::nullopt;
+}
+
+Result<std::unique_ptr<usb::Transport>> SimDevice::connect() {
+    std::uint64_t gen;
+    {
+        std::lock_guard lock(mutex_);
+        if (clock::now() < off_bus_until_) return make_error(Errc::not_found, "emulated scanner is restarting");
+        gen = generation_;
+    }
+    return std::unique_ptr<usb::Transport>(new SimTransport(shared_from_this(), gen));
+}
+
+bool SimDevice::alive_locked(std::uint64_t generation) const {
+    return generation == generation_ && clock::now() >= off_bus_until_;
+}
+
+bool SimDevice::alive(std::uint64_t generation) const {
+    std::lock_guard lock(mutex_);
+    return alive_locked(generation);
+}
+
+bool SimDevice::on_bus() const {
+    std::lock_guard lock(mutex_);
+    return clock::now() >= off_bus_until_;
+}
+
+void SimDevice::set_frame_provider(FrameProvider p) {
     std::lock_guard lock(mutex_);
     provider_ = std::move(p);
 }
 
-void SimTransport::set_flash(std::uint32_t offset, std::span<const std::uint8_t> data) {
+void SimDevice::set_flash(std::uint32_t offset, std::span<const std::uint8_t> data) {
     std::lock_guard lock(mutex_);
     std::ranges::copy(data, flash_.begin() + offset);
 }
 
-void SimTransport::press_button(int button, std::uint8_t action) {
+void SimDevice::press_button(int button, std::uint8_t action) {
     std::lock_guard lock(mutex_);
-    buttons_[static_cast<std::size_t>(button)] = action;
+    buttons_[static_cast<std::size_t>(button)] = static_cast<std::uint8_t>(action & 3);
 }
 
-std::vector<ReceivedCommand> SimTransport::received() const {
+void SimDevice::stall_image_endpoint() {
+    std::lock_guard lock(mutex_);
+    image_halted_ = true;
+}
+
+void SimDevice::reboot() {
+    std::lock_guard lock(mutex_);
+    restart_locked(true);
+}
+
+std::vector<ReceivedCommand> SimDevice::received() const {
     std::lock_guard lock(mutex_);
     return received_;
 }
 
-SimTransport::State SimTransport::state() const {
+std::uint64_t SimDevice::dropped_repeats() const {
     std::lock_guard lock(mutex_);
-    return state_;
+    return dropped_repeats_;
 }
+
+SimDevice::State SimDevice::state() const {
+    std::lock_guard lock(mutex_);
+    return state_locked();
+}
+
+SimDevice::State SimDevice::state_locked() const {
+    State s;
+    const std::uint8_t trig = static_cast<std::uint8_t>(fpga_[kRegTriggerSwitch]);
+    s.mono_triggers = trig & 0x0F;
+    s.rgb_triggers = trig >> 4;
+    s.trigger_period_us = fpga_[kRegTriggerPeriod];
+    s.exposure[0] = s.exposure[1] = fpga_[kRegExposure] & 0x7FFF;
+    s.exposure[2] = (fpga_[kRegExposure] >> 16) & 0x7FFF;
+    for (std::size_t i = 0; i < 3; ++i) s.gain[i] = register_to_gain(gain_register_[i]);
+    s.laser = static_cast<std::uint8_t>(fpga_[kRegLdBrightness] >> 2) << 1;
+    s.strobe[0] = static_cast<int>((fpga_[kRegStrobe0] >> 2) & 0xFFFF);
+    s.strobe[1] = static_cast<int>((fpga_[kRegStrobe1] >> 2) & 0xFFFF);
+    s.indication_distance = mode_to_distance(static_cast<int>((fpga_[kRegMode] >> 4) & 7));
+    s.control = fpga_[kRegControl];
+    return s;
+}
+
+Result<std::vector<std::uint8_t>> SimDevice::command(std::uint64_t generation, std::span<const std::uint8_t> request,
+                                                     std::size_t cap) {
+    if (request.size() < 8) return make_error(Errc::invalid_argument, "short request");
+    std::lock_guard lock(mutex_);
+    if (!alive_locked(generation)) return make_error(Errc::disconnected, "emulated scanner left the bus");
+    // A repeated sequence number (0xFE / 0xFF exempt) gets no reply and clears the stored number.
+    const std::uint8_t seq = request[0];
+    const bool repeat = seq < 0xFE && last_command_seq_ == seq;
+    last_command_seq_ = repeat ? std::nullopt : std::optional<std::uint8_t>(seq);
+    if (repeat) {
+        ++dropped_repeats_;
+        return make_error(Errc::timeout, "no reply (repeated sequence number)");
+    }
+    auto reply = handle_command(request);
+    if (reply.restart || reply.reboot) {
+        // The firmware restarts before (app_restart) or right after replying; either way the host loses it.
+        restart_locked(reply.reboot);
+        return make_error(Errc::disconnected, "emulated scanner restarted");
+    }
+    if (reply.bytes.size() > cap)
+        return make_error(Errc::io, std::format("reply of {} bytes overflows a {}-byte read", reply.bytes.size(), cap));
+    return std::move(reply.bytes);
+}
+
+Result<std::vector<std::uint8_t>> SimDevice::bulk(std::uint64_t generation, std::span<const std::uint8_t> request,
+                                                  std::size_t reply_size) {
+    // The firmware's bulk DMA buffer only reaches it once full: a shorter padded request would never arrive.
+    if (request.size() != usb::kBulkRequestSize)
+        return make_error(Errc::timeout, std::format("bulk request of {} bytes never reaches the firmware (needs {})",
+                                                     request.size(), usb::kBulkRequestSize));
+    std::lock_guard lock(mutex_);
+    if (!alive_locked(generation)) return make_error(Errc::disconnected, "emulated scanner left the bus");
+    const std::uint8_t seq = request[0];
+    const bool repeat = last_bulk_seq_ == seq;  // (no exemption on the bulk channel)
+    last_bulk_seq_ = repeat ? std::nullopt : std::optional<std::uint8_t>(seq);
+    if (repeat) {
+        ++dropped_repeats_;
+        return make_error(Errc::timeout, "no reply (repeated sequence number)");
+    }
+    auto reply = handle_bulk(request);
+    // Reading more than the firmware sends waits for data that never comes.
+    if (reply.size() < reply_size)
+        return make_error(Errc::timeout, std::format("bulk reply is {} bytes, {} were expected", reply.size(), reply_size));
+    reply.resize(reply_size);
+    return reply;
+}
+
+SimDevice::Reply SimDevice::handle_command(std::span<const std::uint8_t> req) {
+    const std::uint8_t seq = req[0], group = req[2], op = req[3];
+    const std::uint32_t length = usb::read_be32(req, 4);
+    // ARG(n): request payload byte n. The firmware reads beyond the declared length (10/5D), so this reads
+    // the padded buffer, not just the payload.
+    auto arg = [&](std::size_t n) -> std::uint8_t { return 8 + n < req.size() ? req[8 + n] : 0; };
+    const std::size_t payload_n = std::min<std::size_t>(length, req.size() - 8);
+    received_.push_back({seq, group, op, std::vector<std::uint8_t>(req.begin() + 8, req.begin() + 8 + static_cast<std::ptrdiff_t>(payload_n))});
+    if (is_dangerous(group, op)) dangerous_seen_ = true;
+
+    ReplyBuilder r(seq, group, op);
+    Reply out;
+    if (const auto it = config_.status_override.find(static_cast<std::uint16_t>(group << 8 | op)); it != config_.status_override.end()) {
+        r.set_status(it->second, 0);
+        out.bytes = std::move(r.bytes);
+        return out;
+    }
+    auto string_reply = [&](const std::string& s, std::uint32_t declared, std::size_t copied) {
+        if (!r.check(length, 0, declared)) return;
+        r.bytes.resize(9 + std::max<std::size_t>(declared, copied), kStale);
+        for (std::size_t i = 0; i < copied; ++i) r.data(i) = i < s.size() ? static_cast<std::uint8_t>(s[i]) : 0;
+    };
+
+    switch (group << 8 | op) {
+        case 0x0000: string_reply(config_.vendor_name, 18, 18); break;
+        case 0x0001: string_reply(config_.product_name, 12, 13); break;  // (copies the NUL too)
+        case 0x0005: string_reply(config_.firmware, 42, 42); break;
+        case 0x0004:  // declares 12 bytes, fills 8: the FX3 die id
+            if (r.check(length, 0, 12))
+                for (std::size_t i = 0; i < 8; ++i) r.data(i) = config_.serial[i];
+            break;
+        case 0x0007: {  // FPGA state register: six 2-bit buttons from bit 5, flags; declares 20, fills 14
+            if (!r.check(length, 0, 20)) break;
+            const auto& t = fpga_[kRegTriggerSwitch];
+            const std::uint32_t run = (t & 0xFF) == 0 ? 0x01 : (t >> 4) & 0x0F ? 0x40 : 0x08;  // (measured)
+            std::uint32_t v = (run << 18) | (config_.state_bit17 ? 1u << 17 : 0u);
+            for (std::size_t b = 0; b < 3; ++b) v |= static_cast<std::uint32_t>(buttons_[b] & 3) << (5 + 2 * b);
+            buttons_ = {};  // (cleared once read, measured)
+            for (std::size_t b = 0; b < 6; ++b) r.data(b) = static_cast<std::uint8_t>((v >> (5 + 2 * b)) & 3);
+            for (std::size_t b = 0; b < 5; ++b) r.data(6 + b) = static_cast<std::uint8_t>((v >> b) & 1);
+            r.data(11) = static_cast<std::uint8_t>((v >> 17) & 1);
+            r.data(12) = static_cast<std::uint8_t>(v >> 18);
+            r.data(13) = static_cast<std::uint8_t>((v >> 26) & 1);
+            // After a cleared image-endpoint halt: the full restart (USB, FPGA, sensors).
+            if (ep83_halt_cleared_ && (v >> 17) & 1) {
+                ep83_halt_cleared_ = false;
+                out.restart = true;
+            }
+            break;
+        }
+        case 0x0008:  // reboot after the reply
+            if (r.check(length, 0, 0)) out.reboot = true;
+            break;
+        case 0xCC00:  // erases flash block 0 and resets, no reply
+            out.reboot = true;
+            break;
+        case 0x1000: if (r.check(length, 0, 2)) r.put_be(0, usb::kVendorId, 2); break;
+        case 0x1001: if (r.check(length, 0, 2)) r.put_be(0, 1, 2); break;  // (the USB PID is 3)
+        case 0x1016: if (r.check(length, 1, 2)) r.put_be(0, static_cast<std::uint32_t>(config_.width), 2); break;
+        case 0x1017: if (r.check(length, 1, 2)) r.put_be(0, static_cast<std::uint32_t>(config_.height), 2); break;
+        case 0x1020: if (r.check(length, 1, 4)) r.put_be(0, config_.exposure_max, 4); break;
+        case 0x1021: if (r.check(length, 1, 4)) r.put_be(0, config_.exposure_min, 4); break;
+        case 0x1024: if (r.check(length, 1, 2)) r.put_be(0, config_.gain_max, 2); break;
+        case 0x1025: if (r.check(length, 1, 2)) r.put_be(0, config_.gain_min, 2); break;
+        case 0x102E: if (r.check(length, 1, 1)) r.data(0) = 8; break;
+        case 0x1022:  // selectors <= 3 read the low 15-bit field (the IR pair), others the high one
+            if (r.check(length, 1, 4)) r.put_be(0, (arg(0) <= 3 ? fpga_[kRegExposure] : fpga_[kRegExposure] >> 16) & 0x7FFF, 4);
+            break;
+        case 0x1023: {  // values above 50000 are ignored with status 0; 15 bits are kept
+            if (!r.check(length, 5, 0)) break;
+            const std::uint32_t v = static_cast<std::uint32_t>(arg(1)) << 24 | static_cast<std::uint32_t>(arg(2)) << 16 |
+                                    static_cast<std::uint32_t>(arg(3)) << 8 | arg(4);
+            if (v > 50000) break;
+            const std::uint32_t field = ((arg(3) & 0x7Fu) << 8) | arg(4);
+            auto& reg = fpga_[kRegExposure];
+            reg = arg(0) <= 3 ? (reg & 0xFFFF0000u) | field : (reg & 0x0000FFFFu) | (field << 16);
+            break;
+        }
+        case 0x1026: {  // a camera that is not there reads as 0 (a failed I2C read)
+            if (!r.check(length, 1, 2)) break;
+            const int c = camera_index(arg(0));
+            r.put_be(0, c < 0 ? 0 : register_to_gain(gain_register_[static_cast<std::size_t>(c)]), 2);
+            break;
+        }
+        case 0x1027: {
+            if (!r.check(length, 3, 0)) break;
+            const int c = camera_index(arg(0));
+            if (c < 0) {
+                r.bytes[4] = kFailed;  // the sensor write fails on a bus without that camera
+                break;
+            }
+            gain_register_[static_cast<std::size_t>(c)] = gain_to_register(static_cast<std::uint16_t>(arg(1) << 8 | arg(2)));
+            break;
+        }
+        case 0x1040: if (r.check(length, 0, 1)) r.data(0) = static_cast<std::uint8_t>(fpga_[kRegTriggerSwitch]); break;
+        case 0x1041:
+            if (r.check(length, 1, 0)) {
+                fpga_[kRegTriggerSwitch] = arg(0);
+                fpga_[kRegTriggerAux] = (0x3FFFu << 17) | 7u;
+            }
+            break;
+        case 0x1048: if (r.check(length, 0, 4)) r.put_be(0, fpga_[kRegTriggerPeriod], 4); break;
+        case 0x1049:  // outside 1000..1000000: ignored with status 0
+            if (r.check(length, 4, 0)) {
+                const std::uint32_t v = static_cast<std::uint32_t>(arg(0)) << 24 | static_cast<std::uint32_t>(arg(1)) << 16 |
+                                        static_cast<std::uint32_t>(arg(2)) << 8 | arg(3);
+                if (v >= 1000 && v <= 1000000) fpga_[kRegTriggerPeriod] = v;
+            }
+            break;
+        case 0x1050:  // ADT7420: signed, 1/128 degC
+            if (r.check(length, 0, 2)) r.put_be(0, static_cast<std::uint16_t>(static_cast<std::int16_t>(config_.temperature_c * 128.0)), 2);
+            break;
+        case 0x1051: if (r.check(length, 0, 1)) r.data(0) = 3; break;
+        case 0x105D:  // replies 0 only when payload byte 2 is 2; otherwise the byte stays stale
+            if (r.check(length, 1, 1) && arg(2) == 2) r.data(0) = 0;
+            break;
+        case 0x1062:  // only DISTANCE is used; DEVICESTATE is ignored
+            if (r.check(length, 2, 0)) fpga_[kRegMode] = (fpga_[kRegMode] & ~0x70u) | (static_cast<std::uint32_t>(distance_to_mode(arg(0))) << 4);
+            break;
+        case 0x1067: if (r.check(length, 0, 1)) r.data(0) = static_cast<std::uint8_t>(static_cast<std::uint8_t>(fpga_[kRegLdBrightness] >> 2) << 1); break;
+        case 0x1068:  // clamped to 100; the FPGA holds level / 2
+            if (r.check(length, 1, 0)) {
+                const std::uint32_t level = std::min<std::uint8_t>(arg(0), 100) >> 1;
+                fpga_[kRegLdBrightness] = (level << 2) | 0x80000000u | 1u;
+            }
+            break;
+        case 0x106F: {  // routes other than 0/1 read FPGA register 0
+            if (!r.check(length, 1, 2)) break;
+            const int reg = arg(0) == 0 ? kRegStrobe0 : arg(0) == 1 ? kRegStrobe1 : 0;
+            r.put_be(0, fpga_[static_cast<std::size_t>(reg)] >> 2, 2);
+            break;
+        }
+        case 0x1070: {  // luminance << 2 truncated to 16 bits (wraps above 16383); routes other than 0/1 hit register 0
+            if (!r.check(length, 3, 0)) break;
+            const int reg = arg(0) == 0 ? kRegStrobe0 : arg(0) == 1 ? kRegStrobe1 : 0;
+            const std::uint32_t lum = static_cast<std::uint32_t>(arg(1) << 8 | arg(2));
+            fpga_[static_cast<std::size_t>(reg)] = ((lum << 2) & 0xFFFFu) | 1u;
+            break;
+        }
+        case 0x107B: if (r.check(length, 0, 0)) fpga_[kRegControl] = 4; break;
+        case 0x1077: case 0x1078: case 0x107A:  // no effect; status and length are left stale
+            r.bytes.resize(9, kStale);
+            break;
+        default:  // unknown (and the undocumented keys, which the host never sends)
+            r.set_status(kFailed, 0);
+            break;
+    }
+    out.bytes = std::move(r.bytes);
+    return out;
+}
+
+std::vector<std::uint8_t> SimDevice::handle_bulk(std::span<const std::uint8_t> req) {
+    const std::uint8_t seq = req[0], group = req[2], op = req[3];
+    const std::uint32_t length = usb::read_be32(req, 4);
+    const std::size_t payload_n = std::min<std::size_t>(length, req.size() - 8);
+    received_.push_back({seq, group, op, std::vector<std::uint8_t>(req.begin() + 8, req.begin() + 8 + static_cast<std::ptrdiff_t>(payload_n))});
+    if (is_dangerous(group, op)) dangerous_seen_ = true;
+
+    std::vector<std::uint8_t> reply(usb::kBulkReplySize, kStale);
+    reply[0] = seq;
+    reply[1] = 0x02;
+    reply[2] = group;
+    reply[3] = op;
+    usb::write_be32(reply, 5, 0);
+    auto status = [&](std::uint8_t s) {
+        reply[4] = s;
+        return reply;
+    };
+    if (const auto it = config_.status_override.find(static_cast<std::uint16_t>(group << 8 | op)); it != config_.status_override.end())
+        return status(it->second);
+    const std::uint16_t page = static_cast<std::uint16_t>(req[8] << 8 | req[9]);
+    switch (group << 8 | op) {
+        case 0x1057:
+            if (length != 2) return status(kBadLength);
+            if (page > 255) return status(kBadLength);
+            reply.resize(usb::kBulkPageReplySize, kStale);
+            usb::write_be32(reply, 5, 4096);
+            std::copy_n(flash_.begin() + static_cast<std::ptrdiff_t>(page) * 4096, 4096, reply.begin() + 9);
+            return status(kOk);
+        case 0x1058:  // only a zero length is rejected; always writes 4096 bytes after the page number
+            if (length == 0 || page > 255) return status(kBadLength);
+            std::copy_n(req.begin() + 10, 4096, flash_.begin() + static_cast<std::ptrdiff_t>(page) * 4096);
+            usb::write_be32(reply, 5, 4);
+            return status(kOk);
+        case 0x0006:  // firmware update: not emulated
+            return status(kFailed);
+        default:
+            return status(kUnknownBulk);
+    }
+}
+
+bool SimDevice::take_image_halt(std::uint64_t generation) {
+    std::lock_guard lock(mutex_);
+    return alive_locked(generation) && image_halted_;
+}
+
+void SimDevice::clear_image_halt() {
+    // The firmware's CLEAR_FEATURE(EP 0x83): GPIF, DMA channel and endpoint restarted, restart armed.
+    std::lock_guard lock(mutex_);
+    image_halted_ = false;
+    ep83_halt_cleared_ = true;
+}
+
+bool SimDevice::stream_cycle(std::uint64_t generation, const usb::Transport::PacketHandler& handler, std::stop_token st,
+                             std::atomic<std::uint64_t>& packets, std::atomic<std::uint64_t>& bytes) {
+    State s;
+    FrameProvider provider;
+    {
+        std::lock_guard lock(mutex_);
+        if (!alive_locked(generation) || image_halted_) return false;
+        s = state_locked();
+        provider = provider_;
+    }
+    if (s.mono_triggers == 0 && s.rgb_triggers == 0) return false;
+    // One trigger cycle: mono triggers produce IR pairs, rgb triggers add a colour frame.
+    const int groups = std::max(s.mono_triggers, 1);
+    const auto period = std::chrono::microseconds(s.trigger_period_us) / groups;
+    auto next = clock::now();
+    ImageU8 img(config_.width, config_.height);
+    for (int g = 0; g < groups && !st.stop_requested(); ++g) {
+        std::uint32_t frame_id;
+        std::uint64_t ts;
+        {
+            std::lock_guard lock(mutex_);
+            if (!alive_locked(generation) || image_halted_) return true;
+            // Device clock: frames are stamped on a virtual timeline (frame index x trigger interval) so
+            // time and emulated motion stay consistent even if the consumer applies backpressure.
+            virtual_time_us_ += static_cast<std::uint64_t>(s.trigger_period_us / static_cast<std::uint32_t>(groups));
+            ts = virtual_time_us_;
+            frame_id = frame_id_++;
+        }
+        for (int sensor = 0; sensor < 2; ++sensor) {
+            provider(sensor, frame_id, img);
+            // As the scanner sends it: this camera is mounted upside down (usb::kUpsideDownSensor).
+            if (sensor == usb::kUpsideDownSensor) std::ranges::reverse(img.pixels());
+            emit_frame(sensor, frame_id, ts, img, handler, packets, bytes);
+        }
+        if (g == 0 && s.rgb_triggers > 0) {
+            provider(2, frame_id, img);
+            emit_frame(2, frame_id, ts, img, handler, packets, bytes);
+        }
+        next += period;
+        std::this_thread::sleep_until(next);
+    }
+    return true;
+}
+
+void SimDevice::emit_frame(int sensor, std::uint32_t frame_id, std::uint64_t timestamp, const ImageU8& img,
+                           const usb::Transport::PacketHandler& handler, std::atomic<std::uint64_t>& packets,
+                           std::atomic<std::uint64_t>& bytes) {
+    const std::size_t total = img.size();
+    // One device packet per DMA buffer (0xA020 bytes): 32-byte header + up to kStreamMaxPayload pixels.
+    std::vector<std::uint8_t> packet(usb::kStreamDeviceBufferSize);
+    std::uniform_real_distribution<double> u(0.0, 1.0);
+    for (std::size_t off = 0; off < total; off += usb::kStreamMaxPayload) {
+        const std::size_t n = std::min(usb::kStreamMaxPayload, total - off);
+        std::fill(packet.begin(), packet.begin() + usb::kStreamHeaderSize, 0);
+        packet[2] = static_cast<std::uint8_t>(((1u << sensor) & 0x7) << 3);
+        packet[8] = off + n == total ? 1 : 0;
+        usb::write_be32(packet, 12, frame_id & 0xFFu);  // the scanner's group id counts modulo 256
+        usb::write_be32(packet, 16, static_cast<std::uint32_t>(timestamp >> 32));
+        usb::write_be32(packet, 20, static_cast<std::uint32_t>(timestamp));
+        std::memcpy(packet.data() + usb::kStreamHeaderSize, img.data() + off, n);
+        bool drop = false;
+        if (config_.packet_drop_rate > 0) {
+            std::lock_guard lock(mutex_);
+            drop = u(rng_) < config_.packet_drop_rate;
+        }
+        if (drop) continue;
+        packets.fetch_add(1);
+        bytes.fetch_add(usb::kStreamHeaderSize + n);
+        handler(std::span(packet.data(), usb::kStreamHeaderSize + n));
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// SimTransport
+
+SimTransport::SimTransport(std::shared_ptr<SimDevice> device, std::uint64_t generation)
+    : device_(std::move(device)), generation_(generation) {}
+
+SimTransport::~SimTransport() { stop_stream(); }
 
 usb::TransportStats SimTransport::stats() const {
     usb::TransportStats s;
     s.stream_packets = packets_;
     s.stream_bytes = bytes_;
+    s.stream_stalls = stalls_;
     s.commands = commands_;
     return s;
 }
 
-std::vector<std::uint8_t> SimTransport::handle(std::span<const std::uint8_t> req) {
-    std::lock_guard lock(mutex_);
+Result<std::vector<std::uint8_t>> SimTransport::command(std::span<const std::uint8_t> request, std::size_t cap, unsigned) {
     ++commands_;
-    const std::uint8_t seq = req[0], group = req[2], op = req[3];
-    const std::uint32_t len = req.size() >= 8 ? be32_at(req, 4) : 0;
-    std::span<const std::uint8_t> payload = req.size() >= 8 ? req.subspan(8, std::min<std::size_t>(len, req.size() - 8))
-                                                            : std::span<const std::uint8_t>{};
-    received_.push_back({seq, group, op, std::vector<std::uint8_t>(payload.begin(), payload.end())});
-    if (const auto it = config_.status_override.find(static_cast<std::uint16_t>(group << 8 | op)); it != config_.status_override.end())
-        return {seq, 0x00, group, op, it->second, 0, 0, 0, 0};
-    if (is_dangerous(group, op)) dangerous_seen_ = true;
-
-    std::uint8_t status = 0;
-    std::vector<std::uint8_t> data;
-    auto sensor = [&]() { return payload.empty() ? -1 : sensor_from_mask(payload[0]); };
-    auto string_reply = [&](const std::string& s) { data.assign(s.begin(), s.end()); };
-
-    if (group == 0x00) {
-        switch (op) {
-            case 0x00: string_reply(config_.vendor_name); break;
-            case 0x01: string_reply(config_.product_name); break;
-            case 0x04: data.assign(config_.serial.begin(), config_.serial.end()); break;
-            case 0x05: string_reply(config_.firmware); break;
-            case 0x07:
-                data.assign(buttons_.begin(), buttons_.end());
-                buttons_ = {};  // latched until read
-                break;
-            default: status = 1; break;
-        }
-    } else if (group == 0x10) {
-        const int s = sensor();
-        switch (op) {
-            case 0x00: put_be16(data, usb::kVendorId); break;
-            case 0x01: put_be16(data, usb::kKnownProductIds[0]); break;
-            case 0x16: put_be16(data, static_cast<std::uint16_t>(config_.width)); break;
-            case 0x17: put_be16(data, static_cast<std::uint16_t>(config_.height)); break;
-            case 0x20: put_be32(data, config_.exposure_max); break;
-            case 0x21: put_be32(data, config_.exposure_min); break;
-            // Exposure as in the firmware: one 15-bit FPGA field for selectors 1..3 (sensors 0 and 1),
-            // another for sensor 2; values above 50000 are ignored with status 0.
-            case 0x22: if (s >= 0) put_be32(data, state_.exposure[static_cast<std::size_t>(s)]); else status = 2; break;
-            case 0x23: {
-                if (s < 0 || payload.size() < 5) { status = 2; break; }
-                const std::uint32_t v = be32_at(payload, 1);
-                if (v > 50000) break;
-                const std::uint32_t field = v & 0x7FFF;
-                if (s == 2) state_.exposure[2] = field;
-                else state_.exposure[0] = state_.exposure[1] = field;
-                break;
-            }
-            case 0x24: put_be16(data, config_.gain_max); break;
-            case 0x25: put_be16(data, config_.gain_min); break;
-            case 0x26: if (s >= 0) put_be16(data, state_.gain[static_cast<std::size_t>(s)]); else status = 2; break;
-            case 0x27:
-                if (s < 0 || payload.size() < 3) status = 2;
-                else state_.gain[static_cast<std::size_t>(s)] = static_cast<std::uint16_t>((payload[1] << 8) | payload[2]);
-                break;
-            case 0x2E: data.push_back(s == 2 ? 8 : 8); break;
-            case 0x40: data.push_back(static_cast<std::uint8_t>((state_.rgb_triggers << 4) | state_.mono_triggers)); break;
-            case 0x41:
-                if (payload.empty()) { status = 2; break; }
-                state_.mono_triggers = payload[0] & 0x0F;
-                state_.rgb_triggers = payload[0] >> 4;
-                break;
-            case 0x48: put_be32(data, state_.trigger_period_us); break;
-            case 0x49: {  // out-of-range periods are ignored with status 0, as in the firmware
-                if (payload.size() < 4) { status = 2; break; }
-                const std::uint32_t v = be32_at(payload, 0);
-                if (v >= 1000 && v <= 1000000) state_.trigger_period_us = v;
-                break;
-            }
-            case 0x50: put_be16(data, static_cast<std::uint16_t>(static_cast<std::int16_t>(config_.temperature_c * 128.0))); break;
-            case 0x51: data.push_back(3); break;
-            case 0x5D: data.push_back(s == 2 ? 1 : 0); break;
-            case 0x62:
-                if (payload.size() < 2 || payload[0] > 2 || payload[1] > 1) { status = 2; break; }
-                state_.indication_distance = payload[0];
-                state_.indication_active = payload[1];
-                break;
-            case 0x67: data.push_back(static_cast<std::uint8_t>(state_.laser)); break;
-            case 0x68: if (!payload.empty() && payload[0] <= 100) state_.laser = payload[0]; else status = 2; break;
-            case 0x6F: if (!payload.empty() && payload[0] < 2) put_be16(data, static_cast<std::uint16_t>(state_.strobe[payload[0]])); else status = 2; break;
-            case 0x70:
-                if (payload.size() < 3 || payload[0] > 1) { status = 2; break; }
-                state_.strobe[payload[0]] = (payload[1] << 8) | payload[2];
-                break;
-            case 0x7B: buttons_ = {}; break;
-            case 0x57: {
-                if (payload.size() < 2) { status = 2; break; }
-                const std::size_t page = static_cast<std::size_t>((payload[0] << 8) | payload[1]);
-                if (page >= flash_.size() / 4096) { status = 2; break; }
-                data.assign(flash_.begin() + static_cast<std::ptrdiff_t>(page * 4096),
-                            flash_.begin() + static_cast<std::ptrdiff_t>((page + 1) * 4096));
-                break;
-            }
-            default: status = 1; break;
-        }
-    } else {
-        status = 1;
-    }
-
-    {
-        std::lock_guard olock(observer_->mutex);
-        observer_->state = state_;
-        observer_->received = received_;
-    }
-    std::vector<std::uint8_t> reply{seq, 0x00, group, op, status};
-    put_be32(reply, static_cast<std::uint32_t>(data.size()));
-    reply.insert(reply.end(), data.begin(), data.end());
-    if (config_.mask_replies) {
-        const auto key = static_cast<std::uint8_t>(1 + rng_() % 15);
-        usb::mask_encode(reply, key);
-    }
-    return reply;
+    return device_->command(generation_, request, cap);
 }
 
-std::uint64_t SimTransport::dropped_repeats() const {
-    std::lock_guard lock(mutex_);
-    return dropped_repeats_;
-}
-
-Result<std::vector<std::uint8_t>> SimTransport::command(std::span<const std::uint8_t> request, std::size_t cap,
-                                                        unsigned) {
-    if (request.size() < 4) return make_error(Errc::invalid_argument, "short request");
-    {
-        std::lock_guard lock(mutex_);
-        const std::uint8_t seq = request[0];
-        const bool repeat = seq < 0xFE && last_command_seq_ == seq;
-        last_command_seq_ = repeat ? std::nullopt : std::optional<std::uint8_t>(seq);  // a drop clears it
-        if (repeat) {
-            ++dropped_repeats_;
-            return make_error(Errc::timeout, "no reply (repeated sequence number)");
-        }
-    }
-    auto reply = handle(request);
-    if (reply.size() > cap) reply.resize(cap);
-    return reply;
-}
-
-Result<std::vector<std::uint8_t>> SimTransport::bulk(std::span<const std::uint8_t> request, std::size_t cap, unsigned) {
-    if (request.size() % usb::kBulkChunk != 0)
-        return make_error(Errc::protocol, "bulk request not padded to 1 KiB");  // the real transport pads
-    {
-        std::lock_guard lock(mutex_);
-        const std::uint8_t seq = request[0];
-        const bool repeat = last_bulk_seq_ == seq;  // (no exemption on the bulk channel)
-        last_bulk_seq_ = repeat ? std::nullopt : std::optional<std::uint8_t>(seq);
-        if (repeat) {
-            ++dropped_repeats_;
-            return make_error(Errc::timeout, "no reply (repeated sequence number)");
-        }
-    }
-    auto reply = handle(request);
-    if (reply.size() > cap) reply.resize(cap);
-    return reply;
+Result<std::vector<std::uint8_t>> SimTransport::bulk(std::span<const std::uint8_t> request, std::size_t reply_size, unsigned) {
+    // As LibusbTransport: pad to the firmware's bulk buffer.
+    if (request.size() > usb::kBulkRequestSize) return make_error(Errc::invalid_argument, "bulk request too long");
+    std::vector<std::uint8_t> padded(request.begin(), request.end());
+    padded.resize(usb::kBulkRequestSize, 0);
+    return device_->bulk(generation_, padded, reply_size);
 }
 
 Result<void> SimTransport::start_stream(PacketHandler handler) {
     if (stream_thread_.joinable()) return make_error(Errc::busy, "stream running");
+    if (!device_->alive(generation_)) return make_error(Errc::disconnected, "emulated scanner left the bus");
     handler_ = std::move(handler);
     stream_thread_ = std::jthread([this](std::stop_token st) { stream_loop(st); });
     return {};
@@ -252,67 +567,24 @@ void SimTransport::stop_stream() {
     stream_thread_ = {};
 }
 
-void SimTransport::emit_frame(int sensor, std::uint32_t frame_id, std::uint64_t timestamp, const ImageU8& img) {
-    const std::size_t total = img.size();
-    std::vector<std::uint8_t> packet(usb::kStreamPacketSize);
-    std::uniform_real_distribution<double> u(0.0, 1.0);
-    for (std::size_t off = 0; off < total; off += usb::kStreamPayloadPerPacket) {
-        const std::size_t n = std::min(usb::kStreamPayloadPerPacket, total - off);
-        std::fill(packet.begin(), packet.begin() + usb::kStreamHeaderSize, 0);
-        packet[2] = static_cast<std::uint8_t>(((1u << sensor) & 0x7) << 3);
-        packet[8] = off + n == total ? 1 : 0;
-        usb::write_be32(packet, 12, frame_id & 0xFFu);  // the scanner's group id counts modulo 256
-        usb::write_be32(packet, 16, static_cast<std::uint32_t>(timestamp >> 32));
-        usb::write_be32(packet, 20, static_cast<std::uint32_t>(timestamp));
-        std::memcpy(packet.data() + usb::kStreamHeaderSize, img.data() + off, n);
-        if (config_.packet_drop_rate > 0 && u(rng_) < config_.packet_drop_rate) continue;
-        packets_++;
-        bytes_ += usb::kStreamHeaderSize + n;
-        handler_(std::span(packet.data(), usb::kStreamHeaderSize + n));
+void SimTransport::stream_loop(std::stop_token st) {
+    while (!st.stop_requested()) {
+        if (device_->take_image_halt(generation_)) {
+            // As LibusbTransport: clear the halt and carry on.
+            stalls_.fetch_add(1);
+            device_->clear_image_halt();
+            continue;
+        }
+        if (!device_->stream_cycle(generation_, handler_, st, packets_, bytes_))
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
 }
 
-void SimTransport::stream_loop(std::stop_token st) {
-    using clock = std::chrono::steady_clock;
-    std::uint32_t frame_id = 0;
-    auto next = clock::now();
-    ImageU8 img(config_.width, config_.height);
-    while (!st.stop_requested()) {
-        State s;
-        FrameProvider provider;
-        {
-            std::lock_guard lock(mutex_);
-            s = state_;
-            provider = provider_;
-        }
-        if (s.mono_triggers == 0 && s.rgb_triggers == 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-            next = clock::now();
-            continue;
-        }
-        // One trigger cycle: mono triggers produce IR pairs, rgb triggers add a colour frame.
-        const int groups = std::max(s.mono_triggers, 1);
-        const auto period = std::chrono::microseconds(s.trigger_period_us) / groups;
-        for (int g = 0; g < groups && !st.stop_requested(); ++g) {
-            // Device clock: frames are stamped on a virtual timeline (frame index x trigger interval) so
-            // time and emulated motion stay consistent even if the consumer applies backpressure.
-            virtual_time_us_ += static_cast<std::uint64_t>(s.trigger_period_us / static_cast<std::uint32_t>(groups));
-            const std::uint64_t ts = virtual_time_us_;
-            for (int sensor = 0; sensor < 2; ++sensor) {
-                provider(sensor, frame_id, img);
-                // As the scanner sends it: this camera is mounted upside down (usb::kUpsideDownSensor).
-                if (sensor == usb::kUpsideDownSensor) std::ranges::reverse(img.pixels());
-                emit_frame(sensor, frame_id, ts, img);
-            }
-            if (g == 0 && s.rgb_triggers > 0) {
-                provider(2, frame_id, img);
-                emit_frame(2, frame_id, ts, img);
-            }
-            ++frame_id;
-            next += period;
-            std::this_thread::sleep_until(next);
-        }
-    }
+SimScanner make_sim_scanner(SimConfig config) {
+    SimScanner s;
+    s.device = std::make_shared<SimDevice>(std::move(config));
+    s.transport = std::move(*s.device->connect());
+    return s;
 }
 
 }  // namespace einstar::sim

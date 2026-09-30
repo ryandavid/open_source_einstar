@@ -75,32 +75,35 @@ public:
         return reply;
     }
 
-    Result<std::vector<std::uint8_t>> bulk(std::span<const std::uint8_t> request, std::size_t reply_capacity,
+    Result<std::vector<std::uint8_t>> bulk(std::span<const std::uint8_t> request, std::size_t reply_size,
                                            unsigned timeout_ms) override {
         std::lock_guard lock(bulk_mutex_);
-        // The device expects whole 1 KiB chunks; EXStar silently drops any remainder, so pad instead.
+        // The firmware only sees a request once its 5120-byte DMA buffer is full, so pad to exactly that.
+        if (request.size() > kBulkRequestSize)
+            return make_error(Errc::invalid_argument, std::format("bulk request of {} bytes exceeds {}", request.size(), kBulkRequestSize));
         std::vector<std::uint8_t> out(request.begin(), request.end());
-        out.resize((out.size() + kBulkChunk - 1) / kBulkChunk * kBulkChunk, 0);
+        out.resize(kBulkRequestSize, 0);
         for (std::size_t off = 0; off < out.size(); off += kBulkChunk) {
             int transferred = 0;
             const int rc = libusb_bulk_transfer(handle_, kEpBulkOut, out.data() + off, static_cast<int>(kBulkChunk),
                                                 &transferred, timeout_ms);
             if (rc != 0) return std::unexpected(usb_error(rc, "bulk send"));
         }
-        // Read 1 KiB chunks until a short packet ends the transfer or the capacity is reached.
+        // Read exactly the reply size in 1 KiB chunks (a short packet also ends it).
         std::vector<std::uint8_t> reply;
-        reply.reserve(reply_capacity);
+        reply.reserve(reply_size);
         std::vector<std::uint8_t> chunk(kBulkChunk);
-        while (reply.size() < reply_capacity) {
+        while (reply.size() < reply_size) {
+            const auto want = std::min(kBulkChunk, reply_size - reply.size());
             int transferred = 0;
-            const int rc = libusb_bulk_transfer(handle_, kEpBulkIn, chunk.data(), static_cast<int>(kBulkChunk),
-                                                &transferred, timeout_ms);
+            const int rc = libusb_bulk_transfer(handle_, kEpBulkIn, chunk.data(), static_cast<int>(want), &transferred,
+                                                timeout_ms);
             if (rc != 0) {
                 if (rc == LIBUSB_ERROR_TIMEOUT) libusb_clear_halt(handle_, kEpBulkIn);
                 return std::unexpected(usb_error(rc, "bulk reply"));
             }
             reply.insert(reply.end(), chunk.begin(), chunk.begin() + transferred);
-            if (static_cast<std::size_t>(transferred) < kBulkChunk) break;
+            if (static_cast<std::size_t>(transferred) < want) break;
         }
         return reply;
     }
@@ -127,7 +130,7 @@ public:
         transfers_.clear();
         for (std::size_t i = 0; i < kStreamTransfersInFlight; ++i) {
             Slot slot;
-            slot.buffer.resize(kStreamPacketSize);
+            slot.buffer.resize(kStreamTransferSize);
             slot.transfer = libusb_alloc_transfer(0);
             transfers_.push_back(std::move(slot));
         }
@@ -195,8 +198,11 @@ private:
             case LIBUSB_TRANSFER_STALL: {
                 // The image endpoint halted: resubmitting cannot succeed until the halt is cleared. Park the
                 // transfer; the event thread clears the halt (a synchronous request, not allowed here) and
-                // resubmits. The firmware then restarts its endpoints on the next device-state read
-                // (00/07, the heartbeat; docs/firmware.md 5).
+                // resubmits. The firmware's CLEAR_FEATURE handler itself restarts GPIF, the DMA channel and the
+                // endpoint, so the stream resumes. It also arms a full restart: the next device-state read
+                // (00/07) that sees FPGA state bit 17 disconnects from USB, reloads the FPGA and the sensor
+                // tables and re-enumerates (docs/firmware.md 5). EinstarDevice reconnects and replays its
+                // settings when that happens (ConnectOptions::reopen).
                 self->errors_.fetch_add(1, std::memory_order_relaxed);
                 std::lock_guard lock(self->stall_mutex_);
                 self->stalled_.push_back(t);
@@ -318,6 +324,14 @@ Result<std::unique_ptr<Transport>> open_libusb(const UsbDeviceInfo& info) {
     libusb_clear_halt(handle, kEpBulkIn);
 
     return std::unique_ptr<Transport>(new LibusbTransport(std::move(ctx), handle, info));
+}
+
+Result<std::unique_ptr<Transport>> reopen_libusb(const UsbDeviceInfo& previous) {
+    auto devices = enumerate_devices();
+    if (!devices) return std::unexpected(devices.error());
+    if (devices->empty()) return make_error(Errc::not_found, "no Shining3D device attached");
+    const auto same = std::ranges::find_if(*devices, [&](const UsbDeviceInfo& d) { return d.path == previous.path; });
+    return open_libusb(same != devices->end() ? *same : devices->front());
 }
 
 }  // namespace einstar::usb

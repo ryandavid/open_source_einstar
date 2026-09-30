@@ -54,18 +54,22 @@ Result<std::unique_ptr<Session>> Session::open(bool force_emulator, UpdateSink u
     auto s = std::unique_ptr<Session>(new Session());
     std::unique_ptr<usb::Transport> transport;
     std::shared_ptr<EmulatorScene> emu;
+    // The scanner reboots or restarts its USB side on its own (docs/firmware.md 5): reopen it and replay.
+    device::ConnectOptions opts;
 
     if (!force_emulator) {
         if (auto devices = usb::enumerate_devices(); devices && !devices->empty()) {
-            auto t = usb::open_libusb(devices->front());
+            const usb::UsbDeviceInfo info = devices->front();
+            auto t = usb::open_libusb(info);
             if (!t) return std::unexpected(t.error());
             transport = std::move(*t);
+            opts.reopen = [info] { return usb::reopen_libusb(info); };
         }
     }
     if (!transport) {
         // Emulator: put the real calibration into its flash when EXStar's cache is available, so the
         // app goes through exactly the same calibration path as with hardware.
-        auto sim = std::make_unique<sim::SimTransport>();
+        auto sim = std::make_shared<sim::SimDevice>();
         RigCalibration rig = synth::synthetic_einstar_rig();
         if (auto blob = calib::encode_quick_flash_blob_from_directory(kExstarCalibrationCache)) {
             sim->set_flash(0, *blob);
@@ -92,12 +96,14 @@ Result<std::unique_ptr<Session>> Session::open(bool force_emulator, UpdateSink u
                                      sensor == 0 ? T_wl : T_wl * T_left_right, rp)
                       .image;
         });
-        transport = std::move(sim);
+        auto t = sim->connect();
+        if (!t) return std::unexpected(t.error());
+        transport = std::move(*t);
+        opts.reopen = [sim] { return sim->connect(); };
         s->emulated_ = true;
         s->emulator_state_ = emu;
     }
 
-    device::ConnectOptions opts;
     auto dev = device::EinstarDevice::connect(std::move(transport), opts);
     if (!dev) return std::unexpected(dev.error());
     s->device_ = std::move(*dev);

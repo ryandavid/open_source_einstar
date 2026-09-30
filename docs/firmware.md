@@ -2,9 +2,11 @@
 
 Source: `EXStar.app/Contents/MacOS/fabu_UPDATE/Configure/EinScan10_01_SC130_FX3_V2.10_FPGA_V3.7_{EN,CH}_IAP.img`
 (the firmware the analysed scanner reports). Everything here comes from reading the package and
-the FX3 application in Ghidra, cross-checked against a source reconstruction that rebuilds the
-application byte for byte with Cypress's SDK (kept outside the repository). Nothing was sent to
-a scanner. Behaviour is described; no vendor code or data is reproduced. Confidence tags as in
+the FX3 application in Ghidra, cross-checked against the source reconstruction in `firmware/`
+(verified behaviourally equivalent to the vendor image; see its README). This document describes
+the **vendor image**; `firmware/` differs from it only by the fixes its README lists (the SET_REPORT
+overflow in 5.1, and defined replies when an internal I2C read fails). Nothing was sent to a scanner
+for this analysis. Where the protocol documents and the firmware disagree, the firmware is right. Confidence tags as in
 protocol-device.md: **[H]** read directly from code or data, **[M]** inferred from structure,
 **[L]** guess.
 
@@ -20,7 +22,8 @@ protocol-device.md: **[H]** read directly from code or data, **[M]** inferred fr
   * `+0x040000`: FPGA bitstream, 1 006 076 bytes (8.05 Mbit), then 0xFF.
 
 ## 2. Hardware seen from the firmware **[H]** (roles **[M]**)
-* **Cypress FX3** (ARM926, USB 3.0) running Cypress's SDK on the **ThreadX** RTOS. Four threads:
+* **Cypress FX3** (ARM926, USB 3.0 capable, but the scanner's cable and connector are USB 2.0 only, so
+  it always runs at high speed) running Cypress's SDK on the **ThreadX** RTOS. Four threads:
   FPGA boot (peripherals, flash, FPGA configuration; then starts the next two), the bulk channel,
   the command channel, and a once-a-second watchdog (see 5.1).
 * **SPI flash** (30 MHz, mode 3), at least 5 MB (8 MB part likely): the slots, the boot record and
@@ -40,8 +43,8 @@ protocol-device.md: **[H]** read directly from code or data, **[M]** inferred fr
   the status LED. Images reach the FX3 through its GPIF-II parallel port (16-bit).
 * **USB**: VID 0x3267, PID 0x0003 in the descriptors. EP 0x01/0x81 command channel (**interrupt**
   endpoints), EP 0x02/0x82 bulk channel, EP 0x83 image stream (GPIF → USB, 4 × 0xA020-byte DMA
-  buffers). All endpoints are set up with **512-byte packets and burst 1, also on SuperSpeed**
-  (the speed is fixed at "high speed" in the code). The device connects to USB only after the
+  buffers). All endpoints are set up with **512-byte packets and burst 1** (the speed is
+  fixed at "high speed" in the code, which matches the USB 2.0-only hardware). The device connects to USB only after the
   cameras are configured.
 
 ## 3. Flash layout **[H]**
@@ -113,8 +116,17 @@ user area. The slots, the boot record and the EEPROM cannot be read back with st
   nearest (exact halves round down). The read-back is converted the other way.
 * 00/04 (serial) is the FX3's 64-bit eFuse die ID.
 * 00/07 reads one FPGA register: six 2-bit button codes (from bit 5; the host uses the first
-  three), then single-bit flags. It also drives a recovery hook: after the host clears a halt on
-  EP 0x83, the next 00/07 that sees FPGA state bit 17 set restarts the endpoints and DMA channels.
+  three), then single-bit flags. It also drives a recovery hook. A CLEAR_FEATURE(ENDPOINT_HALT) on
+  EP 0x83 already restarts GPIF, the DMA channel and the endpoint by itself, and it arms a flag;
+  the next 00/07 that sees FPGA state bit 17 set then runs a **full restart**: the device
+  disconnects from USB, reloads the FPGA bitstream (every FPGA register returns to its power-on
+  value), rewrites the sensor tables (gain back to 500 %), and re-enumerates. The flag survives
+  until it fires or the device reboots, across host sessions. A host that clears that halt must
+  be ready to reopen the device and replay its settings.
+* **Bulk framing**: the bulk OUT DMA buffer is 5120 bytes and is only handed to the firmware when
+  full (or ended by a short packet), so every bulk request is exactly 5120 bytes. Replies are
+  1024 bytes, or 5120 for a page read (10/57), whatever the request, and end on a full packet with
+  no zero-length packet: the host has to read exactly that many.
 * 10/7B (ClearState) writes 4 to an FPGA control register; an undocumented 00/EF writes 1 to the
   same register and then sleeps 1 s.
 * 10/62 (indication) uses only DISTANCE: 0/1/2 select FPGA laser modes 4/1/2, and any other value
@@ -153,6 +165,20 @@ Found while reconstructing the application. None is visible in normal EXStar use
 * **Watchdog progress check is inert**: the 1 s progress timer is created but never started. The
   watchdog thread still resets the device after a SuperSpeed endpoint-reset event, after an update,
   and after 10 s powered but not configured.
+* **A suspend reboots the scanner**: a USB suspend clears the "configured" flag and only
+  SET_CONFIGURATION sets it again (a resume does not). About 10 s after any suspend, resumed or
+  not, the watchdog disconnects and resets the device, e.g. after the host computer sleeps. With
+  VBUS loss and the 00/07 restart above, that makes several ways
+  for the scanner to leave the bus on its own; EXStar reconnects and replays its settings, and
+  so does our device layer.
+* **Laser level halved**: 10/68 clamps to 100 and stores half the value; 10/67 returns it doubled,
+  so odd levels read back one lower.
+* **No-op keys reply with a stale header**: 10/77, 10/78 and 10/7A write neither the status nor
+  the length, so the reply's status byte and length (and with it the reply size) are whatever the
+  heap buffer held.
+* **Unused SuperSpeed paths**: the SuperSpeed descriptors advertise 1024-byte packets (burst 16 on
+  EP 0x83) that the endpoint setup never matches, and the watchdog reboots on a SuperSpeed endpoint
+  reset. Neither matters: the scanner's hardware is USB 2.0 only.
 
 ### 5.2 Undocumented command keys **[H]**
 00/02 (replies 0), 00/03 (replies 1), 00/09 / 00/0A / 00/0B (the lengths 18, 12, 42 of vendor
@@ -160,7 +186,8 @@ name, product name and version), 00/0C (replies 7), 00/0D (clears an FPGA regist
 pending reboot or update), 00/BB (reads an FPGA register), 00/EF (see above), CC/CC (raw FX3
 GPIO 50 and 52 pin registers), 10/36 and 10/37 (length check only), 10/3E / 10/3F (an FPGA
 register's mode), 10/42 / 10/43 (32-bit form of the trigger switch), 10/56 (replies 0x00100000),
-10/71, 10/72, 10/73, 10/75 (read one byte, write one of three bytes of an FPGA register), 10/77, 10/78, 10/7A (no effect). Writes to the
+10/71, 10/72, 10/73, 10/75 (read one byte, write one of three bytes of an FPGA register), 10/77, 10/78, 10/7A (no effect, but a stale reply
+header, 5.1). Writes to the
 trigger switch also rewrite a second FPGA register with a fixed value.
 
 ## 6. FPGA bitstream **[H]** (vendor unidentified)

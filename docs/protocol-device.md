@@ -52,14 +52,17 @@ matching names in the binary and never goes on the wire. **[H]** (0x10954,
 |---|---|---|
 | 0 | 1 | Sequence number. Per-device counter at `this+0x40`, starts at 0, post-increment modulo **254** (0..253), mutex-protected (`getPacketID` 0xb488). The transport reserves 0xFE and 0xFF for its own queries. |
 | 1 | 1 | 0x00 (the transport overwrites it with the mask key) |
-| 2 | 1 | **Group**: `0x00` = system/info, `0x10` = controller/sensor registers, `0xCC` = bootloader |
+| 2 | 1 | **Group**: `0x00` = system/info, `0x10` = controller/sensor registers, `0xCC` = flash maintenance (handled by the application, not a bootloader; firmware.md 4.5) |
 | 3 | 1 | Opcode |
 | 4..7 | 4 | Payload length, **big-endian u32** |
 | 8.. | n | Payload |
 
 The buffer is zero-padded to a fixed size per command: 10, 16, 50 (0x32), 64
 (0x40), 100 or 5120 (0x1400) bytes. That size is passed as both the send
-length and the reply capacity. The padding bytes are always zero.
+length and the reply capacity. The padding bytes are always zero. On the bulk
+channel 5120 is not arbitrary: it is exactly the firmware's DMA buffer, which
+is only delivered when full, and bulk replies have a fixed size of their own
+(protocol-transport.md 4.1).
 
 **Camera selector byte.** Per-sensor commands put a one-byte sensor **bit
 mask** at payload byte 0 (packet offset 8). Sensor index 0 → 0x01, 1 → 0x02,
@@ -189,7 +192,7 @@ events.
 | 00/04 | Serial (`readSerial` 0x12a20) | R | 0 | – | 8 raw bytes, formatted as 16 uppercase hex chars (e.g. `0009011402CF0C20`) | 64 | H |
 | 00/05 | Firmware version (`readFirmwareVersion` 0x938c) | R | 0 | – | ASCII, max 56 | 64 | H |
 | 00/06 | **IAP firmware download** (`updateFirmware` 0xffdc), bulk. **DANGEROUS** | W | see 3.14 | | | 5120 | H |
-| 00/07 | Device state / buttons (`readDeviceState` 0x15e8c) | R | 0 | – | BUTTON0 @9, BUTTON1 @10, BUTTON2 @11. GSY variant only: board temp BE16 @12, IR temp BE16 @14 (÷100 °C) | 50 | H |
+| 00/07 | Device state / buttons (`readDeviceState` 0x15e8c) | R | 0 | – | BUTTON0 @9, BUTTON1 @10, BUTTON2 @11. The plugin reads board/IR temperatures @12/@14 for a "GSY" variant; in this firmware @12..14 are button codes 3–5 (3.10) | 50 | H |
 | 00/08 | Reboot (`rebootDevice` 0xb0d4, command "RebootDevice") | W | 0 | – | – | 10 | H |
 | 10/00 | Vendor ID ("Vid") | R | 0 | – | BE16 | 16 | H |
 | 10/01 | Product ID ("Pid") | R | 0 | – | BE16 | 16 | H |
@@ -211,7 +214,7 @@ events.
 | 10/50 | Temperature (`readTemperature` 0x12c0c, property "Temperature") | R | 0 | – | BE16 raw, °C = raw >> 7 (sign-extended) | 50 | H |
 | 10/51 | Sensor count | R | 0 | – | u8 | 16 | H |
 | 10/57 | **Flash page read** (bulk) | R | 2 | BE16 page number | 4096 bytes | 5120 | H |
-| 10/58 | **Flash page write** (bulk). **DANGEROUS** | W | 0x1002 | BE16 page number, 4096 bytes | (reply capacity 1024) | 5120 | H |
+| 10/58 | **Flash page write** (bulk). **DANGEROUS** | W | 0x1002 | BE16 page number, 4096 bytes | none (length field 4, 1024-byte reply) | 5120 | H |
 | 10/5D | Colour mode | R | 1 | mask | u8 | 16 | H |
 | 10/62 | **Indication** LEDs (`setDeviceIndication` 0x15d5c) | W | 2 | u8 DISTANCE (0..2), u8 DEVICESTATE (0/1) | – | 16 | H |
 | 10/67 | Laser / "LD RGB" brightness read (`laserLightBrightnessIO` 0x12d24) | R | 0 | – | u8 | 50 | H |
@@ -307,16 +310,24 @@ Logic-layer execute names seen in the log, `ReadData(offset, size)` and
 ### 3.6 Exposure / gain per camera **[H]** (units **[M]**)
 * Sensor index 0..2 maps to mask 1, 2, 4. An index > 2 gives error 0x40C.
 * Exposure is BE32. Values seen: 1500–5200. The unit is probably µs. [M]
-* Gain is BE16. Values seen: 80–120 on IR, 180 on RGB (index 2), 400 on
-  index 0 in a texture/preview phase. There is no host clamp. The device range
-  comes from 10/24 and 10/25.
+  **In the firmware** exposure is one FPGA register with two 15-bit fields:
+  masks ≤ 3 (sensors 0 **and** 1) share the low field, mask 4 has the high
+  one. Setting either IR camera sets both. Values above 50 000 are ignored
+  with status 0; 32 768..50 000 wrap to 15 bits (firmware.md 5). [H]
+* Gain is BE16 percent. Values seen: 80–120 on IR, 180 on RGB (index 2), 400
+  on index 0 in a texture/preview phase. There is no host clamp. The device
+  range comes from 10/24 and 10/25. The firmware stores it in the sensor's
+  1/32 steps, so it reads back rounded (110 → 109, 120 → 119; multiples of
+  25 are exact). [H]
 * On success the value is cached (`this+0x3f8` exposure, `this+0x3f0` gain)
   for reconnect replay.
 * Error codes: set exposure 0x40D, get exposure 0x40E, set gain 0x410,
   get gain 0x411.
 
 ### 3.7 Laser brightness ("LDRGBLuminance") **[H]** (meaning **[M]**)
-* 10/68, payload is one byte 0..100, most likely percent.
+* 10/68, payload is one byte 0..100, most likely percent. The firmware clamps
+  it to 100 and keeps half the value, so 10/67 reads back the even number
+  below an odd one (61 → 60). [H]
 * Read with 10/67 (reply u8 @9).
 * Values seen: 0 when idle, 60 during a phase with TriggerMode 3/0 and strobe
   route 0 = 3000. This suggests "LD" is the structured-light laser/VCSEL
@@ -367,10 +378,15 @@ Logic-layer execute names seen in the log, `ReadData(offset, size)` and
   exposure pair for both sensors, e.g. exposure 2400 → 2600 → 2800, then gain 100 → 120 at
   exposure 4400). The steps follow the `cam_para_config` brightness table (algorithms.md §3). [H]
   We use the same assignment with our own brightness ladder (`device::brightness_level`).
-* The firmware probably latches these codes until **ClearState** (10/7B) is
-  sent. The host only sends ClearState after a reconnect, and the host-side
-  cache is cleared on each `HeartBeat` read. Not verified on hardware whether
-  the device auto-clears on read. [L]
+* The codes are cleared once read (measured, 7 Q2). The firmware just reads an
+  FPGA register for them; ClearState (10/7B) writes 4 to another FPGA register
+  (firmware.md 5), and the host only sends it after a reconnect.
+* **Full 00/07 reply in this firmware** [H]: it declares 20 bytes and fills 14:
+  @9..14 six 2-bit button codes (the plugin uses the first three), @15..19
+  single-bit flags, @20 FPGA state bit 17 (meaning unknown; it gates the
+  firmware's restart after a cleared image-endpoint halt), @21 a run-state byte
+  (measured: 01/02 idle, 08 scan streaming, 40 texture streaming), @22 one more
+  flag. Every 00/07 can therefore restart the scanner (firmware.md 5).
 * Online/offline logic:
   * A failed 00/07 increments a failure counter. After 3 consecutive failures
     (on the 4th) the device is marked offline and the cached state is emptied.
@@ -733,10 +749,12 @@ and 14:24:56. Each is followed by the replay (section 2) and ClearState
 9. **GSY product variant.** Which product-name token triggers the extra
    temperature fields? It is not observed on this unit; the product name was
    not logged.
-10. **10/58 reply.** Its size and content are not checked by the plugin
-    (reply capacity 1024), and write errors are ignored.
+10. ~~10/58 reply~~: a 1024-byte bulk reply with length field 4 and no data;
+    only a zero payload length is rejected, and 4096 bytes are always written
+    (firmware.md 4.6, 5).
 11. **The HeartBeatPeriod value** the logic layer sets in `initFunc` (not
     logged).
-12. **Reply length field for register reads.** It is only verified for
-    string replies. Numeric replies are read at fixed offsets and the length
-    is ignored.
+12. ~~Reply length field for register reads~~: every command sets it (the
+    data length), except 00/04 and 00/07, which declare more than they fill,
+    and the no-op keys 10/77, 10/78 and 10/7A, which leave it stale
+    (firmware.md 5.1).

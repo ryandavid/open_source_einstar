@@ -64,6 +64,7 @@
 #include "einstar/track/tracker.hpp"
 #include "einstar/track_metal/metal_icp.hpp"
 #include "einstar/track_metal/metal_tsdf.hpp"
+#include "einstar/usb/constants.hpp"
 
 using namespace einstar;
 
@@ -164,7 +165,7 @@ int probe(bool verbose) {
 int sim_probe() {
     device::ConnectOptions opts;
     opts.heartbeat_ms = 0;
-    auto dev = device::EinstarDevice::connect(std::make_unique<sim::SimTransport>(), opts);
+    auto dev = device::EinstarDevice::connect(sim::make_sim_scanner().transport, opts);
     if (!dev) {
         std::println(stderr, "connect failed: {}", dev.error().message);
         return 1;
@@ -196,13 +197,15 @@ std::unique_ptr<device::EinstarDevice> open_scanner(int heartbeat_ms, std::funct
         std::println(stderr, "no Shining3D devices (vid 3267) found");
         return nullptr;
     }
-    auto transport = usb::open_libusb(devices->front());
+    const usb::UsbDeviceInfo info = devices->front();
+    auto transport = usb::open_libusb(info);
     if (!transport) {
         std::println(stderr, "open failed: {}", transport.error().message);
         return nullptr;
     }
     device::ConnectOptions opts;
     opts.heartbeat_ms = heartbeat_ms;
+    opts.reopen = [info] { return usb::reopen_libusb(info); };
     if (transcript) {
         opts.verbose_transcript = true;
         opts.transcript_sink = std::move(transcript);
@@ -323,7 +326,9 @@ int hw_test(std::span<char*> args) {
             continue;
         }
         const std::uint32_t e2 = *e == 4000 ? 4100 : 4000;
-        const std::uint16_t g2 = *g == 100 ? 110 : 100;
+        // Multiples of 25 %: the firmware stores gain in 1/32 steps, so other values read back rounded
+        // (110 -> 109, 120 -> 119).
+        const std::uint16_t g2 = *g == 100 ? 125 : 100;
         const bool w1 = dev->set_exposure(sensor, e2) && dev->set_gain(sensor, g2);
         const auto e_rb = dev->exposure(sensor);
         const auto g_rb = dev->gain(sensor);
@@ -401,9 +406,13 @@ int hw_test(std::span<char*> args) {
         // (The assemblers and their statistics are per stream.)
         std::println("  {} groups in {:.1f} s = {:.2f} Hz; arrival interval median {:.1f} ms, max {:.1f} ms; frame-id gaps {}", n,
                      secs, hz, dt.empty() ? 0.0 : dt[dt.size() / 2], dt.empty() ? 0.0 : dt.back(), gaps);
-        std::println("  packets {}, frames {}, bad packets {}, resyncs {}, overflows {}, bad camera {}; groups {}, incomplete dropped {}, IR-only {}",
-                     ss.packets, ss.frames, ss.bad_packets, ss.resyncs, ss.overflows, ss.bad_camera, gs.groups, gs.incomplete_dropped,
-                     gs.ir_only_emitted);
+        std::println("  packets {} (longest {} bytes; the firmware's DMA buffer allows {}), frames {}, bad packets {}, resyncs {}, "
+                     "overflows {}, bad camera {}; groups {}, incomplete dropped {}, IR-only {}",
+                     ss.packets, ss.max_packet, usb::kStreamDeviceBufferSize, ss.frames, ss.bad_packets, ss.resyncs, ss.overflows,
+                     ss.bad_camera, gs.groups, gs.incomplete_dropped, gs.ir_only_emitted);
+        const auto ts = dev->transport_stats();
+        if (ts.stream_stalls > 0 || dev->reconnects() > 0)
+            std::println("  image-endpoint stalls cleared {}, reconnections {}", ts.stream_stalls, dev->reconnects());
         if (!temps.empty()) std::println("  temperature while streaming {:.2f} .. {:.2f} C", std::ranges::min(temps), std::ranges::max(temps));
         std::map<unsigned, int> mask_counts;
         for (const auto m : cap->masks) ++mask_counts[m];

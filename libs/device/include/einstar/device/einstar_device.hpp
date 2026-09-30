@@ -8,6 +8,12 @@
 //   configure_*()        volatile settings (exposure, gain, trigger, laser, strobe, LEDs)
 //   start_stream()       image delivery
 // Destruction (or disconnect()) always switches the trigger, laser and strobe off.
+//
+// The firmware leaves the bus on its own (reboots after a suspend or VBUS loss,
+// and a full restart after a cleared image-endpoint halt; docs/firmware.md 5). With ConnectOptions::reopen
+// set, the heartbeat then reopens the scanner, checks its serial, replays every setting made through this
+// API (the restart resets the FPGA and sensors), sends ClearState and resumes the stream, as EXStar does.
+// While offline, commands fail at once with Errc::disconnected.
 
 #include <array>
 #include <atomic>
@@ -83,8 +89,12 @@ enum class DistanceIndication : std::uint8_t { zone0 = 0, zone1 = 1, zone2 = 2 }
 struct ConnectOptions {
     bool verbose_transcript = false;             // log every request/reply as hex
     std::function<void(std::string_view)> transcript_sink;  // defaults to log::debug
-    int heartbeat_ms = 250;                      // 0 disables polling (also the firmware's stream-stall recovery)
+    int heartbeat_ms = 250;                      // 0 disables polling (buttons, offline detection, reconnection)
     int command_retries = 5;
+    // Opens the scanner again after it left the bus (usb::reopen_libusb, or SimDevice::connect). Empty: no
+    // reconnection, the device stays offline. Needs the heartbeat.
+    std::function<Result<std::unique_ptr<usb::Transport>>()> reopen;
+    int reconnect_interval_ms = 500;
     // Sequence number of the first request. The firmware silently drops a request whose number repeats
     // the previous one on that channel, including the last request of an earlier session
     // (docs/firmware.md 5), so a session starts at a random number; set it only for tests.
@@ -105,6 +115,7 @@ public:
 
     [[nodiscard]] const DeviceInfo& info() const { return info_; }
     [[nodiscard]] bool online() const { return online_.load(); }
+    [[nodiscard]] int reconnects() const { return reconnects_.load(); }  // successful reattachments
 
     // ---- read-only ----
     Result<std::vector<std::uint8_t>> read_flash(std::uint32_t offset, std::uint32_t size);
@@ -140,7 +151,7 @@ public:
     void stop_stream();
     [[nodiscard]] usb::StreamStats stream_stats() const;
     [[nodiscard]] usb::GroupStats group_stats() const;
-    [[nodiscard]] usb::TransportStats transport_stats() const { return transport_->stats(); }
+    [[nodiscard]] usb::TransportStats transport_stats() const;
 
     void set_button_sink(ButtonSink sink);
 
@@ -153,23 +164,51 @@ private:
     template <const OpcodeInfo& Op>
         requires SafeOpcode<Op>
     Result<usb::Reply> send(std::span<const std::uint8_t> payload = {});
-    Result<usb::Reply> send_checked(const OpcodeInfo& op, std::span<const std::uint8_t> payload);
+    Result<usb::Reply> send_checked(const OpcodeInfo& op, std::span<const std::uint8_t> payload, int attempts = 0);
 
-    Result<void> identify();
+    Result<void> identify(DeviceInfo& out);
     Result<std::string> read_string(const OpcodeInfo& op);
     void heartbeat_loop(std::stop_token st);
+    void mark_offline(std::string_view reason);
+    void reattach();
+    usb::Transport::PacketHandler packet_handler();
     void transcript(std::string_view dir, std::span<const std::uint8_t> bytes);
     [[nodiscard]] std::uint8_t next_sequence();
+    [[nodiscard]] std::shared_ptr<usb::Transport> transport() const;
+    void set_transport(std::shared_ptr<usb::Transport> t);
 
-    std::unique_ptr<usb::Transport> transport_;
+    // Everything set through the API, replayed after a reconnection.
+    struct Settings {
+        std::optional<std::pair<int, int>> trigger;       // mono, rgb
+        std::optional<std::uint32_t> trigger_period;
+        std::array<std::optional<std::uint32_t>, 2> exposure;  // IR pair (sensors 0, 1), colour (sensor 2)
+        std::array<std::optional<std::uint16_t>, 3> gain;
+        std::optional<int> laser;
+        std::array<std::optional<int>, 2> strobe;
+        std::optional<DistanceIndication> indication;
+    };
+    template <typename F>
+    void remember(F&& update) {
+        std::lock_guard lock(settings_mutex_);
+        update(settings_);
+    }
+
+    mutable std::mutex transport_mutex_;
+    std::shared_ptr<usb::Transport> transport_;  // (guarded; null while offline between reopen attempts)
     ConnectOptions options_;
     DeviceInfo info_;
     std::mutex seq_mutex_;
     std::uint8_t seq_ = 0;
     std::atomic<bool> online_{true};
     std::atomic<bool> streaming_{false};
-    int rgb_triggers_ = 0;
+    std::atomic<int> reconnects_{0};
+    std::atomic<std::thread::id> heartbeat_id_{};  // the heartbeat's own commands pass while offline
+    std::string foreign_serial_;                   // another scanner found while reconnecting (heartbeat only)
+    std::atomic<int> rgb_triggers_{0};  // (also set by the heartbeat when it replays the trigger)
+    std::mutex settings_mutex_;
+    Settings settings_;
 
+    std::mutex stream_control_mutex_;  // start / stop, against the heartbeat restarting the stream
     std::mutex stream_mutex_;
     std::unique_ptr<usb::FrameAssembler> frames_;
     std::unique_ptr<usb::GroupAssembler> groups_;

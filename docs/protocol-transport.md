@@ -139,7 +139,7 @@ Command packets have a common header:
 | Offset | Request | Reply |
 |---|---|---|
 | 0 | sequence byte | echo of the request's seq |
-| 1 | 0x00 (holds the mask key after masking; see 2.5) | 0x00, or the key; 0x02 is treated specially (see 2.4) |
+| 1 | 0x00 (holds the mask key after masking; see 2.5) | always 0x02 from the scanner's firmware ("not masked"; firmware.md 5). The layer would decode anything else (2.4) |
 | 2 | command group (0x00 for the layer's own queries, 0x10 for plugin commands) | echo |
 | 3 | opcode | echo |
 | 4 | request: first byte of the length field | **status**: 0 = OK (the plugin checks this) |
@@ -340,9 +340,11 @@ the resubmit flag is set.
 
 Consequences:
 * A **unit** is the set of consecutive packets that ends at an EOF-flagged
-  packet, or 32 packets, whichever comes first. With the plugin's settings, a
-  frame of W×H bytes takes ⌈W·H / 41 952⌉ packets. For example, 1280×1024 =
-  1 310 720 bytes needs 32 packets, so in practice **one unit ≈ one frame**.
+  packet, or 32 packets, whichever comes first. The firmware's image DMA
+  buffer is 0xA020 = 41 000 bytes, so a device packet is at most that long
+  (at most 40 968 pixel bytes after the header, 3.6), shorter than the
+  plugin's 41 984-byte transfers. A 1280×1024 frame (1 310 720 bytes) then
+  takes 32 packets, so in practice **one unit ≈ one frame**.
 * Slots after the EOF slot in a committed unit hold stale data from earlier
   frames. Consumers must stop at the EOF slot.
 * Timed-out transfers (no data within 500 ms) are simply reposted. This is
@@ -380,8 +382,12 @@ which starts at slot+4. Multi-byte fields are big-endian.
 | 24–31 | 8 | not read by host | [L] |
 | 32… | actual_len−32 | image payload (raw 8-bit pixels, row-major) | [H] |
 
-**Header = 32 bytes.** Payload per full packet = 41 984 − 32 = 41 952 bytes.
-**[H]**
+**Header = 32 bytes.** **[H]** The host's transfers are 41 984 bytes, but a
+device packet is at most one firmware DMA buffer, 0xA020 = 41 000 bytes, so
+at most 40 968 pixel bytes **[H from the firmware]**. Whether the FPGA fills
+each buffer is not known; `einstar-cli hw-test` prints the longest packet
+seen. The header comes from the FPGA; the FX3 firmware passes the GPIF data
+through unchanged.
 
 **Plugin reassembly algorithm** [H]. `payloadSize` = width × height, read from
 the device at connect time with commands 0x10/0x16 and 0x10/0x17.
@@ -424,9 +430,19 @@ A frame can span units. `hasReceived` is carried across units until EOF.
   * On LIBUSB_ERROR_TIMEOUT it calls `clear_halt(0x82)` and fails.
   * On success, `len` is set to the sum of the actual lengths.
 * There is no masking on bulk (see 2.4).
-* The payload appears to use the same header convention as commands. The
-  plugin's `bulkIO` (plugin:0x10414) validates reply bytes 0, 2 and 3 against
-  the request and requires byte 4 == 0. **[M]**
+* The payload uses the same header convention as commands. The plugin's
+  `bulkIO` (plugin:0x10414) validates reply bytes 0, 2 and 3 against the
+  request and requires byte 4 == 0; the firmware confirms the layout
+  (firmware.md 5). **[H]**
+* **What the firmware requires** **[H]**. Its bulk OUT DMA buffer is 5120
+  bytes with 512-byte packets, and the FX3 hands a buffer to the firmware
+  only when it is full or a short packet ends it. The plugin always sends
+  5120-byte buffers (five 1 KiB chunks), which fill it exactly; a shorter
+  request made of whole 1 KiB chunks would never be delivered. Replies have a
+  fixed size set by the firmware, whatever the request: **5120 bytes for a
+  page read (10/57), 1024 for everything else, errors included**. They end on
+  a full packet with no zero-length packet, so the host must read exactly
+  that many bytes: a longer read waits until it times out.
 
 ### 4.2 C API wrappers [H]
 * `sendBulkData(h, buf, len)` (0x17a0c): 1000 ms per chunk. It does **not**
@@ -591,45 +607,37 @@ Its disconnect sequence (plugin:0xaab8):
 * Read the serial with `FF 00 00 04` + zeros (30 bytes), then take reply bytes
   9..16 as hex. Read the product name with `FE 00 00 01` (100-byte buffer),
   then take the BE32 length at bytes 5..8 and the string at byte 9.
-* Masking can be omitted on transmit. On receive, apply the XOR decode keyed
-  on the high nibble of byte1, unless byte1 == 0x02. It is a no-op for
-  unmasked replies.
+* Masking can be omitted on transmit (the firmware never unmasks requests).
+  On receive, the XOR decode keyed on the high nibble of byte1 never applies:
+  the firmware always sends byte1 = 0x02.
 * Stream: keep about 32 async bulk-IN transfers of 41 984 bytes in flight on
   0x83 with a 500 ms timeout, and resubmit on timeout. Treat packet byte 8 == 1
   as end of frame. Strip the 32-byte header and reassemble W×H bytes, using
   the plugin's resync rules. There is no need to reproduce the unit/slot
   container; it is an internal artifact of this layer.
-* For bulk sends, pad the length to a multiple of 1024.
+* For bulk sends, pad every request to exactly 5120 bytes, and read exactly
+  the firmware's reply size (5120 for 10/57, else 1024; 4.1).
 
 ---
 
 ## 8. Open questions
 
-1. **Transfer types of EP 0x01/0x81.** The code uses
-   `libusb_interrupt_transfer`, but libusb would issue the same call against a
-   bulk endpoint. The descriptor must be checked (the firmware notes say
-   interrupt, 1024 B).
-2. **PID.** The layer accepts any PID under VID 0x3267, so it cannot settle
-   0x0002 vs 0x0003. Both are fine for this layer.
-3. **Request length field.** Is it bytes 4..7, as the plugin's
-   `00 00 00 01 <arg>` suggests? Replies clearly use a status byte at 4 and
-   the length at 5..8. The asymmetric layout is inferred **[M/L]**.
-4. **Meaning of reply byte1 == 0x02**, the value that skips decoding.
-   Possibly an "unmasked/raw" marker, or an error class. **[L]**
-5. **Stream header bytes 0–7, 9–11 and 24–31** are unused by the host.
-   A magic value, packet sequence, image size or exposure id may live there.
-   Also: are the two 3-bit fields in byte 2 the camera index and the image
-   type? Are bytes 12–15 a frame counter, and bytes 16–23 a device timestamp
-   (in what unit)?
-6. Does the firmware ever send masked replies, or ever require masked
-   requests? Nothing in EXStar enables masking. The code path may only be
-   used by other products or older firmware.
-7. **Interrupt IN reply sizes.** The C API requests exactly the request length
-   (16 or 50 bytes). The device must be sending short replies. The exact
-   reply length per opcode should be confirmed from the firmware.
-8. **Bulk-channel payload format** for firmware/calibration transfers. The
-   header convention (echo bytes 0/2/3, status at byte 4) is inferred from the
-   plugin's validation only.
+Answered by the firmware (firmware.md), kept for reference:
+1. ~~Transfer types of EP 0x01/0x81~~: **interrupt** endpoints, 512-byte packets
+   (the scanner is USB 2.0 only; the firmware's unused SuperSpeed descriptor says 1024).
+2. **PID.** The descriptors say 0x0003 and command 10/01 reports 1. The layer
+   accepts any PID under VID 0x3267.
+3. ~~Request length field~~: bytes 4..7, BE32, checked exactly per command.
+4. ~~Reply byte1 == 0x02~~: the firmware's "not masked" marker, on every reply.
+5. **Stream header bytes 0–7, 9–11 and 24–31** are unused by the host and
+   written by the FPGA, not the FX3 firmware. Still open: are the two 3-bit
+   fields in byte 2 the camera index and the image type? Are bytes 12–15 a
+   frame counter (it counts modulo 256 on the scanner, status.md), and bytes
+   16–23 a device timestamp (in what unit)?
+6. ~~Masked replies or requests~~: never. The firmware ignores request byte 1.
+7. ~~Interrupt IN reply sizes~~: 9 + the declared length, at most 51 bytes
+   (00/05). 00/04 and 00/07 declare more than they fill (firmware.md 5.1).
+8. ~~Bulk-channel payload format~~: 4.1 and firmware.md 4.6.
 9. **Disconnect detection** compares PID and port lists. Behaviour with two
    identical scanners, or after a re-plug to a different port while one is
    still attached, is quirky and was not analysed further.

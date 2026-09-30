@@ -26,10 +26,8 @@ TEST_CASE("emulated scanner through the full live pipeline tracks the true traje
     const RigCalibration rig = einstar_like_rig();
     const auto setup = e2e::make_scene();
 
-    sim::SimConfig cfg;
-    auto transport = std::make_unique<sim::SimTransport>(cfg);
-    auto* sim = transport.get();
-    sim->set_frame_provider([&](int sensor, std::uint32_t frame_id, ImageU8& out) {
+    auto [emulator, transport] = sim::make_sim_scanner();
+    emulator->set_frame_provider([&](int sensor, std::uint32_t frame_id, ImageU8& out) {
         e2e::render_sensor(setup, rig, truth_pose(frame_id), sensor, frame_id * 3 + static_cast<std::uint32_t>(sensor), out);
     });
 

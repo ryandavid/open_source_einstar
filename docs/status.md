@@ -5,8 +5,8 @@
 | Area | State | Evidence |
 |---|---|---|
 | USB transport (libusb) | done | codec/mask round trip on documented example; packet reassembly + resync tests |
-| Device control | done | full command set via typed API; dangerous opcodes blocked at compile time; emulator tests match EXStar's logged bytes |
-| Device emulator | done | speaks the protocol, streams packetised frames, serves flash, buttons, temperature |
+| Device control | done | full command set via typed API; dangerous opcodes blocked at compile time; emulator tests match EXStar's logged bytes; reconnects and replays every setting when the scanner leaves the bus (it reboots or restarts its USB side on its own, docs/firmware.md 5) |
+| Device emulator | done | modelled on the firmware source (`firmware/src`): payload-length checks, status codes, reply and bulk sizes, shared IR exposure, gain rounding, laser halving, strobe wrap, the restart after a cleared image-endpoint halt, reboots; streams packetised frames, serves flash, buttons, temperature |
 | Calibration | done | decodes EXStar CCF / flash blob; matches documented values; baseline 159.913 mm |
 | Rectification | done | row alignment < 1e-6 px on synthetic rig with distortion + toe-in |
 | Stereo depth | done (CPU reference + Metal) | census + SGM (slant steps) + slanted-window ZNCC; 0.056 mm median error on synthetic speckle; Metal 5.7 ms/frame (CPU 21 ms), 99.8% of disparities within 0.25 px of CPU |
@@ -30,8 +30,10 @@
   layer turns it upright; the emulator sends it rotated. Sensor 0 is the left camera.
 - **Group ids count modulo 256** (the header field is 32 bits): the device layer extends them so frame
   indices keep increasing (a 20 s stream: 300 of 300 groups, no gaps across the wrap).
-- Image-endpoint stalls are cleared and the stream resumed (the firmware restarts its endpoints on the next
-  00/07, which the heartbeat sends). Not yet provoked on hardware.
+- Image-endpoint stalls are cleared and the stream resumed. Clearing the halt arms the firmware's full
+  restart on the next 00/07 (when FPGA state bit 17 is set): the scanner leaves the bus and comes back with
+  its FPGA and sensors reset, and the device layer reopens it, checks the serial and replays its settings.
+  Not yet provoked on hardware; the emulator models it.
 - Exposure and gain write + read back on all three sensors; state polling; 10/62 accepted for DISTANCE 0/1/2
   (which selects FPGA laser modes 4/1/2, docs/firmware.md 5, not only indicator LEDs).
 - Scan streaming: 14.77 Hz (68 ms trigger), every group complete, no frame-id gaps, resyncs or bad packets.
@@ -56,7 +58,10 @@
 - 10/62 DISTANCE 0/1/2 turns the top LED red / green / blue (idle and scanning). Button codes (`einstar-cli
   hw-ui`): 1 single, 2 double, 3 long on start/pause, each cleared once read; the brightness buttons report
   a double click as two singles and a long press as 3 then, 1-2 s later, 2.
-- Still open: marker detection on real IR, RGB colour content.
+- Still open: marker detection on real IR, RGB colour content; the longest image packet (the firmware's DMA
+  buffer allows 41 000 bytes, `hw-test` now prints it); reconnection on hardware (unplug/replug, host sleep).
+  The scanner is USB 2.0 only (its cable and connector carry no SuperSpeed lines), so the firmware's
+  SuperSpeed paths never run.
 
 The scanner's calibration is in `tests/fixtures/calibration/einstar_e10` (`einstar-cli calib-dump`), so the
 tests run on it everywhere. Tests that need real recordings or calibration captures use

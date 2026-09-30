@@ -130,10 +130,11 @@ difference is one you meant). Helpers: `tools/summary.py` and `tools/globals.py`
   still reboots on an endpoint reset (SS reset event), after an update, or after 10 s powered
   but unconfigured.
 * **Control requests**: class requests to the *device* with wIndex 2 use HID request numbers.
-  SET_REPORT with byte 1 = 0xAA erases the EEPROM "CY" signature; **0xBB only logs "Reset!"**
-  (docs/firmware.md says it resets). SET_REPORT copies 64 bytes into an 8-byte buffer, overwriting
-  the GET_REPORT data and the start of `ch_bulk_in`.
-* Endpoints are configured for **high speed (512-byte packets, burst 1) even on SuperSpeed**.
+  SET_REPORT with byte 1 = 0xAA erases the EEPROM "CY" signature; **0xBB only logs "Reset!"**.
+  The vendor's SET_REPORT copies 64 bytes into an 8-byte buffer, overwriting the GET_REPORT data
+  and the start of `ch_bulk_in` (fixed here, see above).
+* Endpoints are configured for **high speed (512-byte packets, burst 1) even on SuperSpeed**; the
+  scanner's hardware is USB 2.0 only, so the SuperSpeed descriptors and paths never run.
 * EP 0x01/0x81 (commands) are **interrupt** endpoints; EP 0x02/0x82 and 0x83 are bulk.
 * `usb_init()` does not connect; `com_thread()` connects after the cameras are configured.
 * **Gain**: percent -> 1/32 steps (nearest, exact halves down) in 0x3e08/0x3e09; a failed low-byte write is
@@ -164,7 +165,12 @@ difference is one you meant). Helpers: `tools/summary.py` and `tools/globals.py`
   answer a host-to-device request; SET_REPORT reads the data stage twice.
 * `usb.c`'s old comment named GPIOs 52/53 for `gpioSimpleEn[1]`: it is 36, 37, 51, 52.
 * Commands 10/3F and 10/5D read payload bytes beyond their declared length.
-* 00/07 arms `app_restart()` only after a CLEAR_FEATURE on EP 0x83 and with FPGA state bit 17.
+* 00/07 runs `app_restart()` only after a CLEAR_FEATURE on EP 0x83 and with FPGA state bit 17. It is
+  a full restart: `usb_init()` disconnects from USB, then the FPGA and the sensor tables are reloaded
+  and the device reconnects (re-enumerates).
+* A USB suspend clears `usb_configured`, and only SET_CONFIGURATION sets it again: ~10 s after a
+  suspend the watchdog disconnects and resets the device, even if the bus resumed.
+* Bulk replies are 1024 bytes (0x1400 for 10/57) whatever the request, ending on a full packet.
 * I2C select: a 4-bit code on GPIO 23/25/26/27 (cameras 1/2/4 one-hot, FPGA 5, light 7, ADT7420 8).
 * FPGA configuration: PROGRAM pulse on GPIO 37, then 384 x 4 KB read from the active slot with
   GPIO 51 low (the FPGA snoops the SPI data).
