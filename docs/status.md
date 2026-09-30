@@ -21,8 +21,17 @@
 
 ### Verified on the scanner (`einstar-cli hw-test`, 2026-09-29, firmware SC130_FX3_V2.10_FPGA_V3.7, USB 2.0)
 - Identification, sensor ranges (1280x1024, 8-bit, exposure 1..10000, gain 1..800) and the flash calibration
-  (2026-09-27 13:57, baseline 159.913 mm, 22.147 deg) as documented. Flash reads are consistent; the first
-  page read after connecting sometimes gets no reply and succeeds on the retry.
+  (2026-09-27 13:57, baseline 159.913 mm, 22.147 deg) as documented. Flash reads are consistent. A session's
+  first request could repeat the last number of the previous session, which the firmware drops
+  (docs/firmware.md 5): sessions now start at a random sequence number, and device status errors are
+  reported with their meaning and not retried.
+- **Sensor 1 is mounted upside down**: its frames arrive rotated 180 degrees relative to the calibration
+  (only that orientation gives stereo depth; rectified rows then agree to ~1 px on the markers). The device
+  layer turns it upright; the emulator sends it rotated. Sensor 0 is the left camera.
+- **Group ids count modulo 256** (the header field is 32 bits): the device layer extends them so frame
+  indices keep increasing (a 20 s stream: 300 of 300 groups, no gaps across the wrap).
+- Image-endpoint stalls are cleared and the stream resumed (the firmware restarts its endpoints on the next
+  00/07, which the heartbeat sends). Not yet provoked on hardware.
 - Exposure and gain write + read back on all three sensors; state polling; 10/62 accepted for DISTANCE 0/1/2
   (which selects FPGA laser modes 4/1/2, docs/firmware.md 5, not only indicator LEDs).
 - Scan streaming: 14.77 Hz (68 ms trigger), every group complete, no frame-id gaps, resyncs or bad packets.
@@ -33,8 +42,13 @@
 - Register 10/5D ("colour mode") read 8 on all three sensors (the firmware leaves that reply byte
   unwritten; no longer queried). Temperature (10/50) reads 0 idle and streaming. Device-state reply byte
   21 is a run state: 01/02 idle, 08 scan streaming, 40 texture streaming.
-- Still open (needs the scanner aimed at a scene): depth and markers on real IR, exposure units, 10/68 per
-  laser mode (10/62 DISTANCE), RGB content, button codes 2/3.
+- With the scanner's light on (a bucket lid with marker stickers at ~45 cm, no ambient IR): brightness
+  above black is linear in exposure (6.3 / 12.7 / 25.2 at 1100 / 2200 / 4400; 42 at 8800) and in gain as a
+  percentage (x1.9 at 240, x3.4 at 480 vs 120). 10/68 alone adds a fine speckle texture; 10/62 DISTANCE
+  (laser mode) made no visible difference. Depth: 11-14% of pixels valid (347-535 mm), limited by the lid's
+  smooth plastic and a specular highlight, not by exposure. Marker detection finds 4-5 of ~12 stickers per
+  image and none match in stereo yet: the detection thresholds need tuning on real IR (issue 4 below).
+- Still open: marker detection on real IR, RGB colour content, button codes 2/3.
 
 The scanner's calibration is in `tests/fixtures/calibration/einstar_e10` (`einstar-cli calib-dump`), so the
 tests run on it everywhere. Tests that need real recordings or calibration captures use

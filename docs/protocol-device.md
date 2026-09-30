@@ -709,16 +709,17 @@ and 14:24:56. Each is followed by the replay (section 2) and ClearState
 
 ## 7. Open questions
 
-1. **Units** of trigger period and exposure (assumed µs) and the gain scale
-   (register value; SC130GS analog/digital gain encoding unknown). Needs
-   hardware or FPGA documentation.
+1. **Units** of trigger period and exposure (assumed µs). Measured: image
+   brightness under the scanner's own light is linear in exposure up to
+   ~4400, and gain is a percentage (docs/firmware.md 5; status.md).
 2. **Button codes 2/3** (DoubleClick/LongClick) are inferred from enum
    order only. The log only shows code 1. It is also unknown whether the
    firmware clears the latch on read or only on ClearState (10/7B).
 3. **Packet byte 2 bits 2..0** (sub-field B, written to image byte 0): is it
    the pattern/trigger index within a MONOTRIGCOUNT burst?
-4. **Which physical sensor is index 0 or 1** (left or right IR)? The
-   stereo calibration in the flash blob must be matched.
+4. **Which physical sensor is index 0 or 1**: sensor 0 is the left IR camera.
+   Sensor 1 is mounted upside down; its frames must be rotated 180° to match
+   the calibration (status.md "Verified on the scanner").
 5. **Bayer phase.** Code 48 implies BGGR at (0,0) under OpenCV naming. Check
    the SC130GS CFA readout and any FPGA flip.
 6. **Strobe route 0 / route 1 and "LD"** hardware mapping (IR flood versus
