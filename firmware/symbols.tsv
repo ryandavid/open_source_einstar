@@ -1,0 +1,65 @@
+# address	name  (application functions)
+0x4000302c	i2c_lock	I2C bus semaphore (all I2C helpers)
+0x40003048	i2c_unlock
+0x40003060	flash_lock	SPI flash semaphore (update/user-page paths)
+0x4000307c	flash_unlock
+0x40003094	emc_wdg_timer_cb	1 s timer: bumps the watchdog progress counter unless paused
+0x400030e4	update_timer_cb	2 s timer during firmware update
+0x4000310c	build_version_string	"EinScan10_01_SC130_FX3_V2.10_FPGA_V3.7_EN"
+0x40003378	eeprom_invalidate_cy
+0x400033e0	debug_console_init	UART debug console (SDK example)
+0x40003510	gpif_start	load GPIF II config + start state machine
+0x400035c0	app_start	endpoints + DMA channels for the negotiated USB speed
+0x40003c24	app_stop	"STOP!!!!": destroy channels, disable endpoints
+0x40003ddc	usb_lpm_request_cb	always accepts LPM
+0x40003e04	stream_reset	reset the image DMA channel / EP 0x83 and restart GPIF
+0x40003e44	app_restart	full stop/start: USB, sensors, FPGA
+0x40003e88	usb_event_cb
+0x40004180	usb_ep_event_cb
+0x40004210	usb_setup_cb	class/vendor control requests (incl. EEPROM invalidation)
+0x40004bec	usb_init	PIB, USB callbacks, descriptors, CyU3PUsbStart
+0x40004f18	i2c_init
+0x40004fa4	io_matrix_init
+0x4000502c	io_reconfigure	GPIO de-init, IO matrix, GPIO + SPI re-init
+0x400050cc	fpga_boot_thread	"20:FPGA Boot Thread"
+0x400051c8	com_thread	"21:comThread": bulk channel, camera config, streaming
+0x40005424	emc_wdg_thread	"21:EMC_WDG_Thread": reboots on stalled USB
+0x400055e8	control_thread	"21:ControlThread": command channel
+0x400057b0	CyFxApplicationDefine
+0x400059ec	main
+0x40005aec	adt7420_read	temperature sensor, 2 bytes
+0x40005bac	fpga_reg_write	4-byte FPGA register write over I2C
+0x40005c50	fpga_reg_read
+0x40005d34	sensor_reg_write	image-sensor register write
+0x40005df8	sc130_reg_write	SC130 register write (logged)
+0x40005ecc	light_reg_write	light/laser driver register
+0x40005fa0	light_reg_write_raw	tentative
+0x4000606c	light_init
+0x400060a8	sc132_set_gain_linear_mode
+0x40006154	sensor_set_gain	regs 0x3e08/0x3e09 (float conversion)
+0x40006450	sensor_get_gain
+0x400066b0	sensor_write_table
+0x400067c0	sensors_init	register tables for CAM1/2/4
+0x4000684c	fpga_set_mode	tentative: FPGA reg 10
+0x400079f0	flash_select	SPI chip select
+0x40007a4c	spi_init
+0x40007b3c	flash_wait_ready	write-enable / status polling
+0x40007c90	flash_erase_sector
+0x40007db8	flash_erase_block	0xD8 64 KB block erase
+0x40007ec8	flash_erase_range
+0x40007f64	flash_rw_pages	256-byte page read/write loop
+0x40008218	fpga_load	stream the bitstream from flash
+0x400083c4	flash_write_status_reg
+0x40008478	flash_read_status_regs
+0x40008588	gpio_interrupt_cb
+0x400085e0	gpio_init
+0x40008820	i2c_select_target	camera/FPGA select GPIOs around I2C transfers (and LED patterns)
+0x40008b78	heartbeat_toggle	GPIO 38
+0x40008bb4	reply_status	reply header: status + length
+0x40008d70	command_dispatch
+0x4000b22c	update_begin
+0x4000b320	update_write_page
+0x4000bb00	user_page_read
+0x4000bc28	user_page_write
+0x4000be60	bulk_dispatch
+0x4000c290	fpga_load_addr_get	"GetFpgaLoadAddr" (boot record)

@@ -1,0 +1,33 @@
+# address	name  (application data; used by build.py to label the generated data)
+0x40030640	app_state	flags block (fields still unnamed)
+0x40030650	app_active	set by app_start, cleared by app_stop
+0x40030654	emc_wdg_timer
+0x400340a8	update_timer
+0x40030684	i2c_sem
+0x400306a4	flash_sem
+0x4003537c	ch_ctrl_in	DMA channel, EP 0x81 (command replies)
+0x40035224	ch_ctrl_out	DMA channel, EP 0x01 (commands)
+0x40033f50	ch_bulk_in	DMA channel, EP 0x82
+0x40033ffc	ch_bulk_out	DMA channel, EP 0x02
+0x400352d0	ch_image	DMA channel, EP 0x83 (GPIF -> USB image stream)
+0x400340d4	fpga_boot_thread_obj
+0x4003417c	com_thread_obj
+0x40033e98	control_thread_obj
+0x40035428	emc_wdg_thread_obj
+0x40030680	emc_wdg_progress	counter bumped by emc_wdg_timer_cb
+0x40031780	ep83_halt_cleared	set by CLEAR_FEATURE(EP 0x83); checked by command 7
+0x40030320	cmd_last_seq	sequence number of the last command (repeat detection)
+0x40030324	bulk_handlers	bulk channel command table
+0x40031788	page_buf	4 KB page buffer
+0x40031778	heartbeat_level
+0x40030681	usb_ep_halted	EP event 0x100 (halt) seen: the EMC watchdog thread reboots
+0x40030682	emc_wdg_limit	never written (0): reboot as soon as emc_wdg_progress > 0
+0x400306c4	hid_idle_rate_2	HID SET_IDLE/GET_IDLE, report ID 2
+0x400306c5	hid_idle_rate_7	HID SET_IDLE/GET_IDLE, report ID 7
+0x400306c8	usb_unconfigured_secs	seconds powered but not configured; reconnect at 10
+0x40031784	cmd7_seen	set by command 7, read nowhere
+0x40032890	update_page_index	pages written in the current update
+0x40032894	update_bytes_received
+0x4003278c	boot_record	flash page 1008 (0x3F000): new/old slot, boot-new flag
+0x40033f40	hid_set_report_buf	HID SET_REPORT data (8 bytes, but 64 are copied in)
+0x40033f48	hid_get_report_data	HID GET_REPORT reply (length-prefixed)

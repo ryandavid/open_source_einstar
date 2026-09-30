@@ -24,3 +24,16 @@ imgui.ini
 .vscode/
 .idea/
 *.swp
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# firmware/: track the reconstructed sources + build scaffolding, but NOT third-party proprietary
+# inputs. The Cypress FX3 SDK, the vendor FPGA bitstream, and the byte-identical vendor ELF are
+# user-supplied and must never be committed (licensing / vendor copyright).
+firmware/sdk/
+firmware/fpga/
+firmware/reference/
+firmware/build*/
