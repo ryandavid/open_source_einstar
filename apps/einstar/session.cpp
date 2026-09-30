@@ -192,7 +192,7 @@ void Session::stop_scan() {
 }
 
 void Session::set_distance_indication(float mean_depth_mm) {
-    // Three LED zones: near / good / far around the 250-450 mm sweet spot (mapping unverified on hardware).
+    // The top LED: red when too near, green in the 250-450 mm sweet spot, blue when too far.
     const int zone = mean_depth_mm <= 0 ? last_zone_ : mean_depth_mm < 250 ? 0 : mean_depth_mm > 450 ? 2 : 1;
     if (zone < 0 || zone == last_zone_) return;
     last_zone_ = zone;

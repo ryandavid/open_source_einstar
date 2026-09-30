@@ -712,9 +712,9 @@ and 14:24:56. Each is followed by the replay (section 2) and ClearState
 1. **Units** of trigger period and exposure (assumed µs). Measured: image
    brightness under the scanner's own light is linear in exposure up to
    ~4400, and gain is a percentage (docs/firmware.md 5; status.md).
-2. **Button codes 2/3** (DoubleClick/LongClick) are inferred from enum
-   order only. The log only shows code 1. It is also unknown whether the
-   firmware clears the latch on read or only on ClearState (10/7B).
+2. **Button codes**, measured: 1 single, 2 double, 3 long on BUTTON1; each is
+   cleared once read. BUTTON0 / BUTTON2 report a double click as two singles
+   and a long press as 3 followed 1-2 s later by 2.
 3. **Packet byte 2 bits 2..0** (sub-field B, written to image byte 0): is it
    the pattern/trigger index within a MONOTRIGCOUNT burst?
 4. **Which physical sensor is index 0 or 1**: sensor 0 is the left IR camera.
@@ -724,8 +724,9 @@ and 14:24:56. Each is followed by the replay (section 2) and ClearState
    the SC130GS CFA readout and any FPGA flip.
 6. **Strobe route 0 / route 1 and "LD"** hardware mapping (IR flood versus
    white LED versus laser projector) is inferred from usage.
-7. **Distance indication semantics** (0/1/2 = near/ok/far?) and the
-   DEVICESTATE meanings beyond 1.
+7. **Distance indication**, measured: DISTANCE 0/1/2 turns the top LED red /
+   green / blue, idle and while scanning. DEVICESTATE is ignored
+   (docs/firmware.md 5).
 8. **Full flash blob layout** (6568 bytes). Only the colour-correction
    offsets are known from this plugin. See libSn3DCalibDevFile /
    libSn3DCalibrationJR.

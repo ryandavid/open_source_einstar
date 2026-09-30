@@ -205,6 +205,7 @@ Result<DeviceState> EinstarDevice::read_state() {
     auto r = send<op::kDeviceState>();
     if (!r) return std::unexpected(r.error());
     DeviceState s;
+    for (std::size_t i = 0; i < s.raw.size(); ++i) s.raw[i] = 9 + i < r->raw.size() ? r->raw[9 + i] : 0;
     for (int i = 0; i < 3; ++i) {
         const std::size_t off = 9 + static_cast<std::size_t>(i);
         const std::uint8_t v = off < r->raw.size() ? r->raw[off] : 0;

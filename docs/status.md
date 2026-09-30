@@ -48,7 +48,10 @@
   (laser mode) made no visible difference. Depth: 11-14% of pixels valid (347-535 mm), limited by the lid's
   smooth plastic and a specular highlight, not by exposure. Marker detection finds 4-5 of ~12 stickers per
   image and none match in stereo yet: the detection thresholds need tuning on real IR (issue 4 below).
-- Still open: marker detection on real IR, RGB colour content, button codes 2/3.
+- 10/62 DISTANCE 0/1/2 turns the top LED red / green / blue (idle and scanning). Button codes (`einstar-cli
+  hw-ui`): 1 single, 2 double, 3 long on start/pause, each cleared once read; the brightness buttons report
+  a double click as two singles and a long press as 3 then, 1-2 s later, 2.
+- Still open: marker detection on real IR, RGB colour content.
 
 The scanner's calibration is in `tests/fixtures/calibration/einstar_e10` (`einstar-cli calib-dump`), so the
 tests run on it everywhere. Tests that need real recordings or calibration captures use
@@ -107,7 +110,7 @@ scan started; the degeneracy/relocalisation thresholds were recalibrated for it.
 10. **Stereo outliers**: measured on synthetic speckle (`debug_depth_errors`), they are not concentrated at silhouettes (5% of the >2 mm errors are). About 7% of pixels have ≥1 px disparity errors spread over textured areas, which may be specific to our synthetic speckle. Fusion averages them out (0.16 mm mesh error). Retune only once real IR captures exist.
 11. **IR-intensity / colour ICP term**: not implemented. The IR images are lit by the laser speckle, which moves with the scanner, so their intensity is not surface texture. A photometric term needs the RGB texture camera (or strobe-only IR frames), and there are no such recordings to validate it on.
 7. Stereo outlier blobs at silhouettes need an extra consistency filter.
-8. Hardware-only unknowns: exact LED distance-zone semantics, button codes 2/3, exposure units, what the "LD" register drives (see "Verified on the scanner").
+8. Hardware-only unknowns: what the "LD" register drives exactly, and the laser modes beyond the LED colour (see "Verified on the scanner").
 12. **Firmware**: the update package, flash layout, boot chain, runtime and FPGA loading are
     described in docs/firmware.md, with an assessment of an open replacement (FX3 side feasible,
     FPGA side needs hardware access; the FPGA vendor is unidentified).

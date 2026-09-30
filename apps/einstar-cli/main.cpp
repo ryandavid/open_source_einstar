@@ -4,6 +4,8 @@
 //   calib <dir-with-CCF-files>        decode LeftCCF/RightCCF/TexCCF and print the rig
 //   calib-dump <dir>                  read the attached scanner's calibration and write it as CCF files
 //                                     (byte-for-byte EXStar's cache files)
+//   hw-ui [--countdown S] [--led-seconds S] [--button-seconds S]
+//                                     indicator LEDs and buttons on a fixed timeline for someone at the scanner
 //   fixture-pack --out DIR [--mustang <Project1.ir_E10_prj>] [--stl mesh.stl] [--board <dir>]
 //                                     pack the excerpts of real EXStar data the tests read
 //                                     (tests/fixtures/external/README.md)
@@ -21,6 +23,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <thread>
 #include <chrono>
@@ -62,6 +65,7 @@ int usage() {
     std::println(stderr,
                  "usage: einstar-cli probe [--verbose] | sim-probe | calib <dir> | calib-dump <dir> |\n"
                  "       hw-test [--out DIR] [--seconds S] [--texture-seconds S] [--buttons S] |\n"
+                 "       hw-ui [--countdown S] [--led-seconds S] [--button-seconds S] |\n"
                  "       fixture-pack --out DIR [--mustang <Project1.ir_E10_prj>] [--stl mesh.stl] [--board <dir>] |\n"
                  "       track-fixture <project.ir_E10_prj> [--start N] [--count N] [--skip K] [--stl ref.stl] [--cpu] [--mode geometry|hybrid|markers] [--global-markers] [--marker-confirm N] [--record out.estr] [--quiet] |\n"
                  "       process <session.estr> [-o mesh.stl|ply|obj] [--voxel MM] [--no-optimize] [--smooth N] [--stl reference.stl] [--reference-poses file] |\n"
@@ -613,6 +617,77 @@ int hw_test(std::span<char*> args) {
     dev->disconnect();  // triggers, laser and strobe off
     std::println("== {} ({} failures); images and calibration in {} ==", failures ? "FAILED" : "all passed", failures, out.string());
     return failures ? 1 : 0;
+}
+
+// Indicator LEDs and buttons, with someone at the scanner following a fixed timeline: a countdown, the
+// three DISTANCE values idle and then while scanning, then a window for button presses. Every change of
+// the device-state reply (00/07) is printed with its time.
+int hw_ui(std::span<char*> args) {
+    const double countdown = arg_double(args, "--countdown", 10.0);
+    const double led_seconds = arg_double(args, "--led-seconds", 5.0);
+    const double button_seconds = arg_double(args, "--button-seconds", 40.0);
+    auto dev = open_scanner(0);  // no heartbeat: this polls the state itself
+    if (!dev) return 1;
+    Stopwatch clock;
+    auto now = [&] { return clock.elapsed_ms() / 1000.0; };
+    auto wait_until = [&](double t) {
+        while (now() < t) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    };
+    auto hex = [](const std::array<std::uint8_t, 14>& b) {
+        std::string s;
+        for (const auto v : b) s += std::format("{:02X} ", v);
+        return s;
+    };
+    std::println("{:6.1f} s  countdown {:.0f} s", now(), countdown);
+    wait_until(countdown);
+    double t = countdown;
+    std::println("{:6.1f} s  == indicator, idle ==", now());
+    for (int zone = 0; zone < 3; ++zone) {
+        const bool ok = dev->set_indication(static_cast<device::DistanceIndication>(zone)).has_value();
+        std::println("{:6.1f} s  DISTANCE {} {}", now(), zone, ok ? "" : "(failed)");
+        wait_until(t += led_seconds);
+    }
+    std::println("{:6.1f} s  == indicator, scanning (projector and strobe on) ==", now());
+    (void)dev->set_exposure(0, 4400);
+    for (int sensor = 0; sensor < 2; ++sensor) (void)dev->set_gain(sensor, 120);
+    (void)dev->set_laser_percent(100);
+    (void)dev->set_strobe(0, 6000);
+    (void)dev->configure_scan_mode(68000);
+    std::atomic<int> groups{0};
+    (void)dev->start_stream([&](usb::FrameGroup&&) { ++groups; });
+    for (int zone = 0; zone < 3; ++zone) {
+        const bool ok = dev->set_indication(static_cast<device::DistanceIndication>(zone)).has_value();
+        std::println("{:6.1f} s  DISTANCE {} {}", now(), zone, ok ? "" : "(failed)");
+        wait_until(t += led_seconds);
+    }
+    (void)dev->set_trigger(0, 0);
+    (void)dev->set_laser_percent(0);
+    (void)dev->set_strobe(0, 0);
+    dev->stop_stream();
+    (void)dev->set_indication(device::DistanceIndication::zone2);  // the firmware's start-up laser mode
+    std::println("{:6.1f} s  scanning stopped ({} frames)", now(), groups.load());
+
+    std::println("{:6.1f} s  == buttons: state bytes 9..22 on every change (polled every 50 ms) ==", now());
+    std::optional<std::array<std::uint8_t, 14>> last;
+    int polls = 0, changes = 0;
+    const double end = t + button_seconds;
+    while (now() < end) {
+        if (auto st = dev->read_state()) {
+            ++polls;
+            if (!last || st->raw != *last) {
+                ++changes;
+                std::print("{:6.1f} s  {}", now(), hex(st->raw));
+                for (int b = 0; b < 3; ++b)
+                    if (st->buttons[static_cast<std::size_t>(b)] != device::ButtonAction::none)
+                        std::print(" button {} code {}", b, static_cast<int>(st->buttons[static_cast<std::size_t>(b)]));
+                std::println("");
+                last = st->raw;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    std::println("{:6.1f} s  done: {} state reads, {} changes", now(), polls, changes);
+    return 0;
 }
 
 int fixture_pack(std::span<char*> args) {
@@ -1243,6 +1318,7 @@ int main(int argc, char** argv) {
     if (cmd == "calib-dump" && argc >= 3) return calib_dump_cmd(argv[2]);
     if (cmd == "hw-test") return hw_test(rest);
     if (cmd == "fixture-pack") return fixture_pack(rest);
+    if (cmd == "hw-ui") return hw_ui(rest);
     if (cmd == "track-fixture" && argc >= 3) return track_fixture(argv[2], rest);
     if (cmd == "inspect" && argc >= 3) return inspect_cmd(argv[2]);
     if (cmd == "process" && argc >= 3) return process_cmd(argv[2], std::span<char*>(argv + 3, static_cast<std::size_t>(argc - 3)));

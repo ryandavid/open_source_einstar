@@ -49,11 +49,14 @@ struct DeviceInfo {
     std::array<SensorInfo, 3> sensors{};
 };
 
+// Codes in the device-state reply, cleared once read (measured on the scanner). BUTTON1 (start / pause)
+// reports all three. BUTTON0 / BUTTON2 (brightness - / +) report a double click as two singles, and a
+// long press as 3 followed 1-2 s later by 2, so 2 is only a double click on BUTTON1.
 enum class ButtonAction : std::uint8_t { none = 0, single_click = 1, double_click = 2, long_click = 3 };
 
 // What the scanner's buttons do, as in EXStar (its device log: every BUTTON1 click switches the light
 // sources off / on for pause / start, BUTTON0 and BUTTON2 clicks step the camera brightness down / up).
-// Double and long clicks were never observed and do nothing.
+// Double and long clicks do nothing.
 enum class ButtonCommand : std::uint8_t { none, toggle_scan, brightness_down, brightness_up };
 [[nodiscard]] ButtonCommand button_command(int button, ButtonAction action);
 
@@ -70,9 +73,11 @@ struct ExposureGain {
 
 struct DeviceState {
     std::array<ButtonAction, 3> buttons{};
+    std::array<std::uint8_t, 14> raw{};  // reply bytes 9..22, all the firmware writes (docs/firmware.md 5.1)
 };
 
-// 10/62 DISTANCE. The firmware maps 0/1/2 to FPGA LED/laser modes 4/1/2 (docs/firmware.md 5).
+// 10/62 DISTANCE. The firmware maps 0/1/2 to FPGA LED/laser modes 4/1/2 (docs/firmware.md 5): the top LED
+// shows red / green / blue (measured on the scanner, idle and scanning).
 enum class DistanceIndication : std::uint8_t { zone0 = 0, zone1 = 1, zone2 = 2 };
 
 struct ConnectOptions {
