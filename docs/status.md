@@ -46,8 +46,13 @@
   above black is linear in exposure (6.3 / 12.7 / 25.2 at 1100 / 2200 / 4400; 42 at 8800) and in gain as a
   percentage (x1.9 at 240, x3.4 at 480 vs 120). 10/68 alone adds a fine speckle texture; 10/62 DISTANCE
   (laser mode) made no visible difference. Depth: 11-14% of pixels valid (347-535 mm), limited by the lid's
-  smooth plastic and a specular highlight, not by exposure. Marker detection finds 4-5 of ~12 stickers per
-  image and none match in stereo yet: the detection thresholds need tuning on real IR (issue 4 below).
+  smooth plastic and a specular highlight, not by exposure. Marker detection: 10 of 10 stickers (was 4-5)
+  after giving saturated blobs a looser dark-ring test and raising the minimum size to 6 px (on the
+  scanner's IR the sticker surround is barely darker than the surface; real speckle and glints are
+  under 7 px). Stereo matching still fails: rectified rows of matching markers disagree by up to ~7 px,
+  position-dependent, while EXStar's captures of the same board agree to 0.05 px with the same
+  calibration, so our raw frames differ geometrically from EXStar's. Raw captures for working on it
+  offline: `einstar-cli hw-capture` (local, fixtures-data/).
 - 10/62 DISTANCE 0/1/2 turns the top LED red / green / blue (idle and scanning). Button codes (`einstar-cli
   hw-ui`): 1 single, 2 double, 3 long on start/pause, each cleared once read; the brightness buttons report
   a double click as two singles and a long press as 3 then, 1-2 s later, 2.

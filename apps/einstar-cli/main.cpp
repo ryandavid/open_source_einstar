@@ -6,6 +6,14 @@
 //                                     (byte-for-byte EXStar's cache files)
 //   hw-ui [--countdown S] [--led-seconds S] [--button-seconds S]
 //                                     indicator LEDs and buttons on a fixed timeline for someone at the scanner
+//   hw-lights [--out DIR] [--countdown S] [--step-seconds S]
+//                                     each light source on its own while streaming (timed, for someone watching)
+//   markers-debug <ir.pgm> [--threshold T] [--ring-scale S] [--ring-contrast C] [--ring-bright F]
+//                                     marker detection on a saved IR frame, with why each blob was rejected
+//   stereo-debug <left.pgm> <right.pgm> <calibration dir>
+//                                     depth and marker row offsets on a saved raw pair (as is and turned 180)
+//   hw-capture [--out DIR] [--label NAME] [--groups N]
+//                                     raw captures of the current pose under standard lighting conditions
 //   fixture-pack --out DIR [--mustang <Project1.ir_E10_prj>] [--stl mesh.stl] [--board <dir>]
 //                                     pack the excerpts of real EXStar data the tests read
 //                                     (tests/fixtures/external/README.md)
@@ -66,6 +74,10 @@ int usage() {
                  "usage: einstar-cli probe [--verbose] | sim-probe | calib <dir> | calib-dump <dir> |\n"
                  "       hw-test [--out DIR] [--seconds S] [--texture-seconds S] [--buttons S] |\n"
                  "       hw-ui [--countdown S] [--led-seconds S] [--button-seconds S] |\n"
+                 "       hw-lights [--out DIR] [--countdown S] [--step-seconds S] |\n"
+                 "       markers-debug <ir.pgm> [--threshold T] [--ring-scale S] [--ring-contrast C] [--ring-bright F] |\n"
+                 "       stereo-debug <left.pgm> <right.pgm> <calibration dir> |\n"
+                 "       hw-capture [--out DIR] [--label NAME] [--groups N] |\n"
                  "       fixture-pack --out DIR [--mustang <Project1.ir_E10_prj>] [--stl mesh.stl] [--board <dir>] |\n"
                  "       track-fixture <project.ir_E10_prj> [--start N] [--count N] [--skip K] [--stl ref.stl] [--cpu] [--mode geometry|hybrid|markers] [--global-markers] [--marker-confirm N] [--record out.estr] [--quiet] |\n"
                  "       process <session.estr> [-o mesh.stl|ply|obj] [--voxel MM] [--no-optimize] [--smooth N] [--stl reference.stl] [--reference-poses file] |\n"
@@ -687,6 +699,281 @@ int hw_ui(std::span<char*> args) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     std::println("{:6.1f} s  done: {} state reads, {} changes", now(), polls, changes);
+    return 0;
+}
+
+// Each light source on its own while streaming, on a fixed timeline for someone watching the scanner:
+// IR and RGB levels, marker brightness (the brightest 0.1% of IR pixels) and images per step.
+int hw_lights(std::span<char*> args) {
+    namespace fs = std::filesystem;
+    const fs::path out = arg_str(args, "--out") ? arg_str(args, "--out") : "hw_lights";
+    const double countdown = arg_double(args, "--countdown", 10.0);
+    const double step_seconds = arg_double(args, "--step-seconds", 5.0);
+    fs::create_directories(out);
+    auto dev = open_scanner(250);
+    if (!dev) return 1;
+    struct Step { const char* name; bool texture; int laser; int strobe0; int strobe1; };
+    const Step steps[] = {
+        {"all off", true, 0, 0, 0},           {"strobe route 0 = 6000", true, 0, 6000, 0}, {"strobe route 0 = 9000", true, 0, 9000, 0},
+        {"strobe route 1 = 6000", true, 0, 0, 6000}, {"strobe route 1 = 9000", true, 0, 0, 9000}, {"LD 100 (projector)", true, 100, 0, 0},
+        {"scan mode: LD 100 + route 0 6000", false, 100, 6000, 0}, {"scan mode: route 1 9000 only", false, 0, 0, 9000},
+    };
+    Stopwatch clock;
+    auto now = [&] { return clock.elapsed_ms() / 1000.0; };
+    std::println("{:6.1f} s  countdown {:.0f} s", now(), countdown);
+    while (now() < countdown) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    (void)dev->set_exposure(0, 4400);
+    for (int sensor = 0; sensor < 2; ++sensor) (void)dev->set_gain(sensor, 120);
+    std::println("{:36} {:>8} {:>8} {:>9} {:>8}", "step (from)", "IR mean", "IR p99.9", "IR >200", "RGB mean");
+    int index = 0;
+    for (const auto& st : steps) {
+        const double start = now();
+        std::mutex m;
+        std::optional<usb::FrameGroup> last;
+        int groups = 0;
+        (void)dev->set_laser_percent(st.laser);
+        (void)dev->set_strobe(0, st.strobe0);
+        (void)dev->set_strobe(1, st.strobe1);
+        (void)(st.texture ? dev->configure_texture_mode(100000) : dev->configure_scan_mode(68000));
+        (void)dev->start_stream([&](usb::FrameGroup&& g) {
+            std::lock_guard lock(m);
+            ++groups;
+            last = std::move(g);
+        });
+        while (now() < start + step_seconds) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        (void)dev->set_trigger(0, 0);
+        (void)dev->set_laser_percent(0);
+        (void)dev->set_strobe(0, 0);
+        (void)dev->set_strobe(1, 0);
+        dev->stop_stream();
+        std::lock_guard lock(m);
+        double ir_mean = -1, rgb_mean = -1;
+        int p999 = -1;
+        long bright = -1;
+        if (last && last->sensors[0]) {
+            const auto& ir = last->sensors[0]->pixels;
+            std::array<long, 256> hist{};
+            for (const auto v : ir.pixels()) ++hist[v];
+            ir_mean = image_stats(ir).mean;
+            long acc = 0;
+            for (int v = 0; v < 256 && p999 < 0; ++v)
+                if ((acc += hist[static_cast<std::size_t>(v)]) >= static_cast<long>(0.999 * static_cast<double>(ir.size()))) p999 = v;
+            bright = 0;
+            for (int v = 201; v < 256; ++v) bright += hist[static_cast<std::size_t>(v)];
+            write_pgm(out / std::format("step{}_ir0.pgm", index), ir);
+        }
+        if (last && last->sensors[2]) {
+            rgb_mean = image_stats(last->sensors[2]->pixels).mean;
+            write_pgm(out / std::format("step{}_rgb.pgm", index), last->sensors[2]->pixels);
+        }
+        std::println("{:28} {:5.1f}s {:8.1f} {:8} {:9} {:8.1f}  ({} groups)", st.name, start, ir_mean, p999, bright, rgb_mean, groups);
+        ++index;
+    }
+    std::println("{:6.1f} s  done", now());
+    return 0;
+}
+
+std::optional<ImageU8> read_pgm(const std::filesystem::path& path) {
+    std::ifstream f(path, std::ios::binary);
+    std::string magic;
+    int w = 0, h = 0, maxval = 0;
+    f >> magic >> w >> h >> maxval;
+    if (magic != "P5" || w <= 0 || h <= 0 || maxval != 255) return std::nullopt;
+    f.get();
+    ImageU8 img(w, h);
+    f.read(reinterpret_cast<char*>(img.data()), static_cast<std::streamsize>(img.size()));
+    if (!f) return std::nullopt;
+    return img;
+}
+
+// Marker detection on a saved 8-bit IR frame (PGM): candidate blobs and why each was rejected.
+int markers_debug(std::span<char*> args) {
+    if (args.empty()) return usage();
+    auto img = read_pgm(args[0]);
+    if (!img) {
+        std::println(stderr, "cannot read {} (8-bit binary PGM)", args[0]);
+        return 1;
+    }
+    markers::DetectParams p;
+    p.threshold = static_cast<int>(arg_int(args, "--threshold", p.threshold));
+    p.min_diameter_px = arg_double(args, "--min-diameter", p.min_diameter_px);
+    p.ring_scale = arg_double(args, "--ring-scale", p.ring_scale);
+    p.ring_max_contrast = arg_double(args, "--ring-contrast", p.ring_max_contrast);
+    p.max_ring_bright_fraction = arg_double(args, "--ring-bright", p.max_ring_bright_fraction);
+    p.saturated_ring_max_contrast = arg_double(args, "--sat-ring-contrast", p.saturated_ring_max_contrast);
+    p.saturated_max_ring_bright_fraction = arg_double(args, "--sat-ring-bright", p.saturated_max_ring_bright_fraction);
+    const auto blobs = markers::find_blobs_cpu(img->view(), p.threshold);
+    markers::FitStats stats;
+    const auto found = markers::fit_blobs(img->view(), blobs, p, &stats);
+    std::println("{} blobs above {}, {} markers", blobs.size(), p.threshold, found.size());
+    for (std::size_t r = 0; r < stats.count.size(); ++r)
+        if (stats.count[r] > 0) std::println("  {:14} {}", markers::reject_name(static_cast<markers::Reject>(r)), stats.count[r]);
+    for (const auto& e : found)
+        std::println("  marker at ({:.1f}, {:.1f}) a {:.2f} b {:.2f} residual {:.3f} peak {}", e.center.x(), e.center.y(), e.a, e.b,
+                     e.residual, e.peak);
+    // The larger candidates (markers are the biggest bright blobs), one at a time, with their reason.
+    std::vector<markers::Blob> big;
+    for (const auto& b : blobs)
+        if (b.pixels >= 30) big.push_back(b);
+    std::ranges::sort(big, [](const markers::Blob& a, const markers::Blob& b) { return a.pixels > b.pixels; });
+    for (std::size_t i = 0; i < std::min<std::size_t>(big.size(), 20); ++i) {
+        markers::FitStats one;
+        (void)markers::fit_blobs(img->view(), {big[i]}, p, &one);
+        const auto r = static_cast<markers::Reject>(std::ranges::max_element(one.count) - one.count.begin());
+        std::println("  blob ({:4},{:4})-({:4},{:4}) {:5} px peak {:3}: {}", big[i].x0, big[i].y0, big[i].x1, big[i].y1, big[i].pixels,
+                     big[i].peak, markers::reject_name(r));
+    }
+    return 0;
+}
+
+// Stereo on a saved raw IR pair (PGM) with a calibration directory: valid depth and the rectified row
+// offsets of markers matched by nearest row, as delivered and with both images turned 180 degrees.
+int stereo_debug(std::span<char*> args) {
+    if (args.size() < 3) return usage();
+    auto l = read_pgm(args[0]), r = read_pgm(args[1]);
+    auto cal = calib::load_ccf_directory(args[2]);
+    if (!l || !r || !cal) {
+        std::println(stderr, "need <left.pgm> <right.pgm> <calibration dir>");
+        return 1;
+    }
+    pipeline::StereoFrontend fe(cal->rig());
+    auto rotated = [](ImageU8 img) {
+        std::ranges::reverse(img.pixels());
+        return img;
+    };
+    for (const bool rot : {false, true}) {
+        const ImageU8 L = rot ? rotated(*l) : *l, R = rot ? rotated(*r) : *r;
+        auto d = fe.process(L, R);
+        d.frame.ensure_cpu();
+        const double valid = static_cast<double>(std::ranges::count_if(d.frame.points.pixels(), [](const Vec3f& p) { return p.z() > 0; })) /
+                             static_cast<double>(d.frame.points.size());
+        const auto el = markers::detect_markers(L.view()), er = markers::detect_markers(R.view());
+        const auto& ms = fe.marker_stereo();
+        std::vector<double> dy;
+        for (const auto& a : el) {
+            const Vec2 ra = ms.rectify_left(a.center);
+            double best = 1e9;
+            for (const auto& b : er) {
+                const Vec2 rb = ms.rectify_right(b.center);
+                if (rb.x() < ra.x() && std::abs(rb.y() - ra.y()) < std::abs(best)) best = rb.y() - ra.y();  // (right is left of left)
+            }
+            if (std::abs(best) < 20) {
+                dy.push_back(best);
+                if (!rot) std::println("  left marker raw ({:6.1f}, {:6.1f}) rectified ({:6.1f}, {:6.1f}): row offset {:+.2f}", a.center.x(), a.center.y(),
+                                       ra.x(), ra.y(), best);
+            }
+        }
+        if (!rot && has_flag(args, "--fit-shift")) {
+            // Which shift of the raw right image makes the markers' rectified rows agree?
+            std::vector<std::pair<Vec2, Vec2>> pairs;  // (left raw, right raw), matched as above
+            for (const auto& a : el) {
+                const Vec2 ra = ms.rectify_left(a.center);
+                const markers::Ellipse* best = nullptr;
+                double bd = 20;
+                for (const auto& b : er) {
+                    const Vec2 rb = ms.rectify_right(b.center);
+                    if (rb.x() < ra.x() && std::abs(rb.y() - ra.y()) < bd) bd = std::abs(rb.y() - ra.y()), best = &b;
+                }
+                if (best) pairs.emplace_back(a.center, best->center);
+            }
+            double best_rms = 1e9, bx = 0, by = 0;
+            for (double sx = -20; sx <= 20; sx += 0.25)
+                for (double sy = -20; sy <= 20; sy += 0.25) {
+                    double ss = 0;
+                    for (const auto& [a, b] : pairs) {
+                        const double e = ms.rectify_right(b + Vec2(sx, sy)).y() - ms.rectify_left(a).y();
+                        ss += e * e;
+                    }
+                    const double rms = std::sqrt(ss / static_cast<double>(std::max<std::size_t>(pairs.size(), 1)));
+                    if (rms < best_rms) best_rms = rms, bx = sx, by = sy;
+                }
+            std::println("  best shift of the raw right image: ({:+.2f}, {:+.2f}) px -> row rms {:.3f} px over {} markers", bx, by, best_rms, pairs.size());
+        }
+        std::ranges::sort(dy);
+        std::print("{:18} valid depth {:5.1f}%, stereo markers {}, markers {} / {}; row offsets (px):", rot ? "both rotated 180" : "as delivered",
+                   100 * valid, d.markers.size(), el.size(), er.size());
+        for (const double v : dy) std::print(" {:.2f}", v);
+        std::println("");
+    }
+    return 0;
+}
+
+// Raw captures for offline work: per pose (--label), a standard set of lighting conditions, each as
+// PGM images (sensors 0 and 1 upright as the device delivers them, sensor 2 raw Bayer in texture mode)
+// plus frames.csv (group id, per-sensor sub-field and timestamp) and the settings; the flash blob and
+// calibration once per directory.
+int hw_capture(std::span<char*> args) {
+    namespace fs = std::filesystem;
+    const fs::path root = arg_str(args, "--out") ? arg_str(args, "--out") : "fixtures-data/scanner";
+    const std::string label = arg_str(args, "--label") ? arg_str(args, "--label") : "pose";
+    const int scan_groups = static_cast<int>(arg_int(args, "--groups", 20));
+    auto dev = open_scanner(250);
+    if (!dev) return 1;
+    fs::create_directories(root / label);
+    if (!fs::exists(root / "flash_blob.bin"))
+        if (auto blob = dev->read_flash(0, calib::kFlashBlobSize)) {
+            std::ofstream(root / "flash_blob.bin", std::ios::binary).write(reinterpret_cast<const char*>(blob->data()), static_cast<std::streamsize>(blob->size()));
+            if (auto files = calib::extract_ccf_files(*blob)) (void)calib::write_ccf_directory(*files, (root / "calibration").string());
+            std::ofstream info(root / "device.txt");
+            const auto& di = dev->info();
+            info << "serial " << di.serial << "\nfirmware " << di.firmware << "\nnote sensor 1 frames are stored upright: the scanner sends them "
+                 << "rotated 180 degrees (reverse the pixel order for the wire orientation)\n";
+        }
+    struct Condition { const char* name; bool texture; int laser, strobe0, strobe1; std::uint32_t exposure; std::uint16_t gain; int groups; };
+    const Condition conditions[] = {
+        {"scan", false, 100, 6000, 0, 4400, 120, scan_groups},   // as the app scans
+        {"dark", false, 0, 0, 0, 4400, 120, 3},                  // black level
+        {"strobe_only", false, 0, 6000, 0, 4400, 120, 5},        // IR ring light: markers
+        {"projector_only", false, 100, 0, 0, 4400, 120, 5},      // speckle
+        {"scan_exposure_8800", false, 100, 6000, 0, 8800, 120, 5},
+        {"texture_white", true, 0, 6000, 9000, 4400, 120, 5},    // RGB with the white LEDs
+    };
+    for (const auto& c : conditions) {
+        const fs::path dir = root / label / c.name;
+        fs::create_directories(dir);
+        (void)dev->set_exposure(0, c.exposure);
+        for (int sensor = 0; sensor < 2; ++sensor) (void)dev->set_gain(sensor, c.gain);
+        (void)dev->set_laser_percent(c.laser);
+        (void)dev->set_strobe(0, c.strobe0);
+        (void)dev->set_strobe(1, c.strobe1);
+        (void)(c.texture ? dev->configure_texture_mode(100000) : dev->configure_scan_mode(68000));
+        std::mutex m;
+        std::vector<usb::FrameGroup> groups;
+        int skipped = 0;
+        (void)dev->start_stream([&](usb::FrameGroup&& g) {
+            std::lock_guard lock(m);
+            if (skipped < 3) {  // let the new settings settle
+                ++skipped;
+                return;
+            }
+            if (static_cast<int>(groups.size()) < c.groups) groups.push_back(std::move(g));
+        });
+        for (int i = 0; i < 400; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            std::lock_guard lock(m);
+            if (static_cast<int>(groups.size()) >= c.groups) break;
+        }
+        (void)dev->set_trigger(0, 0);
+        (void)dev->set_laser_percent(0);
+        (void)dev->set_strobe(0, 0);
+        (void)dev->set_strobe(1, 0);
+        dev->stop_stream();
+        std::ofstream csv(dir / "frames.csv");
+        csv << "group,frame_id,sensor,subfield,timestamp_us\n";
+        std::lock_guard lock(m);
+        for (std::size_t i = 0; i < groups.size(); ++i)
+            for (int sensor = 0; sensor < 3; ++sensor) {
+                const auto& f = groups[i].sensors[static_cast<std::size_t>(sensor)];
+                if (!f) continue;
+                write_pgm(dir / std::format("g{:03}_s{}.pgm", i, sensor), f->pixels);
+                csv << i << ',' << groups[i].frame_id << ',' << sensor << ',' << int(f->subfield) << ',' << f->timestamp << '\n';
+            }
+        std::ofstream(dir / "settings.txt") << std::format("mode {}\nlaser_percent {}\nstrobe_route0 {}\nstrobe_route1 {}\nexposure {}\ngain {}\n",
+                                                          c.texture ? "texture (1 IR + RGB, 100 ms)" : "scan (3 IR, 68 ms)", c.laser, c.strobe0,
+                                                          c.strobe1, c.exposure, c.gain);
+        std::println("  {:20} {} groups", c.name, groups.size());
+    }
+    std::println("saved {}", (root / label).string());
     return 0;
 }
 
@@ -1319,6 +1606,10 @@ int main(int argc, char** argv) {
     if (cmd == "hw-test") return hw_test(rest);
     if (cmd == "fixture-pack") return fixture_pack(rest);
     if (cmd == "hw-ui") return hw_ui(rest);
+    if (cmd == "hw-lights") return hw_lights(rest);
+    if (cmd == "markers-debug") return markers_debug(rest);
+    if (cmd == "stereo-debug") return stereo_debug(rest);
+    if (cmd == "hw-capture") return hw_capture(rest);
     if (cmd == "track-fixture" && argc >= 3) return track_fixture(argv[2], rest);
     if (cmd == "inspect" && argc >= 3) return inspect_cmd(argv[2]);
     if (cmd == "process" && argc >= 3) return process_cmd(argv[2], std::span<char*>(argv + 3, static_cast<std::size_t>(argc - 3)));
