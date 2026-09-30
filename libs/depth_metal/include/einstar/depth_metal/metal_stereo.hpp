@@ -29,8 +29,8 @@ struct BlobParams {
     // Dark-ring pre-check on the blob's moment ellipse (a little more lenient than the CPU's test on
     // the fitted ellipse, which follows).
     float ring_scale = 1.4f;
-    float ring_contrast = 0.3f;
-    float ring_max_bright = 0.2f;
+    float ring_contrast = 0.5f;
+    float ring_max_bright = 0.3f;
     std::uint32_t max_blobs = 1024;
 };
 struct BlobBox {
