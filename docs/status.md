@@ -19,6 +19,36 @@
 | Process step | done | frame-level pose graph (chain + free-space-verified fragment registrations + loop closures + marker landmarks), island exclusion, lost-frame recovery, re-fusion, surface-nets mesh, cleanup, parallel quadric simplification, STL/PLY/OBJ export; CLI `process`, app Process panel. Mustang: 18.6 s; 93.0% of EXStar's reference within 0.5 mm |
 | Global markers | done | markers-only constellation capture -> keyframes -> Ceres stereo-reprojection bundle adjustment -> fixed map that later scans start on; save/load as text |
 
+### Verified on the scanner (`einstar-cli hw-test`, 2026-09-29, firmware SC130_FX3_V2.10_FPGA_V3.7, USB 2.0)
+- Identification, sensor ranges (1280x1024, 8-bit, exposure 1..10000, gain 1..800) and the flash calibration
+  (2026-09-27 13:57, baseline 159.913 mm, 22.147 deg) as documented. Flash reads are consistent; the first
+  page read after connecting sometimes gets no reply and succeeds on the retry.
+- Exposure and gain write + read back on all three sensors; state polling; 10/62 accepted for DISTANCE 0/1/2
+  (which selects FPGA laser modes 4/1/2, docs/firmware.md 5, not only indicator LEDs).
+- Scan streaming: 14.77 Hz (68 ms trigger), every group complete, no frame-id gaps, resyncs or bad packets.
+  Texture mode (1 IR + RGB): 10.04 Hz, all three sensors in every group. USB 2.0 carries both.
+- Strobe route 0 lights the scene (IR level 12 -> 200-252 at exposure 4400 / gain 120). The "LD" register
+  (10/68, `set_laser_percent`) alone changed nothing in the images, with DISTANCE 1 (laser mode 1) selected
+  and the scanner face down on a table (scene out of focus and saturated).
+- Register 10/5D ("colour mode") read 8 on all three sensors (the firmware leaves that reply byte
+  unwritten; no longer queried). Temperature (10/50) reads 0 idle and streaming. Device-state reply byte
+  21 is a run state: 01/02 idle, 08 scan streaming, 40 texture streaming.
+- Still open (needs the scanner aimed at a scene): depth and markers on real IR, exposure units, 10/68 per
+  laser mode (10/62 DISTANCE), RGB content, button codes 2/3.
+
+The scanner's calibration is in `tests/fixtures/calibration/einstar_e10` (`einstar-cli calib-dump`), so the
+tests run on it everywhere. Tests that need real recordings or calibration captures use
+`tests/fixtures/external` (`einstar-cli fixture-pack`, see its README) and skip without them.
+
+### Discrete GPUs (Intel Mac, Radeon Pro 560X)
+Buffers are placed by access (`gpu::Context::gpu_buffer` / `mirrored_buffer`): private (VRAM) for GPU-only
+data and managed with explicit syncs for data the CPU also touches; on unified memory both are the
+shared buffers as before. Kernels that were slow on AMD have variants selected on non-Apple GPUs
+(barrier-free SGM paths, fused row winner-takes-all, 8x8 raycast tiles; identical results); Apple GPUs
+keep their kernels. Blob moments are exact integer sums everywhere (float atomic adds are emulated on AMD).
+`einstar-bench pipeline` on the 560X: 583 -> 42 ms per frame (markers and recording on), within the 68 ms
+frame period; the live view adds ~5.8 ms of GPU per frame at 3200x2000.
+
 ### Tracking on EXStar's own recordings (`einstar-cli track-fixture`)
 mustang_differential, 6055 frames, depth-only (no markers/texture), GPU path. A single replay is not a
 reliable measure: starting one frame later swung the old tracker between 74.5% and 94.5% tracked, because
@@ -63,10 +93,13 @@ scan started; the degeneracy/relocalisation thresholds were recalibrated for it.
 10. **Stereo outliers**: measured on synthetic speckle (`debug_depth_errors`), they are not concentrated at silhouettes (5% of the >2 mm errors are). About 7% of pixels have ≥1 px disparity errors spread over textured areas, which may be specific to our synthetic speckle. Fusion averages them out (0.16 mm mesh error). Retune only once real IR captures exist.
 11. **IR-intensity / colour ICP term**: not implemented. The IR images are lit by the laser speckle, which moves with the scanner, so their intensity is not surface texture. A photometric term needs the RGB texture camera (or strobe-only IR frames), and there are no such recordings to validate it on.
 7. Stereo outlier blobs at silhouettes need an extra consistency filter.
-8. Hardware-only unknowns: exact LED distance-zone semantics, button codes 2/3, exposure units.
+8. Hardware-only unknowns: exact LED distance-zone semantics, button codes 2/3, exposure units, what the "LD" register drives (see "Verified on the scanner").
 12. **Firmware**: the update package, flash layout, boot chain, runtime and FPGA loading are
     described in docs/firmware.md, with an assessment of an open replacement (FX3 side feasible,
     FPGA side needs hardware access; the FPGA vendor is unidentified).
 
 ## First contact with a real scanner
 `einstar-cli probe --verbose` performs read-only identification plus a calibration read and prints a full hex transcript.
+`einstar-cli hw-test` exercises the rest (registers, indication LEDs, scan and texture streaming, light and exposure
+sweeps, depth and markers on the captured frames, optionally buttons) and turns the projector and strobe on;
+`einstar-cli calib-dump <dir>` writes the scanner's calibration as EXStar's cache files.
