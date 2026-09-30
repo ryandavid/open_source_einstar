@@ -14,6 +14,23 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_OBJCXX_STANDARD 23)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Older Apple libc++ (e.g. CLT 16 / Apple clang 17) keeps std::jthread and
+# std::stop_token behind -fexperimental-library.
+include(CheckCXXSourceCompiles)
+set(EINSTAR_JTHREAD_TEST "#include <stop_token>\n#include <thread>\nint main(){std::jthread t([](std::stop_token){});}")
+set(CMAKE_REQUIRED_FLAGS "-std=c++23")
+check_cxx_source_compiles("${EINSTAR_JTHREAD_TEST}" EINSTAR_HAVE_JTHREAD)
+if(NOT EINSTAR_HAVE_JTHREAD)
+  set(CMAKE_REQUIRED_FLAGS "-std=c++23 -fexperimental-library")
+  check_cxx_source_compiles("${EINSTAR_JTHREAD_TEST}" EINSTAR_HAVE_JTHREAD_EXPERIMENTAL)
+  if(NOT EINSTAR_HAVE_JTHREAD_EXPERIMENTAL)
+    message(FATAL_ERROR "The C++ standard library lacks std::jthread; update Xcode / the Command Line Tools")
+  endif()
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX,OBJCXX>:-fexperimental-library>)
+  add_link_options(-fexperimental-library)
+endif()
+unset(CMAKE_REQUIRED_FLAGS)
+
 option(EINSTAR_BUILD_TESTS "Build unit tests" ON)
 option(EINSTAR_BUILD_APP "Build the GUI application (GLFW + Dear ImGui + Metal)" ON)
 option(EINSTAR_WITH_RERUN "Enable Rerun debug visualisation" OFF)
