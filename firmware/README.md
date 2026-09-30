@@ -24,6 +24,14 @@ and flags anything else. None changes the USB wire protocol, so stock EXStar sti
   (`s0Mode`/`s1Mode` were uninitialised).
 * SET_REPORT no longer overflows its 8-byte buffer into `ch_bulk_in`.
 
+And one deliberate identity change: command 00/05 reports `EinScan10_01_SC130_OPN_V2.10_FPGA_V3.7_<lang>`,
+the vendor's string with its `FX3` token replaced by `OPN` (`src/version.c`), so a scanner running this build
+can be told apart. Same length (42 bytes with the NUL, as 00/05 and 00/0B declare), and the tokens EXStar
+compares with its own package (`V2.10`, `V3.7`) unchanged: it offers a firmware update only when its package
+is newer, so it neither pushes the vendor firmware back nor rejects this build. fx3emu compares with the tag
+mapped back (`diff.py` BUILD_TAG), so everything else stays under the strict comparison. The update package
+is named to match (`..._OPN_V2.10_..._IAP.img`).
+
 The bit-for-bit vendor rebuild (gcc 4.8.1) it descends from lives only in the 2026-09-29 snapshot
 (`.re/snapshots/`); `reference/vendor-names.elf` keeps a copy of that ELF as the harness's symbol map.
 
@@ -89,15 +97,15 @@ the Arm GNU Toolchain gcc (`FX3_ARMGNU_GCC`) and a host C compiler for `elf2img`
 The host tool `einstar-firmware` (built with the main project, `apps/einstar-firmware`):
 ```
 build/default/apps/einstar-firmware version                    # what the scanner runs (00/05), serial
-build/default/apps/einstar-firmware inspect firmware/build/EN/EinScan10_01_SC130_FX3_V2.10_FPGA_V3.7_EN_IAP.img
-build/default/apps/einstar-firmware flash   firmware/build/EN/EinScan10_01_SC130_FX3_V2.10_FPGA_V3.7_EN_IAP.img
+build/default/apps/einstar-firmware inspect firmware/build/EN/EinScan10_01_SC130_OPN_V2.10_FPGA_V3.7_EN_IAP.img
+build/default/apps/einstar-firmware flash   firmware/build/EN/EinScan10_01_SC130_OPN_V2.10_FPGA_V3.7_EN_IAP.img
 build/default/apps/einstar-firmware flash   <EXStar.app>/Contents/MacOS/fabu_UPDATE/Configure/..._EN_IAP.img   # back to the vendor's
 ```
 `flash` checks the package, reboots the scanner (clearing any abandoned update, see the retry bug
 below), writes the inactive slot exactly as EXStar does, and reconnects to read the version; `--emulator`
 runs it against the emulated scanner. The previous firmware stays in the other slot but no command
-selects it, so going back is flashing EXStar's package. Our build reports the same version string as the
-vendor's, so `version` cannot tell them apart. The host side was checked against this firmware with
+selects it, so going back is flashing EXStar's package. `version` tells the builds apart by the version
+string (below). The host side was checked against this firmware with
 `tools/fx3emu` (`python -m fx3emu replay`, see its README). Not yet run on the scanner.
 
 ## Layout

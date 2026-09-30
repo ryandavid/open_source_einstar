@@ -44,12 +44,15 @@ struct FirmwarePackage {
 [[nodiscard]] Result<FirmwarePackage> parse_firmware_package(std::vector<std::uint8_t> bytes);
 [[nodiscard]] Result<FirmwarePackage> load_firmware_package(const std::string& path);
 
-// "EinScan10_01_SC130_FX3_V2.10_FPGA_V3.7_EN", as command 00/05 reports it. Fields stay empty when the
+// "EinScan10_01_SC130_FX3_V2.10_FPGA_V3.7_EN", as command 00/05 reports it. Our build (firmware/) reports
+// the same string with the FX3 token replaced by OPN (firmware/src/version.c). Fields stay empty when the
 // text does not have that shape.
 struct FirmwareVersion {
     std::string text;
     std::string product;   // EinScan10_01
     std::string sensor;    // SC130
+    std::string tag;       // FX3 (Shining3D's firmware) or OPN (our build)
+    [[nodiscard]] bool open_build() const { return tag == "OPN"; }
     std::string fx3;       // 2.10
     std::string fpga;      // 3.7
     std::string language;  // EN / CH

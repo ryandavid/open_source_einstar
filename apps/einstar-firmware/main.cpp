@@ -35,7 +35,7 @@ int usage() {
                  "  --emulator  run against the built-in emulated scanner instead of the USB device\n"
                  "  --yes       do not ask for confirmation\n"
                  "\n"
-                 "Our build's package: firmware/build/EN/EinScan10_01_SC130_FX3_V2.10_FPGA_V3.7_EN_IAP.img\n"
+                 "Our build's package: firmware/build/EN/EinScan10_01_SC130_OPN_V2.10_FPGA_V3.7_EN_IAP.img\n"
                  "EXStar's (to go back): /Applications/EXStar.app/Contents/MacOS/fabu_UPDATE/Configure/*_EN_IAP.img");
     return 2;
 }
@@ -74,8 +74,10 @@ device::TransportOpener make_opener(bool emulator) {
 void print_version(std::string_view text) {
     const auto v = device::parse_firmware_version(text);
     std::println("firmware        {}", v.text);
-    if (!v.fx3.empty())
-        std::println("                FX3 application {}, FPGA {}, sensor {}, language {}", v.fx3, v.fpga, v.sensor, v.language);
+    if (v.fx3.empty()) return;
+    std::println("                {}: FX3 application {}, FPGA {}, sensor {}, language {}",
+                 v.open_build() ? "open build (firmware/)" : v.tag == "FX3" ? "Shining3D's firmware" : std::format("unknown build '{}'", v.tag),
+                 v.fx3, v.fpga, v.sensor, v.language);
 }
 
 int version_cmd(bool emulator) {
@@ -89,7 +91,6 @@ int version_cmd(bool emulator) {
     std::println("serial          {}", i.serial);
     print_version(i.firmware);
     std::println("ids             reported VID {:04x} PID {:04x} (the USB descriptor's PID is 0003)", i.vendor_id, i.product_id);
-    std::println("note            our build reports the same version string as the vendor firmware it reproduces");
     return 0;
 }
 

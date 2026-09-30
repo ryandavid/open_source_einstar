@@ -137,7 +137,7 @@ TEST_CASE("damaged update packages are refused before anything is sent") {
 
 TEST_CASE("the real update packages parse: EXStar's and our build's") {
     const std::string exstar = "/Applications/EXStar.app/Contents/MacOS/fabu_UPDATE/Configure/EinScan10_01_SC130_FX3_V2.10_FPGA_V3.7_EN_IAP.img";
-    const std::string ours = std::string(EINSTAR_SOURCE_DIR) + "/firmware/build/EN/EinScan10_01_SC130_FX3_V2.10_FPGA_V3.7_EN_IAP.img";
+    const std::string ours = std::string(EINSTAR_SOURCE_DIR) + "/firmware/build/EN/EinScan10_01_SC130_OPN_V2.10_FPGA_V3.7_EN_IAP.img";
     int found = 0;
     for (const auto& path : {exstar, ours}) {
         if (!std::filesystem::exists(path)) continue;
@@ -158,6 +158,14 @@ TEST_CASE("firmware version strings split into their fields") {
     CHECK(v.fx3 == "2.10");
     CHECK(v.fpga == "3.7");
     CHECK(v.language == "EN");
+    CHECK(v.tag == "FX3");
+    CHECK_FALSE(v.open_build());
+    // Ours: the same shape and length, the FX3 token replaced (firmware/src/version.c).
+    const auto o = device::parse_firmware_version("EinScan10_01_SC130_OPN_V2.10_FPGA_V3.7_EN");
+    CHECK(o.text.size() == v.text.size());
+    CHECK(o.open_build());
+    CHECK(o.fx3 == "2.10");
+    CHECK(o.fpga == "3.7");
     CHECK(device::parse_firmware_version("something else").fx3.empty());
 }
 
@@ -377,8 +385,8 @@ TEST_CASE("record a typical session's conversation for the fx3emu cross-check") 
     for (int s = 0; s < 3; ++s) {
         REQUIRE(d.set_exposure(s, s == 2 ? 3000u : 4400u).has_value());
         REQUIRE(d.exposure(s).has_value());
-        for (const std::uint16_t g : {100, 110, 120, 125, 333, 800}) {
-            REQUIRE(d.set_gain(s, g).has_value());
+        for (const int g : {100, 110, 120, 125, 333, 800}) {
+            REQUIRE(d.set_gain(s, static_cast<std::uint16_t>(g)).has_value());
             REQUIRE(d.gain(s).has_value());
         }
     }

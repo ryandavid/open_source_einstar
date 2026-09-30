@@ -12,6 +12,9 @@ Two mechanisms:
   when a failed read precedes it within the same command. This covers every readback command
   (exposure, gain, temperature, strobe, LD mode, trigger, device state, ...) without enumerating them.
 * **Final-state-only fixes** below are matched by signature when a scenario differs only in end state.
+
+The open build's version tag (00/05 reports ..._OPN_V2.10_... for ..._FX3_V2.10_...) is not a fix but a
+deliberate identity change; diff.py maps it back before comparing (BUILD_TAG), so it needs no entry here.
 """
 
 EXPECTED = [

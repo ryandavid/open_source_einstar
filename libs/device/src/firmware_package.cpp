@@ -110,19 +110,22 @@ Result<FirmwarePackage> load_firmware_package(const std::string& path) {
 FirmwareVersion parse_firmware_version(std::string_view text) {
     FirmwareVersion v;
     v.text = std::string(text);
-    // <product>_<sensor>_FX3_V<fx3>_FPGA_V<fpga>_<language>; the product itself contains one '_'.
-    const auto fx3 = text.find("_FX3_V"), fpga = text.find("_FPGA_V");
-    if (fx3 == std::string_view::npos || fpga == std::string_view::npos || fpga < fx3) return v;
-    const auto head = text.substr(0, fx3);
-    const auto sensor_sep = head.rfind('_');
-    if (sensor_sep == std::string_view::npos) return v;
-    const auto tail = text.substr(fpga + 7);
-    const auto lang_sep = tail.find('_');
-    v.product = std::string(head.substr(0, sensor_sep));
-    v.sensor = std::string(head.substr(sensor_sep + 1));
-    v.fx3 = std::string(text.substr(fx3 + 6, fpga - fx3 - 6));
-    v.fpga = std::string(lang_sep == std::string_view::npos ? tail : tail.substr(0, lang_sep));
-    v.language = lang_sep == std::string_view::npos ? std::string{} : std::string(tail.substr(lang_sep + 1));
+    // Tokens split on '_', as EXStar splits them: product (two tokens), sensor, FX3|OPN, V<fx3>, FPGA,
+    // V<fpga>, language. (EXStar compares tokens 4 and 6 with its own package.)
+    std::vector<std::string_view> t;
+    for (std::size_t from = 0;;) {
+        const auto to = text.find('_', from);
+        t.push_back(text.substr(from, to == std::string_view::npos ? std::string_view::npos : to - from));
+        if (to == std::string_view::npos) break;
+        from = to + 1;
+    }
+    if (t.size() != 8 || t[5] != "FPGA" || !t[4].starts_with('V') || !t[6].starts_with('V')) return v;
+    v.product = std::format("{}_{}", t[0], t[1]);
+    v.sensor = std::string(t[2]);
+    v.tag = std::string(t[3]);
+    v.fx3 = std::string(t[4].substr(1));
+    v.fpga = std::string(t[6].substr(1));
+    v.language = std::string(t[7]);
     return v;
 }
 

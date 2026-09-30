@@ -6,6 +6,34 @@ from .expected import acknowledged
 
 FAILURE_MARKERS = ("status=46", "failed ret", "Failed to ReadI2C", "from 3e0", "SPI wait status", "command failed")
 
+# The open build's version string differs from the vendor's in one token, by design (firmware/src/version.c):
+# "..._SC130_OPN_V2.10_..." for "..._SC130_FX3_V2.10_...", same length. Compare with the tag mapped back,
+# so the rest of every trace, reply and state stays under the strict comparison (acknowledging the first
+# divergence instead would wave through everything after a 00/05 in a scenario).
+BUILD_TAG = [(b"_OPN_V", b"_FX3_V")]
+_TAG_HEX = [(o.hex(), v.hex()) for o, v in BUILD_TAG]
+_TAG_WORDS = [("4f5f3033 565f4e50", "465f3033 565f3358")]   # fw_version as little-endian words ("0_O"/"PN_V")
+
+
+def _untag_text(t):
+    for o, v in _TAG_HEX + _TAG_WORDS:
+        t = t.replace(o, v)
+    return t
+
+
+def _untag_bytes(b):
+    for o, v in BUILD_TAG:
+        b = b.replace(o, v)
+    return b
+
+
+def untagged(dev):
+    """A device's trace, replies and final state with the open build's version tag mapped to the vendor's."""
+    trace = [tuple(_untag_text(x) if isinstance(x, str) else x for x in ev) for ev in dev.trace]
+    replies = [(ch, _untag_bytes(data)) for ch, data in dev.m.replies]
+    state = {k: _untag_text(v) for k, v in dev.m.final_state().items()}
+    return trace, replies, state
+
 
 def run(image, scenario, seed=0, faults=True):
     d = Device(image, seed=seed)
@@ -53,7 +81,7 @@ def read_failure_before(dev, i, window=400):
 def compare(a, b, context=4):
     """Differences between two finished Devices: trace, replies, final state. [] if identical."""
     out = []
-    ta, tb = a.trace, b.trace
+    (ta, ra, sa), (tb, rb, sb) = untagged(a), untagged(b)
     n = min(len(ta), len(tb))
     first = next((i for i in range(n) if ta[i] != tb[i]), None)
     if first is None and len(ta) != len(tb):
@@ -68,12 +96,10 @@ def compare(a, b, context=4):
             if i < len(tb):
                 lines.append("  B " + fmt(tb[i]))
         out.append("\n".join(lines))
-    ra, rb = a.m.replies, b.m.replies
     if ra != rb:
         k = next((i for i in range(min(len(ra), len(rb))) if ra[i] != rb[i]), min(len(ra), len(rb)))
         out.append("replies differ at #%d: A %s / B %s" % (
             k, (ra[k][0], ra[k][1][:24].hex()) if k < len(ra) else "-", (rb[k][0], rb[k][1][:24].hex()) if k < len(rb) else "-"))
-    sa, sb = a.m.final_state(), b.m.final_state()
     for key in sorted(set(sa) & set(sb)):
         if sa[key] != sb[key]:
             out.append("final %s differs:\n  A %s\n  B %s" % (key, sa[key][:200], sb[key][:200]))
@@ -101,7 +127,7 @@ def differential(image_a, image_b, scenarios, seed=0, log=print, strict=False, f
         # consequence and the whole scenario is acknowledged.
         # A scenario's diffs are intended if the first trace divergence is a known fix (everything
         # after it is a consequence), or -- when only final state differs -- if every block is.
-        ta, tb = a.trace, b.trace
+        (ta, _, _), (tb, _, _) = untagged(a), untagged(b)   # (the version tag is not a difference)
         n = min(len(ta), len(tb))
         diff_idx = [k for k in range(n) if ta[k] != tb[k]]
 

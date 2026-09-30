@@ -25,7 +25,7 @@ endforeach()
 
 set(SDK "${CMAKE_CURRENT_SOURCE_DIR}/sdk")
 set(FPGA_BITSTREAM "${CMAKE_CURRENT_SOURCE_DIR}/fpga/EinScan10_01_FPGA_V3.7.bin")
-set(PACKAGE_NAME "EinScan10_01_SC130_FX3_V2.10_FPGA_V3.7_%LANG%_IAP.img")
+set(PACKAGE_NAME "EinScan10_01_SC130_OPN_V2.10_FPGA_V3.7_%LANG%_IAP.img")   # (version.c: OPN marks this build)
 
 execute_process(COMMAND "${CMAKE_C_COMPILER}" --version OUTPUT_VARIABLE _ccv)
 string(REGEX MATCH "[0-9]+\\.[0-9]+\\.[0-9]+" _ccver "${_ccv}")

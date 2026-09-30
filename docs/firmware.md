@@ -100,8 +100,17 @@ user area. The slots, the boot record and the EEPROM cannot be read back with st
    `tools/fx3emu` (`python -m fx3emu replay`): every reply agrees, the firmware resets where the
    host reconnects, and the written slot and boot record come out right. Not yet run on the
    scanner. A host that stalls for more than 2 s between pages loses the update (safely: the old
-   firmware keeps booting). `einstar-firmware version` cannot tell our build from the vendor's:
-   both report the same version string.
+   firmware keeps booting). Our build reports `EinScan10_01_SC130_OPN_V2.10_FPGA_V3.7_EN` (4.8), which
+   `einstar-firmware version` shows as the open build.
+8. **What EXStar does with the version string** **[H]** (libAppUi `FirmwareUpgradeHelperEA`): on connect
+   it compares the scanner's 00/05 string with the name of its own package in
+   `fabu_UPDATE/Configure`: both split on `_`, tokens 4 and 6 (`V2.10`, `V3.7`) stripped of `V`, split on
+   `.` and parsed; it offers an update only when all of them parse and its package's FX3 or FPGA number
+   is higher (its log: `checkFirmwreUpgrade ... isNeedUpgrade = 0`). Nothing else reads the string: the
+   Einstar is matched by the product name (00/01), `FirmwareLanguage` comes from `res/system.ini`, and a
+   copy of the vendor string in libScanPage_E7 is only a default value. So our build keeps the string's
+   length and tokens 4 and 6 and marks itself in token 3 (`FX3` -> `OPN`): EXStar sees the same versions
+   and leaves it alone. A lower version there would make EXStar offer to reinstall its own firmware.
 
 ## 5. Command handling **[H]**
 * Command channel: one large dispatcher; the bulk channel: a 3-entry table (00/06 update,

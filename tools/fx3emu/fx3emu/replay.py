@@ -14,6 +14,7 @@ and, for a firmware update, that the slot the firmware wrote holds the package a
 that slot. The SPI flash carries over each reset.
 """
 from .device import Device, default_flash, BOOT_RECORD, SLOT_A_APP, SLOT_B_APP
+from .diff import _untag_bytes     # the open build's version tag, mapped back (diff.py BUILD_TAG)
 
 STALE = 0xCD                       # bytes the host's emulator leaves unwritten (stale in the firmware)
 NO_DATA_CHECK = {0x0004, 0x0007, 0x1050}  # hardware-dependent: FX3 die id, FPGA state register, temperature
@@ -56,7 +57,7 @@ def replay(image, path, seed=0, out=print):
         if not got:
             problem(i, "%s %04x: the firmware sent no reply, the host expected %s" % (channel, key, want[:9].hex()))
             continue
-        reply = got[-1]
+        reply = _untag_bytes(got[-1])
         replies += 1
         if reply[:9] != want[:9]:
             problem(i, "%s %04x: header %s, the host expected %s" % (channel, key, reply[:9].hex(), want[:9].hex()))
