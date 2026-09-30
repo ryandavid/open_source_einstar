@@ -2,6 +2,15 @@
 //   probe [--verbose]                 read-only hardware identification (first contact with a scanner)
 //   sim-probe                         same, against the device emulator
 //   calib <dir-with-CCF-files>        decode LeftCCF/RightCCF/TexCCF and print the rig
+//   calib-dump <dir>                  read the attached scanner's calibration and write it as CCF files
+//                                     (byte-for-byte EXStar's cache files)
+//   fixture-pack --out DIR [--mustang <Project1.ir_E10_prj>] [--stl mesh.stl] [--board <dir>]
+//                                     pack the excerpts of real EXStar data the tests read
+//                                     (tests/fixtures/external/README.md)
+//   hw-test [--out DIR] [--seconds S] [--texture-seconds S] [--buttons S]
+//                                     exercise the attached scanner: identification, flash, registers,
+//                                     indicator LEDs, scan and texture streaming, depth and markers on
+//                                     real frames, buttons (turns the projector and strobe on)
 //   track-fixture <project.ir_E10_prj> [--start N] [--count N] [--skip K] [--record out.estr] [--quiet]
 //                                     run the tracker on EXStar-recorded depth frames and compare poses;
 //                                     --record writes a session (plus EXStar's poses as <out>.exstar_poses)
@@ -9,11 +18,16 @@
 //           [--stl reference.stl] [--reference-poses file]
 //                                     the process step: optimise poses, re-fuse, mesh, export
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <charconv>
 #include <thread>
 #include <chrono>
+#include <filesystem>
 #include <fstream>
+#include <mutex>
+#include <tuple>
 #include <map>
 #include <cstring>
 #include <cmath>
@@ -29,7 +43,9 @@
 #include "einstar/core/timing.hpp"
 #include "einstar/device/einstar_device.hpp"
 #include "einstar/eval/evaluation.hpp"
+#include "einstar/pipeline/stereo_frontend.hpp"
 #include "einstar/fixtures/exstar_project.hpp"
+#include "einstar/fixtures/packaging.hpp"
 #include "einstar/recon/process.hpp"
 #include "einstar/session/session.hpp"
 #include "einstar/sim/sim_transport.hpp"
@@ -43,7 +59,9 @@ namespace {
 
 int usage() {
     std::println(stderr,
-                 "usage: einstar-cli probe [--verbose] | sim-probe | calib <dir> |\n"
+                 "usage: einstar-cli probe [--verbose] | sim-probe | calib <dir> | calib-dump <dir> |\n"
+                 "       hw-test [--out DIR] [--seconds S] [--texture-seconds S] [--buttons S] |\n"
+                 "       fixture-pack --out DIR [--mustang <Project1.ir_E10_prj>] [--stl mesh.stl] [--board <dir>] |\n"
                  "       track-fixture <project.ir_E10_prj> [--start N] [--count N] [--skip K] [--stl ref.stl] [--cpu] [--mode geometry|hybrid|markers] [--global-markers] [--marker-confirm N] [--record out.estr] [--quiet] |\n"
                  "       process <session.estr> [-o mesh.stl|ply|obj] [--voxel MM] [--no-optimize] [--smooth N] [--stl reference.stl] [--reference-poses file] |\n"
                  "       inspect <session.estr>");
@@ -152,6 +170,414 @@ int calib_cmd(const char* dir) {
     const auto rig = cal->rig();
     std::println("baseline {:.3f} mm, left->right rotation {:.3f} deg", rig.baseline_mm(),
                  rotation_angle(rig.T_right_left) * 180.0 / M_PI);
+    return 0;
+}
+
+std::unique_ptr<device::EinstarDevice> open_scanner(int heartbeat_ms, std::function<void(std::string_view)> transcript = {}) {
+    auto devices = usb::enumerate_devices();
+    if (!devices || devices->empty()) {
+        std::println(stderr, "no Shining3D devices (vid 3267) found");
+        return nullptr;
+    }
+    auto transport = usb::open_libusb(devices->front());
+    if (!transport) {
+        std::println(stderr, "open failed: {}", transport.error().message);
+        return nullptr;
+    }
+    device::ConnectOptions opts;
+    opts.heartbeat_ms = heartbeat_ms;
+    if (transcript) {
+        opts.verbose_transcript = true;
+        opts.transcript_sink = std::move(transcript);
+    }
+    auto dev = device::EinstarDevice::connect(std::move(*transport), opts);
+    if (!dev) {
+        std::println(stderr, "connect failed: {}", dev.error().message);
+        return nullptr;
+    }
+    return std::move(*dev);
+}
+
+int calib_dump_cmd(const char* dir) {
+    auto dev = open_scanner(0);
+    if (!dev) return 1;
+    auto blob = dev->read_flash(0, calib::kFlashBlobSize);
+    if (!blob) {
+        std::println(stderr, "flash read failed: {}", blob.error().message);
+        return 1;
+    }
+    auto files = calib::extract_ccf_files(*blob);
+    if (!files) {
+        std::println(stderr, "{}", files.error().message);
+        return 1;
+    }
+    if (auto r = calib::write_ccf_directory(*files, dir); !r) {
+        std::println(stderr, "{}", r.error().message);
+        return 1;
+    }
+    std::println("wrote {}/LeftCCF.txt, RightCCF.txt, TexCCF.txt (calibration {}, serial {})", dir, files->calibration_time,
+                 dev->info().serial);
+    return calib_cmd(dir);
+}
+
+void write_pgm(const std::filesystem::path& path, const ImageU8& img) {
+    std::ofstream f(path, std::ios::binary);
+    f << "P5\n" << img.width() << " " << img.height() << "\n255\n";
+    for (int y = 0; y < img.height(); ++y) f.write(reinterpret_cast<const char*>(img.view().row(y)), img.width());
+}
+
+struct ImageStats {
+    double mean = 0;
+    int p99 = 0;
+    double saturated = 0, dark = 0;  // fractions (255, < 10)
+};
+ImageStats image_stats(const ImageU8& img) {
+    std::array<std::uint64_t, 256> hist{};
+    for (const auto v : img.pixels()) ++hist[v];
+    ImageStats s;
+    const double n = static_cast<double>(img.size());
+    std::uint64_t acc = 0;
+    bool have_p99 = false;
+    for (int v = 0; v < 256; ++v) {
+        s.mean += v * static_cast<double>(hist[static_cast<std::size_t>(v)]) / n;
+        acc += hist[static_cast<std::size_t>(v)];
+        if (!have_p99 && static_cast<double>(acc) >= 0.99 * n) s.p99 = v, have_p99 = true;
+        if (v < 10) s.dark += static_cast<double>(hist[static_cast<std::size_t>(v)]) / n;
+    }
+    s.saturated = static_cast<double>(hist[255]) / n;
+    return s;
+}
+
+int hw_test(std::span<char*> args) {
+    const std::filesystem::path out = arg_str(args, "--out") ? arg_str(args, "--out") : "hw_test";
+    const double seconds = arg_double(args, "--seconds", 6.0);
+    const double texture_seconds = arg_double(args, "--texture-seconds", 3.0);
+    const double button_seconds = arg_double(args, "--buttons", 0.0);
+    std::filesystem::create_directories(out);
+    int failures = 0;
+    auto check = [&](bool ok, std::string_view what, const std::string& detail = {}) {
+        std::println("  [{}] {}{}{}", ok ? "PASS" : "FAIL", what, detail.empty() ? "" : ": ", detail);
+        if (!ok) ++failures;
+    };
+
+    std::println("== connect / identification ==");
+    // Every request / reply goes to transcript.txt (timestamped).
+    auto transcript_file = std::make_shared<std::ofstream>(out / "transcript.txt");
+    auto transcript_mutex = std::make_shared<std::mutex>();
+    auto transcript_clock = std::make_shared<Stopwatch>();
+    auto dev = open_scanner(250, [transcript_file, transcript_mutex, transcript_clock](std::string_view line) {  // heartbeat on: state polling, buttons
+        std::lock_guard lock(*transcript_mutex);
+        *transcript_file << std::format("{:9.3f} {}\n", transcript_clock->elapsed_ms() / 1000.0, line);
+    });
+    if (!dev) return 1;
+    print_device(*dev);
+    const auto& info = dev->info();
+    check(info.sensor_count == 3, "three sensors", std::format("{}", info.sensor_count));
+    for (int i = 0; i < info.sensor_count; ++i) {
+        const auto& sn = info.sensors[static_cast<std::size_t>(i)];
+        check(sn.width == 1280 && sn.height == 1024 && sn.pixel_bits == 8, std::format("sensor {} geometry", i),
+              std::format("{}x{} {}-bit", sn.width, sn.height, sn.pixel_bits));
+    }
+
+    std::println("== flash / calibration ==");
+    auto blob = dev->read_flash(0, calib::kFlashBlobSize);
+    auto blob2 = dev->read_flash(0, calib::kFlashBlobSize);
+    check(blob && blob2 && *blob == *blob2, "flash blob reads are consistent");
+    std::optional<calib::DeviceCalibration> cal;
+    if (blob) {
+        std::ofstream(out / "flash_blob.bin", std::ios::binary).write(reinterpret_cast<const char*>(blob->data()), static_cast<std::streamsize>(blob->size()));
+        auto c = calib::decode_flash_blob(*blob);
+        check(c.has_value(), "calibration decodes", c ? std::format("{}, baseline {:.3f} mm", c->calibration_time, c->rig().baseline_mm()) : c.error().message);
+        if (c) cal = *c;
+        auto files = calib::extract_ccf_files(*blob);
+        if (files && calib::write_ccf_directory(*files, (out / "calibration").string())) {
+            auto reloaded = calib::load_ccf_directory((out / "calibration").string());
+            check(reloaded && c && reloaded->rig().baseline_mm() == c->rig().baseline_mm(), "CCF files round trip",
+                  (out / "calibration").string());
+        }
+    }
+
+    std::println("== registers (sensors 0 and 1 share one exposure register) ==");
+    for (int sensor = 0; sensor < 3; ++sensor) {
+        const auto e = dev->exposure(sensor);
+        const auto g = dev->gain(sensor);
+        if (!e || !g) {
+            check(false, std::format("sensor {} exposure/gain read", sensor));
+            continue;
+        }
+        const std::uint32_t e2 = *e == 4000 ? 4100 : 4000;
+        const std::uint16_t g2 = *g == 100 ? 110 : 100;
+        const bool w1 = dev->set_exposure(sensor, e2) && dev->set_gain(sensor, g2);
+        const auto e_rb = dev->exposure(sensor);
+        const auto g_rb = dev->gain(sensor);
+        const bool w2 = dev->set_exposure(sensor, *e) && dev->set_gain(sensor, *g);  // restore
+        const auto e_back = dev->exposure(sensor);
+        check(w1 && w2 && e_rb && *e_rb == e2 && g_rb && *g_rb == g2 && e_back && *e_back == *e,
+              std::format("sensor {} exposure/gain write + read back", sensor),
+              std::format("was {}/{}, wrote {}/{}, read {}/{}", *e, *g, e2, g2, e_rb ? *e_rb : 0u, g_rb ? *g_rb : 0));
+    }
+    if (auto t = dev->temperature_c()) std::println("  temperature (idle) {:.2f} C", *t);
+    auto st = dev->read_state();
+    check(st.has_value(), "device state / buttons read");
+
+    std::println("== indicator LEDs (watch the scanner: zone 0, 1, 2, then 1) ==");
+    for (int zone = 0; zone < 3; ++zone) {
+        const bool ok = dev->set_indication(static_cast<device::DistanceIndication>(zone)).has_value();
+        check(ok, std::format("indication zone {} on", zone));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    }
+    check(dev->set_indication(device::DistanceIndication::zone1).has_value(), "indication back to zone 1");
+
+    // Scan-mode streaming with the app's capture settings.
+    struct Capture {
+        std::mutex m;
+        std::vector<usb::FrameGroup> groups;         // first frames, kept for analysis
+        std::vector<double> arrival_ms;
+        std::vector<std::uint32_t> ids;
+        std::vector<unsigned> masks;
+        Stopwatch clock;
+    };
+    auto stream = [&](const std::string& label, int laser, int strobe, double secs, bool texture, std::size_t keep,
+                      std::uint32_t exposure = 4400, std::uint16_t gain = 120, bool quiet = false) {
+        auto cap = std::make_shared<Capture>();
+        if (auto* f = transcript_file.get()) {
+            std::lock_guard lock(*transcript_mutex);
+            *f << std::format("---- {} (laser {}, strobe {}, exposure {}, gain {}) ----\n", label, laser, strobe, exposure, gain);
+        }
+        (void)dev->set_exposure(0, exposure);  // (shared by the IR pair)
+        for (int sensor = 0; sensor < 2; ++sensor) (void)dev->set_gain(sensor, gain);
+        (void)dev->set_laser_percent(laser);
+        (void)dev->set_strobe(0, strobe);
+        const auto mode = texture ? dev->configure_texture_mode(100000) : dev->configure_scan_mode(68000);
+        if (!quiet) check(mode.has_value(), std::format("{}: trigger configured", label));
+        auto r = dev->start_stream([cap, keep](usb::FrameGroup&& g) {
+            std::lock_guard lock(cap->m);
+            cap->arrival_ms.push_back(cap->clock.elapsed_ms());
+            cap->ids.push_back(g.frame_id);
+            cap->masks.push_back(g.mask());
+            if (cap->groups.size() < keep) cap->groups.push_back(std::move(g));
+        });
+        if (!quiet || !r) check(r.has_value(), std::format("{}: stream started", label), r ? "" : r.error().message);
+        std::vector<double> temps;
+        for (double t = 0; t < secs; t += 1.0) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            if (auto c = dev->temperature_c()) temps.push_back(*c);
+        }
+        (void)dev->set_trigger(0, 0);
+        (void)dev->set_laser_percent(0);
+        (void)dev->set_strobe(0, 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        dev->stop_stream();
+        const auto ss = dev->stream_stats();
+        const auto gs = dev->group_stats();
+        std::lock_guard lock(cap->m);
+        const std::size_t n = cap->ids.size();
+        const double span = n > 1 ? cap->arrival_ms.back() - cap->arrival_ms.front() : 0.0;
+        const double hz = n > 1 ? 1000.0 * static_cast<double>(n - 1) / span : 0.0;
+        std::uint64_t gaps = 0;
+        for (std::size_t i = 1; i < n; ++i)
+            if (cap->ids[i] != cap->ids[i - 1] + 1) gaps += cap->ids[i] > cap->ids[i - 1] ? cap->ids[i] - cap->ids[i - 1] - 1 : 1;
+        std::vector<double> dt;
+        for (std::size_t i = 1; i < n; ++i) dt.push_back(cap->arrival_ms[i] - cap->arrival_ms[i - 1]);
+        std::ranges::sort(dt);
+        if (quiet) return std::move(cap->groups);
+        // (The assemblers and their statistics are per stream.)
+        std::println("  {} groups in {:.1f} s = {:.2f} Hz; arrival interval median {:.1f} ms, max {:.1f} ms; frame-id gaps {}", n,
+                     secs, hz, dt.empty() ? 0.0 : dt[dt.size() / 2], dt.empty() ? 0.0 : dt.back(), gaps);
+        std::println("  packets {}, frames {}, bad packets {}, resyncs {}, overflows {}, bad camera {}; groups {}, incomplete dropped {}, IR-only {}",
+                     ss.packets, ss.frames, ss.bad_packets, ss.resyncs, ss.overflows, ss.bad_camera, gs.groups, gs.incomplete_dropped,
+                     gs.ir_only_emitted);
+        if (!temps.empty()) std::println("  temperature while streaming {:.2f} .. {:.2f} C", std::ranges::min(temps), std::ranges::max(temps));
+        std::map<unsigned, int> mask_counts;
+        for (const auto m : cap->masks) ++mask_counts[m];
+        for (const auto& [m, c] : mask_counts) std::println("  sensor mask {:03b}: {} groups", m, c);
+        const double expected_hz = texture ? 10.0 : 1e6 / 68000.0;
+        check(n > 0 && std::abs(hz - expected_hz) < 0.1 * expected_hz, std::format("{}: frame rate", label),
+              std::format("{:.2f} Hz (trigger period implies {:.2f})", hz, expected_hz));
+        check(ss.resyncs == 0 && ss.bad_packets == 0 && ss.overflows == 0 && gaps == 0, std::format("{}: clean stream", label));
+        std::vector<usb::FrameGroup> groups = std::move(cap->groups);
+        return groups;
+    };
+    auto report_images = [&](const std::vector<usb::FrameGroup>& groups, const std::string& tag) {
+        if (groups.empty()) return;
+        const auto& g = groups[groups.size() / 2];
+        for (int s = 0; s < 3; ++s) {
+            if (!g.sensors[static_cast<std::size_t>(s)]) continue;
+            const auto& img = g.sensors[static_cast<std::size_t>(s)]->pixels;
+            const auto is = image_stats(img);
+            std::println("  sensor {} (frame {}): mean {:.1f}, p99 {}, saturated {:.2f}%, dark {:.1f}%", s, g.frame_id, is.mean, is.p99,
+                         100 * is.saturated, 100 * is.dark);
+            write_pgm(out / std::format("{}_sensor{}.pgm", tag, s), img);
+        }
+    };
+
+    // What the light sources and the exposure register do, measured on the images (scene held still).
+    auto mean_of = [](const std::vector<usb::FrameGroup>& groups, int sensor) {
+        if (groups.empty() || !groups.back().sensors[static_cast<std::size_t>(sensor)]) return -1.0;
+        return image_stats(groups.back().sensors[static_cast<std::size_t>(sensor)]->pixels).mean;
+    };
+    std::println("== light sources (mean IR level, sensors 0 / 1; exposure 4400, gain 120) ==");
+    for (const auto& [name, laser, strobe] : {std::tuple{"all off", 0, 0}, std::tuple{"projector 100", 100, 0},
+                                              std::tuple{"strobe 6000", 0, 6000}, std::tuple{"both", 100, 6000}}) {
+        const auto g = stream(name, laser, strobe, 1.0, false, 8, 4400, 120, true);
+        std::println("  {:14} {:6.1f} / {:6.1f}", name, mean_of(g, 0), mean_of(g, 1));
+        if (!g.empty()) write_pgm(out / std::format("light_{}_sensor0.pgm", laser * 100000 + strobe), g.back().sensors[0]->pixels);
+    }
+    std::println("== exposure / gain (lights off: ambient only; mean IR level, sensors 0 / 1) ==");
+    for (const auto& [e, gn] : {std::pair{250u, 120}, std::pair{1000u, 120}, std::pair{4000u, 120}, std::pair{1000u, 30}, std::pair{1000u, 480}}) {
+        const auto g = stream("exposure", 0, 0, 1.0, false, 8, e, static_cast<std::uint16_t>(gn), true);
+        std::println("  exposure {:5} gain {:3}: {:6.1f} / {:6.1f}", e, gn, mean_of(g, 0), mean_of(g, 1));
+    }
+
+    std::println("== scan stream (EXStar-level laser 60, strobe 6000) ==");
+    auto scan60 = stream("scan L60", 60, 6000, 2.0, false, 4);
+    report_images(scan60, "scan_laser60");
+    std::println("== scan stream (app default laser 100, strobe 6000) ==");
+    auto scan = stream("scan L100", 100, 6000, seconds, false, 40);
+    report_images(scan, "scan_laser100");
+
+    if (cal && !scan.empty()) {
+        std::println("== depth and markers on the real frames ==");
+        pipeline::StereoFrontend fe(cal->rig());
+        fe.detect_sensor_order(scan.front());
+        std::vector<double> valid, stereo_ms;
+        std::vector<int> left_markers, stereo_markers;
+        for (const auto& g : scan) {
+            auto d = fe.process(g);
+            if (!d) continue;
+            d->frame.ensure_cpu();
+            const auto& pts = d->frame.points;
+            valid.push_back(static_cast<double>(std::ranges::count_if(pts.pixels(), [](const Vec3f& p) { return p.z() > 0; })) /
+                            static_cast<double>(pts.size()));
+            stereo_ms.push_back(d->stereo_ms);
+            stereo_markers.push_back(static_cast<int>(d->markers.size()));
+            left_markers.push_back(static_cast<int>(d->markers.size() + d->unmatched_left.size()));
+        }
+        auto median = [](auto v) {
+            using T = typename decltype(v)::value_type;
+            std::ranges::sort(v);
+            return v.empty() ? T{} : v[v.size() / 2];
+        };
+        std::println("  {} frames: valid depth median {:.1f}% (min {:.1f}%), stereo {:.1f} ms; markers median {} in the left image, {} stereo",
+                     valid.size(), 100 * median(valid), 100 * (valid.empty() ? 0.0 : std::ranges::min(valid)), median(stereo_ms),
+                     median(left_markers), median(stereo_markers));
+        check(!valid.empty() && median(valid) > 0.05, "depth from real IR");
+    }
+
+    if (texture_seconds > 0) {
+        std::println("== texture stream (1 IR + RGB) ==");
+        auto tex = stream("texture", 60, 6000, texture_seconds, true, 4);
+        report_images(tex, "texture");
+    }
+
+    if (button_seconds > 0) {
+        std::println("== buttons: press each scanner button (short and long) within {:.0f} s ==", button_seconds);
+        std::mutex bm;
+        std::vector<std::string> events;
+        Stopwatch bclock;
+        dev->set_button_sink([&](int button, device::ButtonAction action) {
+            std::lock_guard lock(bm);
+            events.push_back(std::format("{:.1f} s: button {} action {}", bclock.elapsed_ms() / 1000.0, button, static_cast<int>(action)));
+            std::println("  {}", events.back());
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(button_seconds * 1000)));
+        dev->set_button_sink({});
+        check(!events.empty(), "button events received", std::format("{}", events.size()));
+    }
+
+    dev->disconnect();  // triggers, laser and strobe off
+    std::println("== {} ({} failures); images and calibration in {} ==", failures ? "FAILED" : "all passed", failures, out.string());
+    return failures ? 1 : 0;
+}
+
+int fixture_pack(std::span<char*> args) {
+    namespace fs = std::filesystem;
+    const char* out_arg = arg_str(args, "--out");
+    if (!out_arg) return usage();
+    const fs::path out = out_arg;
+    auto packed_size = [](const fs::path& dir) {
+        std::uintmax_t n = 0;
+        for (const auto& e : fs::directory_iterator(dir)) n += e.file_size();
+        return static_cast<double>(n) / (1024.0 * 1024.0);
+    };
+    // Writes `tmp` into `dir` as `<name>.zst`.
+    auto pack = [](const fs::path& tmp, const fs::path& dir) -> bool {
+        if (auto r = fixtures::compress_file(tmp, dir / (tmp.filename().string() + ".zst")); !r) {
+            std::println(stderr, "{}", r.error().message);
+            return false;
+        }
+        return true;
+    };
+    const fs::path staging = fs::temp_directory_path() / std::format("einstar-fixture-pack-{}", ::getpid());
+    fs::create_directories(staging);
+
+    if (const char* src = arg_str(args, "--mustang")) {
+        const fs::path dir = out / "mustang";
+        fs::create_directories(dir);
+        auto full = fixtures::ExstarProject::open(src);
+        if (!full) {
+            std::println(stderr, "{}", full.error().message);
+            return 1;
+        }
+        const auto frames = fixtures::mustang_test_frames();
+        if (auto r = fixtures::write_project_subset(src, frames, staging / "Project1"); !r) {
+            std::println(stderr, "{}", r.error().message);
+            return 1;
+        }
+        for (const char* ext : {".data_base", ".data_cm", ".ir_E10_prj"})
+            if (!pack(staging / (std::string("Project1") + ext), dir)) return 1;
+        std::ofstream manifest(dir / "manifest.txt");
+        manifest << "# Excerpt of an EXStar recording (einstar-cli fixture-pack): the frames the tests read.\n"
+                 << "# frame i of Project1 is the recording's frame frames[i].\n"
+                 << "frame_count " << (*full)->frame_count() << "\nframes";
+        for (const auto f : frames) manifest << ' ' << f;
+        manifest << '\n';
+        if (const char* stl = arg_str(args, "--stl")) {
+            auto mesh = fixtures::load_stl(stl);
+            if (!mesh) {
+                std::println(stderr, "{}", mesh.error().message);
+                return 1;
+            }
+            // Only the part of EXStar's mesh the compared frames see (plus a margin).
+            Vec3f lo = Vec3f::Constant(1e30f), hi = Vec3f::Constant(-1e30f);
+            for (const auto i : fixtures::mustang_mesh_frames()) {
+                auto f = (*full)->read_frame(i);
+                if (!f) continue;
+                const Eigen::Matrix4f T = f->T_world_camera.matrix().cast<float>();
+                for (const auto& p : fixtures::unproject(*f, 8)) {
+                    const Vec3f w = (T * p.homogeneous()).head<3>();
+                    lo = lo.cwiseMin(w);
+                    hi = hi.cwiseMax(w);
+                }
+            }
+            const auto cropped = fixtures::crop(*mesh, lo - Vec3f::Constant(10), hi + Vec3f::Constant(10));
+            if (auto r = fixtures::write_stl(cropped, staging / "mesh.stl"); !r || !pack(staging / "mesh.stl", dir)) return 1;
+            std::println("mesh: {} of {} triangles", cropped.vertices.size() / 3, mesh->vertices.size() / 3);
+        }
+        std::println("{}: {} of {} frames, {:.1f} MiB", dir.string(), frames.size(), (*full)->frame_count(), packed_size(dir));
+    }
+
+    if (const char* board = arg_str(args, "--board")) {
+        const fs::path dir = out / "calibration_board";
+        fs::create_directories(dir);
+        int pairs = 0;
+        for (int k = 1; k <= 25; ++k) {
+            bool both = true;
+            for (const char* side : {"Left", "Right"})
+                both = both && fs::exists(fs::path(board) / std::format("image{}{}.bmp", side, k));
+            if (!both) continue;
+            for (const char* side : {"Left", "Right"}) {
+                const auto name = std::format("image{}{}.bmp", side, k);
+                if (auto r = fixtures::compress_file(fs::path(board) / name, dir / (name + ".zst")); !r) {
+                    std::println(stderr, "{}", r.error().message);
+                    return 1;
+                }
+            }
+            ++pairs;
+        }
+        std::println("{}: {} image pairs, {:.1f} MiB", dir.string(), pairs, packed_size(dir));
+    }
+    fs::remove_all(staging);
     return 0;
 }
 
@@ -689,6 +1115,9 @@ int main(int argc, char** argv) {
     if (cmd == "probe") return probe(has_flag(rest, "--verbose"));
     if (cmd == "sim-probe") return sim_probe();
     if (cmd == "calib" && argc >= 3) return calib_cmd(argv[2]);
+    if (cmd == "calib-dump" && argc >= 3) return calib_dump_cmd(argv[2]);
+    if (cmd == "hw-test") return hw_test(rest);
+    if (cmd == "fixture-pack") return fixture_pack(rest);
     if (cmd == "track-fixture" && argc >= 3) return track_fixture(argv[2], rest);
     if (cmd == "inspect" && argc >= 3) return inspect_cmd(argv[2]);
     if (cmd == "process" && argc >= 3) return process_cmd(argv[2], std::span<char*>(argv + 3, static_cast<std::size_t>(argc - 3)));

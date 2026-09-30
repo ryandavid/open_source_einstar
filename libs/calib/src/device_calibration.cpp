@@ -1,6 +1,8 @@
 #include "einstar/calib/device_calibration.hpp"
 
 #include <bit>
+#include <cctype>
+#include <filesystem>
 #include <cstring>
 #include <format>
 #include <fstream>
@@ -126,26 +128,55 @@ Result<DeviceCalibration> decode_ccf_files(std::span<const std::uint8_t> left_fi
     return cal;
 }
 
-Result<DeviceCalibration> decode_flash_blob(std::span<const std::uint8_t> blob) {
+Result<CcfFiles> extract_ccf_files(std::span<const std::uint8_t> blob) {
     if (blob.size() < kFlashBlobSize) return make_error(Errc::invalid_argument, "flash blob must be 6568 bytes");
     // Quick CCF section: type u32 @0x39B, three {name[260], i32 len, data[1024]} entries, tag FQFQ @0x12B7.
     constexpr std::size_t kQuick = 0x39B;
     if (load_le<std::uint32_t>(blob.data() + kQuick) != 4 || !tag_at(blob, 0x12B7, "FQFQ"))
         return make_error(Errc::not_found, "flash blob has no quick-calibration section");
-    auto entry = [&](int i) -> std::pair<std::span<const std::uint8_t>, std::string> {
+    auto entry = [&](int i) -> std::pair<std::vector<std::uint8_t>, std::string> {
         const std::size_t base = kQuick + 4 + static_cast<std::size_t>(i) * 0x508;
         const auto len = load_le<std::int32_t>(blob.data() + base + 260);
         const char* name = reinterpret_cast<const char*>(blob.data() + base);
         std::string label(name, strnlen(name, 260));
         const auto n = static_cast<std::size_t>(std::clamp(len, 0, 1024));
-        return {blob.subspan(base + 264, n), label};
+        const auto data = blob.subspan(base + 264, n);
+        return {std::vector<std::uint8_t>(data.begin(), data.end()), label};
     };
-    const auto [lf, ln] = entry(0);
-    const auto [rf, rn] = entry(1);
-    const auto [tf, tn] = entry(2);
-    auto cal = decode_ccf_files(lf, rf, tf);
+    CcfFiles f;
+    f.left = entry(0).first;
+    f.right = entry(1).first;
+    auto [tex, time] = entry(2);  // (the writer stores the calibration time in this entry's name)
+    f.tex = std::move(tex);
+    f.calibration_time = std::move(time);
+    return f;
+}
+
+Result<void> write_ccf_directory(const CcfFiles& files, const std::string& dir) {
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) return make_error(Errc::io, std::format("cannot create {}: {}", dir, ec.message()));
+    auto write = [&](const char* name, std::span<const std::uint8_t> bytes) -> Result<void> {
+        std::ofstream out(std::filesystem::path(dir) / name, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        if (!out) return make_error(Errc::io, std::format("cannot write {}/{}", dir, name));
+        return {};
+    };
+    const std::string time = files.calibration_time + "\n";
+    for (auto [name, bytes] : {std::pair{"LeftCCF.txt", std::span<const std::uint8_t>(files.left)},
+                               std::pair{"RightCCF.txt", std::span<const std::uint8_t>(files.right)},
+                               std::pair{"TexCCF.txt", std::span<const std::uint8_t>(files.tex)},
+                               std::pair{"calibration_time.txt", std::span(reinterpret_cast<const std::uint8_t*>(time.data()), time.size())}})
+        if (auto r = write(name, bytes); !r) return r;
+    return {};
+}
+
+Result<DeviceCalibration> decode_flash_blob(std::span<const std::uint8_t> blob) {
+    auto files = extract_ccf_files(blob);
+    if (!files) return std::unexpected(files.error());
+    auto cal = decode_ccf_files(files->left, files->right, files->tex);
     if (!cal) return cal;
-    cal->calibration_time = tn;
+    cal->calibration_time = files->calibration_time;
 
     // Colour section: two 81-byte records {u32 type, f32[15] ccm+offset+gain, f32[3] dark, "FBFB"}.
     if (tag_at(blob, 0x2F9 + 0x4C, "FBFB") && tag_at(blob, 0x2F9 + 81 + 0x4C, "FBFB")) {
@@ -203,7 +234,15 @@ Result<DeviceCalibration> load_ccf_directory(const std::string& dir) {
     if (!l) return std::unexpected(l.error());
     if (!r) return std::unexpected(r.error());
     if (!t) return std::unexpected(t.error());
-    return decode_ccf_files(*l, *r, *t);
+    auto cal = decode_ccf_files(*l, *r, *t);
+    if (cal) {
+        if (auto time = read_file(dir + "/calibration_time.txt")) {  // (written by write_ccf_directory)
+            cal->calibration_time.assign(time->begin(), time->end());
+            while (!cal->calibration_time.empty() && std::isspace(static_cast<unsigned char>(cal->calibration_time.back())))
+                cal->calibration_time.pop_back();
+        }
+    }
+    return cal;
 }
 
 }  // namespace einstar::calib

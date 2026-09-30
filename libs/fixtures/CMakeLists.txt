@@ -1,5 +1,5 @@
-add_library(einstar_fixtures src/exstar_project.cpp)
+add_library(einstar_fixtures src/exstar_project.cpp src/packaging.cpp)
 add_library(einstar::fixtures ALIAS einstar_fixtures)
 target_include_directories(einstar_fixtures PUBLIC include)
-target_link_libraries(einstar_fixtures PUBLIC einstar::core)
+target_link_libraries(einstar_fixtures PUBLIC einstar::core PRIVATE einstar_zstd)
 einstar_target_defaults(einstar_fixtures)

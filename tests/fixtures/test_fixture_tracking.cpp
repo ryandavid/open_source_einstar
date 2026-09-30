@@ -4,18 +4,17 @@
 #include <print>
 
 #include "einstar/fixtures/exstar_project.hpp"
+#include "real_data.hpp"
 #include "einstar/track/icp.hpp"
 #include "einstar/track/tsdf.hpp"
 
 using namespace einstar;
 
 TEST_CASE("fixture frames: model raycast and ICP between consecutive frames") {
-    const auto dir = std::filesystem::path(std::getenv("HOME")) / "Documents/EXStar/mustang_differential";
-    if (!std::filesystem::exists(dir / "Project1.data_base")) SKIP("mustang fixture not available");
-    auto proj = fixtures::ExstarProject::open(dir / "Project1.ir_E10_prj");
-    REQUIRE(proj.has_value());
-    auto f0 = (*proj)->read_frame(0);
-    auto f1 = (*proj)->read_frame(1);
+    const auto m = test_data::mustang();
+    if (!m) SKIP("mustang fixture not available (tests/fixtures/external/README.md)");
+    auto f0 = m->read(0);
+    auto f1 = m->read(1);
     REQUIRE((f0 && f1));
     const track::Intrinsics k{640, 512, f0->intrinsics.fx, f0->intrinsics.fy, f0->intrinsics.cx, f0->intrinsics.cy};
     const auto d0 = track::make_depth_frame(f0->depth, k);

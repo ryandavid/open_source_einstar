@@ -13,11 +13,9 @@ namespace einstar::e2e {
 
 
 inline RigCalibration einstar_like_rig() {
-    // Real calibration if EXStar's cache is present, otherwise a rig with the same geometry.
-    const char* cache = "/Applications/EXStar.app/Contents/Resources/res/Einscan-E10/200x150";
-    if (std::filesystem::exists(std::string(cache) + "/LeftCCF.txt"))
-        if (auto cal = calib::load_ccf_directory(cache)) return cal->rig();
-    return synth::synthetic_einstar_rig();
+    // The scanner's calibration (tests/fixtures), so the scenes are the same on every machine.
+    auto cal = calib::load_ccf_directory(EINSTAR_TEST_CALIBRATION_DIR);
+    return cal ? cal->rig() : synth::synthetic_einstar_rig();
 }
 
 // Scanner pose (left IR camera in world) for a frame: slow arc around the object.

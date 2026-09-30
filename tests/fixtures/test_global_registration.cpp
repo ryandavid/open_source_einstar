@@ -5,6 +5,7 @@
 
 #include "einstar/core/timing.hpp"
 #include "einstar/fixtures/exstar_project.hpp"
+#include "real_data.hpp"
 #include "einstar/track/global_registration.hpp"
 #include "einstar/track/icp.hpp"
 #include "einstar/track/tsdf.hpp"
@@ -12,15 +13,13 @@
 using namespace einstar;
 
 TEST_CASE("global registration finds fixture frames in a model built from other frames") {
-    const auto dir = std::filesystem::path(std::getenv("HOME")) / "Documents/EXStar/mustang_differential";
-    if (!std::filesystem::exists(dir / "Project1.data_base")) SKIP("mustang fixture not available");
-    auto proj = fixtures::ExstarProject::open(dir / "Project1.ir_E10_prj");
-    REQUIRE(proj.has_value());
+    const auto m = test_data::mustang();
+    if (!m) SKIP("mustang fixture not available (tests/fixtures/external/README.md)");
 
     track::TsdfVolume vol;
     track::Intrinsics k;
     for (std::size_t i = 0; i < 480; i += 4) {
-        auto f = (*proj)->read_frame(i);
+        auto f = m->read(i);
         REQUIRE(f.has_value());
         k = {640, 512, f->intrinsics.fx, f->intrinsics.fy, f->intrinsics.cx, f->intrinsics.cy};
         vol.integrate(track::make_depth_frame(f->depth, k), f->T_world_camera);
@@ -38,7 +37,7 @@ TEST_CASE("global registration finds fixture frames in a model built from other 
 
     int found = 0, correct = 0, tried = 0;
     for (std::size_t i = 2; i < 480; i += 40) {  // frames not used for the model (offset by 2)
-        auto f = (*proj)->read_frame(i);
+        auto f = m->read(i);
         REQUIRE(f.has_value());
         const auto df = track::make_depth_frame(f->depth, k);
         track::OrientedCloud cloud;

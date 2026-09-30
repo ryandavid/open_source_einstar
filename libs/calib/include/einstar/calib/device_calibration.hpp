@@ -68,6 +68,16 @@ decode_ccf_pair(std::span<const std::uint8_t> left_file, std::span<const std::ui
                                                          std::span<const std::uint8_t> tex_file);
 [[nodiscard]] Result<DeviceCalibration> decode_flash_blob(std::span<const std::uint8_t> blob);
 
+// The three CCF files stored in the flash blob's quick-calibration section: byte-for-byte what EXStar
+// writes to its cache directory (LeftCCF.txt, RightCCF.txt, TexCCF.txt).
+struct CcfFiles {
+    std::vector<std::uint8_t> left, right, tex;
+    std::string calibration_time;  // "yyyy-MM-dd hh:mm" if present
+};
+[[nodiscard]] Result<CcfFiles> extract_ccf_files(std::span<const std::uint8_t> blob);
+// Writes them (plus calibration_time.txt) to `dir`, creating it; load_ccf_directory() reads them back.
+[[nodiscard]] Result<void> write_ccf_directory(const CcfFiles& files, const std::string& dir);
+
 // Builds a flash blob holding the three CCF files in the quick-calibration section (for the device
 // emulator; never written to a real device).
 [[nodiscard]] std::vector<std::uint8_t> encode_quick_flash_blob(std::span<const std::uint8_t> left_file,

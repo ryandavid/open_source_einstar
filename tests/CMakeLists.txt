@@ -1,5 +1,12 @@
 include(Catch)
 
+# The Einstar's calibration (LeftCCF / RightCCF / TexCCF exactly as stored in the scanner's flash,
+# dumped with `einstar-cli calib-dump`), so tests run the same on every machine.
+add_compile_definitions(EINSTAR_TEST_CALIBRATION_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/calibration/einstar_e10")
+# Excerpts of real EXStar data (einstar-cli fixture-pack; see fixtures/external/README.md and support/real_data.hpp).
+add_compile_definitions(EINSTAR_TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/external")
+include_directories(support)
+
 function(einstar_add_test name)
   add_executable(${name} ${ARGN})
   target_link_libraries(${name} PRIVATE Catch2::Catch2WithMain)
@@ -25,7 +32,7 @@ target_link_libraries(test_usb PRIVATE einstar::usb)
 einstar_add_test(test_device device/test_device_sim.cpp)
 target_link_libraries(test_device PRIVATE einstar::device einstar::sim)
 
-einstar_add_test(test_fixtures fixtures/test_exstar_project.cpp fixtures/test_fixture_tracking.cpp fixtures/test_global_registration.cpp fixtures/test_symmetry_probe.cpp)
+einstar_add_test(test_fixtures fixtures/test_packaging.cpp fixtures/test_exstar_project.cpp fixtures/test_fixture_tracking.cpp fixtures/test_global_registration.cpp fixtures/test_symmetry_probe.cpp)
 target_link_libraries(test_fixtures PRIVATE einstar::fixtures einstar::track)
 
 einstar_add_test(test_track track/test_tsdf.cpp track/test_metal_tsdf.cpp track/test_relocaliser.cpp)
@@ -39,7 +46,7 @@ add_executable(debug_track pipeline/debug_track.cpp)
 target_link_libraries(debug_track PRIVATE einstar::pipeline einstar::synth)
 
 einstar_add_test(test_markers markers/test_markers.cpp)
-target_link_libraries(test_markers PRIVATE einstar::markers einstar::calib)
+target_link_libraries(test_markers PRIVATE einstar::markers einstar::calib einstar::fixtures)
 
 einstar_add_test(test_optim optim/test_marker_bundle.cpp)
 target_link_libraries(test_optim PRIVATE einstar::optim)

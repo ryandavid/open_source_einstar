@@ -35,7 +35,7 @@ static SE3 truth_pose(std::uint32_t frame) {
 
 int main(int argc, char** argv) {
     const int mode = argc > 1 ? std::atoi(argv[1]) : 0;
-    auto cal = calib::load_ccf_directory("/Applications/EXStar.app/Contents/Resources/res/Einscan-E10/200x150");
+    auto cal = calib::load_ccf_directory(EINSTAR_TEST_CALIBRATION_DIR);
     if (!cal) return 1;
     const auto rig = cal->rig();
     const SE3 T_left_right = rig.T_right_left.inverse();

@@ -23,11 +23,10 @@ struct Pair {
     ImageU8 left, right;
 };
 
-// Realistic pair: Einstar-like rig (real calibration when available), cluttered lit scene.
+// Realistic pair: the scanner's calibration (tests/fixtures), cluttered lit scene.
 Pair make_pair() {
     Pair p;
-    const char* cache = "/Applications/EXStar.app/Contents/Resources/res/Einscan-E10/200x150";
-    if (auto cal = calib::load_ccf_directory(cache)) {
+    if (auto cal = calib::load_ccf_directory(EINSTAR_TEST_CALIBRATION_DIR)) {
         p.rig = cal->rig();
     } else {
         auto& r = p.rig;
@@ -36,8 +35,8 @@ Pair make_pair() {
         r.left.fx = r.left.fy = r.right.fx = r.right.fy = 1157.3;
         r.left.cx = 625.4; r.left.cy = 522.4; r.right.cx = 633.8; r.right.cy = 506.0;
         SE3 T = SE3::Identity();
-        T.linear() = Eigen::AngleAxisd(-22.15 * M_PI / 180, Vec3::UnitY()).toRotationMatrix();
-        T.translation() = -T.linear() * Vec3(156.9, 0.2, -30.7);
+        T.linear() = Eigen::AngleAxisd(22.15 * M_PI / 180, Vec3::UnitY()).toRotationMatrix();
+        T.translation() = -T.linear() * Vec3(156.9, 0.2, 30.7);
         r.T_right_left = T;
     }
     const SE3 T_lr = p.rig.T_right_left.inverse();

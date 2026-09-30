@@ -14,7 +14,7 @@ using Catch::Matchers::WithinAbs;
 
 namespace {
 
-const char* kExstarCache = "/Applications/EXStar.app/Contents/Resources/res/Einscan-E10/200x150";
+const char* kExstarCache = EINSTAR_TEST_CALIBRATION_DIR;  // the scanner's calibration (tests/fixtures)
 
 std::vector<std::uint8_t> slurp(const std::string& p) {
     std::ifstream f(p, std::ios::binary);
@@ -60,7 +60,6 @@ TEST_CASE("obfuscation round trip on synthetic CCF files") {
 }
 
 TEST_CASE("decodes the real EXStar calibration cache") {
-    if (!std::filesystem::exists(std::string(kExstarCache) + "/LeftCCF.txt")) SKIP("EXStar calibration cache not installed");
     auto cal = calib::load_ccf_directory(kExstarCache);
     REQUIRE(cal.has_value());
     // Values documented in docs/calibration.md for the 2026-09-27 calibration.
@@ -107,4 +106,29 @@ TEST_CASE("real calibration rectifies to a usable stereo geometry") {
     INFO("disparity range " << d_far << " .. " << d_near << " px, f=" << rect.geometry.f << " cx=" << rect.rectified.cx);
     CHECK(d_far > 200);
     CHECK(d_near < 1100);
+}
+
+TEST_CASE("CCF files extracted from a flash blob are the stored files, and write back to a loadable directory") {
+    const std::string dir = kExstarCache;
+    const auto l = slurp(dir + "/LeftCCF.txt"), r = slurp(dir + "/RightCCF.txt"), t = slurp(dir + "/TexCCF.txt");
+    REQUIRE(l.size() == calib::kObfuscatedCcfSize);
+    const auto blob = calib::encode_quick_flash_blob(l, r, t, "2026-09-27 13:57");
+    auto files = calib::extract_ccf_files(blob);
+    REQUIRE(files.has_value());
+    CHECK(files->left == l);
+    CHECK(files->right == r);
+    CHECK(files->tex == t);
+    CHECK(files->calibration_time == "2026-09-27 13:57");
+
+    const auto out = std::filesystem::temp_directory_path() / "einstar_test_ccf_dump";
+    std::filesystem::remove_all(out);
+    REQUIRE(calib::write_ccf_directory(*files, out.string()).has_value());
+    auto reloaded = calib::load_ccf_directory(out.string());
+    auto direct = calib::decode_flash_blob(blob);
+    REQUIRE(reloaded.has_value());
+    REQUIRE(direct.has_value());
+    CHECK(reloaded->calibration_time == "2026-09-27 13:57");
+    CHECK(reloaded->rig().baseline_mm() == direct->rig().baseline_mm());
+    CHECK(reloaded->left.model.fx == direct->left.model.fx);
+    std::filesystem::remove_all(out);
 }

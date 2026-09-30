@@ -12,6 +12,7 @@
 
 #include "einstar/calib/device_calibration.hpp"
 #include "einstar/core/timing.hpp"
+#include "real_data.hpp"
 #include "einstar/markers/detect.hpp"
 #include "einstar/markers/stereo.hpp"
 
@@ -38,8 +39,7 @@ ImageU8 read_bmp8(const std::string& path) {
     return img;
 }
 
-const char* kCalImages = "/Applications/EXStar.app/Contents/Frameworks/Applications/EXStar.app/Contents/Resources/res/Einscan-E10/calibrate_image_read_rapid";
-const char* kCalCache = "/Applications/EXStar.app/Contents/Resources/res/Einscan-E10/200x150";
+const char* kCalCache = EINSTAR_TEST_CALIBRATION_DIR;
 
 }  // namespace
 
@@ -62,7 +62,9 @@ TEST_CASE("ellipse fit recovers a synthetic ellipse") {
 }
 
 TEST_CASE("markers on the real calibration board triangulate to the board pitch") {
-    if (!std::filesystem::exists(std::string(kCalImages) + "/imageLeft1.bmp")) SKIP("calibration captures not available");
+    const auto board = test_data::calibration_board();
+    if (!board) SKIP("calibration captures not available (tests/fixtures/external/README.md)");
+    const std::string kCalImages = board->string();
     auto cal = calib::load_ccf_directory(kCalCache);
     REQUIRE(cal.has_value());
     const auto rig = cal->rig();

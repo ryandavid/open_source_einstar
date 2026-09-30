@@ -9,6 +9,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "einstar/core/error.hpp"
@@ -49,6 +50,10 @@ public:
     [[nodiscard]] double baseline_mm() const { return baseline_; }
 
     Result<Frame> read_frame(std::size_t index, bool apply_deletion_flags = true) const;
+    // Byte range of the frame's block in the .data_base file (offset, size).
+    [[nodiscard]] std::pair<std::uint64_t, std::uint64_t> frame_block(std::size_t index) const {
+        return {blocks_[index].offset, blocks_[index].size};
+    }
 
 private:
     struct BlockRef {
