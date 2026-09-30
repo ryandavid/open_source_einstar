@@ -52,6 +52,11 @@ struct SimConfig {
     std::optional<std::uint8_t> previous_command_sequence, previous_bulk_sequence;
     // Fault injection: reply to (group << 8 | opcode) with this status instead of executing it.
     std::map<std::uint16_t, std::uint8_t> status_override;
+    // Fault injection on the next `flash_fault_count` 10/58 page writes: power lost after the erase (the
+    // page reads 0xFF), or one programmed byte wrong. The firmware reports neither.
+    enum class FlashFault : std::uint8_t { none, erased_only, corrupt_byte };
+    FlashFault flash_fault = FlashFault::none;
+    int flash_fault_count = 1;
     std::uint32_t seed = 7;
 };
 
@@ -91,6 +96,9 @@ public:
     [[nodiscard]] bool dangerous_command_seen() const { return dangerous_seen_.load(); }
     [[nodiscard]] int restarts() const { return restarts_.load(); }
     [[nodiscard]] bool on_bus() const;
+    // The emulated flash's user area (for assertions), and the 10/58 page writes executed.
+    [[nodiscard]] std::vector<std::uint8_t> flash(std::uint32_t offset, std::uint32_t size) const;
+    [[nodiscard]] int flash_page_writes() const;
 
     // Emulated state, decoded from the FPGA registers and sensor gain registers as the firmware's read
     // commands would report it.
@@ -146,6 +154,8 @@ private:
     bool ep83_halt_cleared_ = false;
     bool image_halted_ = false;
     std::vector<std::uint8_t> flash_;
+    int flash_page_writes_ = 0;
+    int flash_faults_left_ = 0;
     std::vector<ReceivedCommand> received_;
     std::optional<std::uint8_t> last_command_seq_, last_bulk_seq_;
     std::uint64_t dropped_repeats_ = 0;

@@ -220,7 +220,11 @@ laser timing, and FPGA-to-FX3 interface all re-implemented.
   the boot-mode pins allow USB fallback. Otherwise it leaves a device that needs an EEPROM programmer.
 * Neither the EEPROM nor the slots can be backed up through stock commands.
 
-Every one of these operations stays blocked in `DeviceGuard`.
+Every one of these operations stays blocked in `DeviceGuard`. The one exception is 10/58 for the
+calibration pages 0–1, sent only by `EinstarDevice::write_calibration_blob` / `restore_calibration_pages`
+(docs/calibration.md §8). Its handler (`user_page_write`, firmware/src/update.c; bulk table entry at
+0x40030330) checks page ≤ 255, erases the 4 KB sector at 0x400000 + page × 4096 (write-enable 0x06, then
+0x20) and programs the page; neither result is checked or reported.
 
 **Next steps if this is pursued:**
 1. Photograph the board: the FPGA part, the boot-mode (PMODE) pin straps, and whether the EEPROM

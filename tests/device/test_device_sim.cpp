@@ -455,3 +455,138 @@ TEST_CASE("brightness ladder") {
     CHECK(device::brightness_level(-5).exposure == device::brightness_level(0).exposure);
     CHECK(device::brightness_level(99).gain == device::brightness_level(device::kBrightnessLevels - 1).gain);
 }
+
+namespace {
+
+// Flash pages 0-1 with a recognisable pattern and a quick-calibration section (type 4, "FQFQ" tag).
+std::vector<std::uint8_t> calibration_pages() {
+    std::vector<std::uint8_t> pages(8192);
+    for (std::size_t i = 0; i < pages.size(); ++i) pages[i] = static_cast<std::uint8_t>(i * 31 + 7);
+    const std::uint8_t type[4] = {4, 0, 0, 0};
+    std::copy_n(type, 4, pages.begin() + 0x39B);
+    std::copy_n("FQFQ", 5, pages.begin() + 0x12B7);
+    return pages;
+}
+
+Harness flash_harness(sim::SimConfig cfg = {}) {
+    auto h = connect(cfg);
+    h.sim->set_flash(0, calibration_pages());
+    return h;
+}
+
+std::vector<std::uint8_t> with_new_quick_section(std::vector<std::uint8_t> pages) {
+    pages.resize(device::EinstarDevice::kCalibrationBlobSize);
+    for (std::size_t i = 0x3A0; i < 0xFC0; ++i) pages[i] = static_cast<std::uint8_t>(pages[i] ^ 0x5A);  // CCF entries
+    return pages;
+}
+
+}  // namespace
+
+TEST_CASE("calibration write: backup first, only the changed page, verified") {
+    auto h = flash_harness();
+    const auto old = calibration_pages();
+    const auto blob = with_new_quick_section(old);
+    std::vector<std::uint8_t> backup;
+    const auto r = h.dev->write_calibration_blob(blob, [&](std::span<const std::uint8_t> p) -> Result<void> {
+        CHECK(h.sim->flash_page_writes() == 0);  // before anything is written
+        backup.assign(p.begin(), p.end());
+        return {};
+    });
+    REQUIRE(r);
+    CHECK(*r == std::vector<int>{0});
+    CHECK(backup == old);
+    CHECK(h.sim->flash_page_writes() == 1);
+    const auto now = h.sim->flash(0, 8192);
+    CHECK(std::equal(blob.begin(), blob.end(), now.begin()));
+    CHECK(std::equal(old.begin() + 6568, old.end(), now.begin() + 6568));  // rest of page 1 untouched
+}
+
+TEST_CASE("calibration write refuses changes outside the quick section, a failed backup, and a running stream") {
+    auto h = flash_harness();
+    const auto old = calibration_pages();
+    auto ok_backup = [](std::span<const std::uint8_t>) -> Result<void> { return {}; };
+
+    auto factory = with_new_quick_section(old);
+    factory[0x100] ^= 1;  // factory section
+    CHECK(!h.dev->write_calibration_blob(factory, ok_backup));
+    auto wb = with_new_quick_section(old);
+    wb[0x12C0] ^= 1;  // white balance
+    CHECK(!h.dev->write_calibration_blob(wb, ok_backup));
+    auto untagged = with_new_quick_section(old);
+    untagged[0x12B7] = 'X';
+    CHECK(!h.dev->write_calibration_blob(untagged, ok_backup));
+    CHECK(!h.dev->write_calibration_blob(std::span(old).first(6000), ok_backup));
+
+    int called = 0;
+    const auto failed = h.dev->write_calibration_blob(with_new_quick_section(old), [&](std::span<const std::uint8_t>) -> Result<void> {
+        ++called;
+        return make_error(Errc::io, "disk full");
+    });
+    CHECK(!failed);
+    CHECK(called == 1);
+    CHECK(!h.dev->write_calibration_blob(with_new_quick_section(old), {}));
+
+    REQUIRE(h.dev->start_stream([](usb::FrameGroup&&) {}));
+    CHECK(!h.dev->write_calibration_blob(with_new_quick_section(old), ok_backup));
+    h.dev->stop_stream();
+
+    CHECK(h.sim->flash_page_writes() == 0);
+    CHECK(h.sim->flash(0, 8192) == old);
+}
+
+TEST_CASE("calibration write: a page that does not verify is written again") {
+    sim::SimConfig cfg;
+    cfg.flash_fault = sim::SimConfig::FlashFault::erased_only;  // first write: power lost after the erase
+    auto h = flash_harness(cfg);
+    const auto blob = with_new_quick_section(calibration_pages());
+    const auto r = h.dev->write_calibration_blob(blob, [](std::span<const std::uint8_t>) -> Result<void> { return {}; });
+    REQUIRE(r);
+    CHECK(h.sim->flash_page_writes() == 2);
+    const auto now = h.sim->flash(0, 6568);
+    CHECK(std::equal(blob.begin(), blob.end(), now.begin()));
+}
+
+TEST_CASE("calibration write: a page that never verifies is put back as it was") {
+    sim::SimConfig cfg;
+    cfg.flash_fault = sim::SimConfig::FlashFault::corrupt_byte;
+    cfg.flash_fault_count = 2;  // both attempts; the restore then succeeds
+    auto h = flash_harness(cfg);
+    const auto old = calibration_pages();
+    const auto r = h.dev->write_calibration_blob(with_new_quick_section(old), [](std::span<const std::uint8_t>) -> Result<void> { return {}; });
+    REQUIRE(!r);
+    CHECK(r.error().message.find("put back") != std::string::npos);
+    CHECK(h.sim->flash(0, 8192) == old);
+}
+
+TEST_CASE("calibration restore puts a backup back after an interrupted write") {
+    auto h = flash_harness();
+    const auto old = calibration_pages();
+    h.sim->set_flash(0, std::vector<std::uint8_t>(4096, 0xFF));  // page 0 erased, never programmed
+    const auto r = h.dev->restore_calibration_pages(old);
+    REQUIRE(r);
+    CHECK(*r == std::vector<int>{0});
+    CHECK(h.sim->flash(0, 8192) == old);
+    CHECK(!h.dev->restore_calibration_pages(std::vector<std::uint8_t>(8192, 0xFF)));  // not a calibration
+}
+
+TEST_CASE("calibration write is refused while the scanner is off the bus") {
+    auto h = flash_harness();
+    h.sim->reboot();
+    const auto r = h.dev->write_calibration_blob(with_new_quick_section(calibration_pages()),
+                                                 [](std::span<const std::uint8_t>) -> Result<void> { return {}; });
+    CHECK(!r);
+    CHECK(h.sim->flash_page_writes() == 0);
+    static_assert(!device::guard_allows(0x10, 0x58), "the generic path still blocks flash writes");
+}
+
+TEST_CASE("calibration write works after the scanner restarted and was reopened") {
+    auto h = connect({}, 20, true);
+    h.sim->set_flash(0, calibration_pages());
+    h.sim->reboot();
+    REQUIRE(wait_for([&] { return h.dev->reconnects() == 1 && h.dev->online(); }));
+    const auto blob = with_new_quick_section(calibration_pages());
+    const auto r = h.dev->write_calibration_blob(blob, [](std::span<const std::uint8_t>) -> Result<void> { return {}; });
+    REQUIRE(r);
+    const auto now = h.sim->flash(0, 6568);
+    CHECK(std::equal(blob.begin(), blob.end(), now.begin()));
+}

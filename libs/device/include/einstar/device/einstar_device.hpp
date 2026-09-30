@@ -126,6 +126,24 @@ public:
     Result<std::uint32_t> exposure(int sensor);
     Result<std::uint16_t> gain(int sensor);
 
+    // ---- calibration write (the only persistent write this API can make) ----
+    // Rewrites the quick-calibration section of the calibration blob in flash pages 0-1, as EXStar's
+    // quick calibration does (docs/protocol-device.md 3.12). `blob` is the complete new 6568-byte blob;
+    // it is refused unless it differs from the scanner's current blob only inside the quick section
+    // (kQuickSectionBegin..kQuickSectionEnd) and both carry the section's tag. Before anything is written
+    // the current pages 0-1 (8192 bytes) are handed to `save_backup`, which must succeed. Each changed
+    // page is written (the firmware erases its 4 KB sector and programs it, reporting no errors), read
+    // back and compared; a page that does not verify is written once more, then the old pages are put
+    // back. The stream must be stopped. Returns the pages written.
+    static constexpr std::size_t kCalibrationBlobSize = 6568;
+    static constexpr std::size_t kQuickSectionBegin = 0x39B, kQuickSectionEnd = 0x12BC;
+    static constexpr std::size_t kCalibrationPagesSize = 8192;
+    using BackupSink = std::function<Result<void>(std::span<const std::uint8_t> pages)>;
+    Result<std::vector<int>> write_calibration_blob(std::span<const std::uint8_t> blob, const BackupSink& save_backup);
+    // Puts back pages 0-1 saved by write_calibration_blob's backup (e.g. after an interrupted write).
+    // Refused unless the backup carries the quick-calibration section. Returns the pages rewritten.
+    Result<std::vector<int>> restore_calibration_pages(std::span<const std::uint8_t> backup);
+
     // ---- volatile configuration ----
     Result<void> set_trigger(int mono_count, int rgb_count);
     // kMinTriggerPeriodUs..kMaxTriggerPeriodUs, else invalid_argument (the firmware would ignore it
@@ -165,6 +183,10 @@ private:
         requires SafeOpcode<Op>
     Result<usb::Reply> send(std::span<const std::uint8_t> payload = {});
     Result<usb::Reply> send_checked(const OpcodeInfo& op, std::span<const std::uint8_t> payload, int attempts = 0);
+    // The send itself, after the guard. Called directly only by write_user_page (10/58 on pages 0-1).
+    Result<usb::Reply> send_unguarded(const OpcodeInfo& op, std::span<const std::uint8_t> payload, int attempts = 0);
+    // Writes one 4 KB calibration page (0 or 1 only), reads it back and compares.
+    Result<void> write_user_page(int page, std::span<const std::uint8_t> data);
 
     Result<void> identify(DeviceInfo& out);
     Result<std::string> read_string(const OpcodeInfo& op);

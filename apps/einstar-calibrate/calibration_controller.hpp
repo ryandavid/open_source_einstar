@@ -4,6 +4,7 @@
 // the capture plan, auto-capture, the solve, and saving. The UI (main.mm) only reads snapshots and
 // calls these methods; the work runs on a detection worker and a solver thread.
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <filesystem>
@@ -109,9 +110,28 @@ public:
     [[nodiscard]] SolveState solve_state() const;
     // Writes calibration.txt (and report.txt) to the session folder.
     Result<std::filesystem::path> save_result();
-    // Makes the saved result the one the Einstar app scans with (instead of the flash), or reverts.
-    Result<void> use_for_scanning(bool use);
-    [[nodiscard]] std::filesystem::path active_calibration_path() const;
+    // ---- writing the result into the scanner (as EXStar's quick calibration does) ----
+    struct Gate {
+        std::string what;
+        bool ok = false;
+    };
+    struct WritePlan {
+        std::optional<calibrate::FlashUpdate> update;  // the new blob (only its quick section differs)
+        std::vector<Gate> gates;                       // all must pass
+        std::string reference_view;                    // the board pose the stored extrinsics refer to
+        std::filesystem::path backup_path;             // where the current pages 0-1 will be saved
+        std::string error;
+        [[nodiscard]] bool ready() const {
+            return update && std::ranges::all_of(gates, [](const Gate& g) { return g.ok; });
+        }
+    };
+    [[nodiscard]] WritePlan plan_write() const;
+    // Writes the plan into the scanner's flash (stream paused; backup first; read back and verified),
+    // then re-reads the calibration from the scanner. The Einstar app reads it at connect.
+    Result<std::string> write_to_scanner(const WritePlan& plan);
+    // Puts a backup made by write_to_scanner back.
+    Result<std::string> restore_backup(const std::filesystem::path& file);
+    [[nodiscard]] const std::vector<std::uint8_t>& flash_blob() const { return flash_blob_; }
 
 private:
     void on_group(usb::FrameGroup&& g);
@@ -126,6 +146,9 @@ private:
     std::string description_, serial_;
     std::optional<RigCalibration> flash_, factory_;
     std::string flash_time_;
+    std::vector<std::uint8_t> flash_blob_;  // the scanner's 6568-byte calibration blob, as last read
+    Result<void> reread_flash();
+    Result<void> resume_stream();
     RigCalibration guidance_rig_;
     std::shared_ptr<void> emulator_;  // emulator scene state (see .cpp)
 

@@ -9,6 +9,7 @@
 
 #include <Eigen/Dense>
 
+#include "einstar/calib/device_calibration.hpp"
 #include "einstar/calib/rectify.hpp"
 #include "einstar/calibrate/plan.hpp"
 #include "einstar/optim/stereo_calibration.hpp"
@@ -83,6 +84,7 @@ CalibrationReport make_report(const RigCalibration& rig, const Views& v, const s
         vr.row_rms_px = std::sqrt(vrow / n);
         const auto m = measure_board(Tl, rig, board);
         vr.distance_mm = m.distance_mm, vr.tilt_x_deg = m.tilt_x_deg, vr.tilt_y_deg = m.tilt_y_deg;
+        vr.T_left_board = Tl;
         ss += vs, rows += vrow, r.dots += vr.dots;
         r.views.push_back(vr);
     }
@@ -336,9 +338,50 @@ Result<CalibrationFile> read_calibration_file(const std::string& path) {
     return c;
 }
 
-std::filesystem::path active_calibration_path(const std::string& serial) {
-    const char* home = std::getenv("HOME");
-    return std::filesystem::path(home ? home : ".") / "Documents" / "Einstar" / "Calibration" / (serial.empty() ? "unknown" : serial) / "active.txt";
+Result<FlashUpdate> build_flash_update(std::span<const std::uint8_t> current, const RigCalibration& rig, const SE3& T_left_world,
+                                       const std::string& calibration_time, std::uint32_t seed) {
+    auto old = calib::decode_flash_blob(current);
+    if (!old) return make_error(Errc::invalid_argument, "the scanner's calibration does not decode: " + old.error().message);
+    const RigCalibration old_rig = old->rig();
+    calib::DeviceCalibration cal = *old;
+    auto camera = [&](const CameraModel& m, const SE3& T_cam_world, double rms) {
+        calib::CameraCalibration c;
+        c.model = m;
+        c.R_cam_world = T_cam_world.linear();
+        c.t_cam_world = T_cam_world.translation();
+        c.rms_error = rms;
+        return c;
+    };
+    cal.left = camera(rig.left, T_left_world, 0);
+    cal.right = camera(rig.right, rig.T_right_left * T_left_world, 0);
+    cal.texture = camera(old->texture.model, old_rig.T_texture_left * T_left_world, old->texture.rms_error);
+    cal.calibration_time = calibration_time;
+    const auto files = calib::encode_ccf_files(cal, seed);
+    auto blob = calib::replace_quick_section(current, files);
+    if (!blob) return std::unexpected(blob.error());
+
+    // What was built must decode to what was asked for.
+    const auto back = calib::decode_flash_blob(*blob);
+    if (!back) return make_error(Errc::invalid_argument, "internal error: the new calibration does not decode: " + back.error().message);
+    const RigCalibration b = back->rig();
+    const auto d = compare_calibrations(rig, b);
+    if (d.left.mapping_px > 1e-6 || d.right.mapping_px > 1e-6 || d.rotation_deg.norm() > 1e-9 || d.translation_mm.norm() > 1e-9)
+        return make_error(Errc::invalid_argument, "internal error: the new calibration decodes differently");
+    if ((b.T_texture_left.translation() - old_rig.T_texture_left.translation()).norm() > 1e-9 ||
+        Eigen::AngleAxisd(b.T_texture_left.linear() * old_rig.T_texture_left.linear().transpose()).angle() > 1e-12)
+        return make_error(Errc::invalid_argument, "internal error: the colour camera would move");
+    if (back->calibration_time != calibration_time) return make_error(Errc::invalid_argument, "internal error: calibration time");
+
+    FlashUpdate u;
+    u.blob = std::move(*blob);
+    u.calibration_time = calibration_time;
+    for (int page = 0; page < 2; ++page) {
+        const std::size_t lo = static_cast<std::size_t>(page) * 4096, hi = std::min<std::size_t>(lo + 4096, u.blob.size());
+        if (!std::equal(u.blob.begin() + static_cast<std::ptrdiff_t>(lo), u.blob.begin() + static_cast<std::ptrdiff_t>(hi), current.begin() + static_cast<std::ptrdiff_t>(lo)))
+            u.pages.push_back(page);
+    }
+    return u;
 }
+
 
 }  // namespace einstar::calibrate

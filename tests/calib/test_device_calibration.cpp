@@ -132,3 +132,80 @@ TEST_CASE("CCF files extracted from a flash blob are the stored files, and write
     CHECK(reloaded->left.model.fx == direct->left.model.fx);
     std::filesystem::remove_all(out);
 }
+
+TEST_CASE("CCF encoding decodes back to the calibration it was made from") {
+    const auto cal = calib::load_ccf_directory(kExstarCache);
+    REQUIRE(cal);
+    for (const std::uint32_t seed : {1u, 2u, 12345u}) {
+        auto files = calib::encode_ccf_files(*cal, seed);
+        REQUIRE(files.left.size() == calib::kObfuscatedCcfSize);
+        REQUIRE(files.right.size() == calib::kObfuscatedCcfSize);
+        REQUIRE(files.tex.size() == calib::kPlainCcfSize);
+        const auto back = calib::decode_ccf_files(files.left, files.right, files.tex);
+        REQUIRE(back);
+        for (const auto& [a, b] : {std::pair{&cal->left, &back->left}, std::pair{&cal->right, &back->right}, std::pair{&cal->texture, &back->texture}}) {
+            CHECK_THAT(b->model.fx, WithinAbs(a->model.fx, 1e-9));
+            CHECK_THAT(b->model.fy, WithinAbs(a->model.fy, 1e-9));
+            CHECK_THAT(b->model.cx, WithinAbs(a->model.cx, 1e-9));
+            CHECK_THAT(b->model.cy, WithinAbs(a->model.cy, 1e-9));
+            CHECK_THAT(b->model.skew, WithinAbs(a->model.skew, 1e-9));
+            for (std::size_t k = 0; k < 5; ++k) CHECK_THAT(b->model.dist[k], WithinAbs(a->model.dist[k], 1e-12));
+            CHECK((b->R_cam_world - a->R_cam_world).norm() < 1e-12);
+            CHECK((b->t_cam_world - a->t_cam_world).norm() < 1e-9);
+        }
+        CHECK_THAT(back->texture.rms_error, WithinAbs(cal->texture.rms_error, 1e-15));
+        // The stored doubles really are offset (not plain copies).
+        double fx_stored = 0;
+        std::memcpy(&fx_stored, files.left.data(), 8);
+        const auto* tail = files.left.data() + calib::kPlainCcfSize;
+        CHECK(std::any_of(tail, tail + 256, [](std::uint8_t v) { return v != 0; }));
+        (void)fx_stored;
+    }
+}
+
+TEST_CASE("replacing the quick section changes nothing else in the blob") {
+    const auto l = slurp(std::string(kExstarCache) + "/LeftCCF.txt"), r = slurp(std::string(kExstarCache) + "/RightCCF.txt"),
+               t = slurp(std::string(kExstarCache) + "/TexCCF.txt");
+    auto blob = calib::encode_quick_flash_blob(l, r, t, "2026-09-27 13:57");
+    // Other sections filled with a pattern, so any stray write shows.
+    for (std::size_t i = 0; i < blob.size(); ++i)
+        if (i < calib::kQuickSectionOffset || i >= calib::kQuickSectionOffset + calib::kQuickSectionSize) blob[i] = static_cast<std::uint8_t>(i * 7 + 3);
+
+    auto cal = calib::decode_flash_blob(blob);
+    REQUIRE(cal);
+    cal->left.model.fx += 1.5;
+    cal->right.R_cam_world = Eigen::AngleAxisd(0.004, Vec3::UnitX()).toRotationMatrix() * cal->right.R_cam_world;
+    cal->calibration_time = "2026-09-30 12:34";
+    const auto files = calib::encode_ccf_files(*cal, 99);
+    const auto updated = calib::replace_quick_section(blob, files);
+    REQUIRE(updated);
+    REQUIRE(updated->size() == blob.size());
+    for (std::size_t i = 0; i < blob.size(); ++i)
+        if (i < calib::kQuickSectionOffset || i >= calib::kQuickSectionOffset + calib::kQuickSectionSize) REQUIRE((*updated)[i] == blob[i]);
+    const auto back = calib::decode_flash_blob(*updated);
+    REQUIRE(back);
+    CHECK(back->calibration_time == "2026-09-30 12:34");
+    CHECK_THAT(back->left.model.fx, WithinAbs(cal->left.model.fx, 1e-9));
+    CHECK((back->right.R_cam_world - cal->right.R_cam_world).norm() < 1e-12);
+
+    // Rejected: wrong sizes, a blob without the section.
+    auto bad = files;
+    bad.left.pop_back();
+    CHECK(!calib::replace_quick_section(blob, bad));
+    std::vector<std::uint8_t> empty(calib::kFlashBlobSize, 0);
+    CHECK(!calib::replace_quick_section(empty, files));
+    CHECK(!calib::replace_quick_section(std::span(blob).first(100), files));
+}
+
+TEST_CASE("the quick section of the scanner's flash rebuilds byte for byte") {
+    // The dump of the scanner's flash is local (fixtures-data/, not in the repository).
+    const std::string path = std::string(EINSTAR_TEST_CALIBRATION_DIR) + "/../../../../fixtures-data/scanner-2026-09-30/flash_blob.bin";
+    if (!std::filesystem::exists(path)) SKIP("no local flash dump");
+    const auto blob = slurp(path);
+    REQUIRE(blob.size() == calib::kFlashBlobSize);
+    const auto files = calib::extract_ccf_files(blob);
+    REQUIRE(files);
+    const auto rebuilt = calib::replace_quick_section(blob, *files);
+    REQUIRE(rebuilt);
+    CHECK(*rebuilt == blob);  // same layout, name fields and padding as EXStar's writer
+}

@@ -11,6 +11,7 @@
 #include <array>
 #include <filesystem>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -40,6 +41,7 @@ struct ViewReport {
     double row_rms_px = 0;       // rectified row difference left vs right
     double distance_mm = 0;      // board centre from the scanner
     double tilt_x_deg = 0, tilt_y_deg = 0;
+    SE3 T_left_board = SE3::Identity();
     bool used = true;
 };
 
@@ -80,7 +82,19 @@ struct CalibrationDiff {
 };
 [[nodiscard]] CalibrationDiff compare_calibrations(const RigCalibration& a, const RigCalibration& b);
 
-// Host-side calibration file (text). The scanner's flash is never written.
+// The scanner's calibration blob with its quick-calibration section replaced by a solve result, as
+// EXStar's quick calibration does (docs/calibration.md 1.2): Left/Right from the solve, the colour
+// camera's intrinsics and its pose relative to the left camera kept from `current`, the world frame
+// the board at `T_left_world` (EXStar: its first, face-on view). Only builds and checks bytes.
+struct FlashUpdate {
+    std::vector<std::uint8_t> blob;   // the full 6568 bytes to store
+    std::vector<int> pages;           // 4 KB flash pages that differ from `current` (0 and / or 1)
+    std::string calibration_time;
+};
+[[nodiscard]] Result<FlashUpdate> build_flash_update(std::span<const std::uint8_t> current, const RigCalibration& rig, const SE3& T_left_world,
+                                                     const std::string& calibration_time, std::uint32_t seed);
+
+// Calibration file (text): the record of a solve, readable by einstar-cli wherever it takes a calibration.
 struct CalibrationFile {
     RigCalibration rig;
     std::string serial;
@@ -91,8 +105,5 @@ struct CalibrationFile {
 };
 [[nodiscard]] Result<void> write_calibration_file(const std::string& path, const CalibrationFile& file);
 [[nodiscard]] Result<CalibrationFile> read_calibration_file(const std::string& path);
-// Where einstar-calibrate puts the calibration a scanner should scan with instead of its flash
-// ($HOME/Documents/Einstar/Calibration/<serial>/active.txt); the Einstar app uses it when present.
-[[nodiscard]] std::filesystem::path active_calibration_path(const std::string& serial);
 
 }  // namespace einstar::calibrate

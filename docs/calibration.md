@@ -466,10 +466,24 @@ in the repo.
   only the board poses fitted, and compared parameter by parameter. Rectified row error is the number
   that matters for stereo.
 * **Output**: captures are saved as `imageLeftN.pgm` / `imageRightN.pgm` / `imageTexN.pgm` (EXStar's naming)
-  under `~/Documents/Einstar/Calibration/<serial>/<time>/`, plus `calibration.txt` (text, OpenCV convention)
-  and `report.txt`. "Use for scanning" copies it to `<serial>/active.txt`, which the Einstar app then uses
-  instead of the flash (its status line names the calibration in use); "Revert to flash" removes it.
-  `einstar-cli` accepts the file wherever it takes a calibration.
+  under `~/Documents/Einstar/Calibration/<serial>/<time>/`, plus `calibration.txt` (text, OpenCV convention;
+  `einstar-cli` accepts it wherever it takes a calibration) and `report.txt`, as a record.
+* **Writing to the scanner** ("Write to scanner…"), as EXStar's quick calibration does (docs/protocol-device.md
+  3.12): the quick section (§1.2) is rebuilt from the solve (`calibrate::build_flash_update`: Left/Right CCFs
+  obfuscated with fresh 0..9 tables, the colour camera's intrinsics and pose relative to the left camera
+  kept, the world frame the nearest face-on board view, the time `yyyy-MM-dd hh:mm`) and checked to decode
+  back to the solve. Rebuilding the section of the scanner's own flash dump from its files reproduces it
+  byte for byte. The write needs five checks to pass (≥ 15 views, rectified rows < 0.15 px, reprojection
+  < 0.5 px, intrinsics and the camera pair near the current calibration) and a confirmation.
+  `EinstarDevice::write_calibration_blob` then refuses any change outside the quick section, saves pages
+  0–1 (`flash-backup-<time>.bin`, 8192 bytes, next to the sessions) before writing, writes the changed
+  page(s) with 10/58 (in practice only page 0), reads each back and compares, writes once more if it does
+  not verify and puts the old pages back if it still does not. "Restore a backup…" writes a backup back.
+  The firmware's 10/58 erases one 4 KB sector at 0x400000 + page × 4096 and programs it, with no error
+  report (docs/firmware.md 5), so the read-back is the only check. The generic opcode guard still blocks
+  10/58; only this path sends it, for pages 0 and 1. The Einstar app reads the calibration from the flash
+  at connect, so it scans with the new one from the next connection; EXStar refreshes its cache from the
+  flash the same way.
 * **Emulator**: the board is rendered through a rig whose right camera has moved (0.25°, cy +1.5 px, fx
   +0.8 px) since the calibration in the emulated flash. The virtual scanner moves to each asked-for pose,
   so the whole procedure runs unattended (`EinstarCalibration --snapshot out.png --complete`). It recovers

@@ -248,6 +248,16 @@ std::string choose_path() {
     return {};
 }
 
+std::string choose_file() {
+    NSOpenPanel* panel = [NSOpenPanel openPanel];
+    panel.canChooseDirectories = NO;
+    panel.canChooseFiles = YES;
+    panel.allowsMultipleSelection = NO;
+    panel.message = @"Choose a calibration backup (flash-backup-*.bin)";
+    if ([panel runModal] == NSModalResponseOK) return panel.URL.path.UTF8String;
+    return {};
+}
+
 bool write_png(id<MTLTexture> tex, const char* path) {
     const NSUInteger w = tex.width, h = tex.height;
     std::vector<std::uint8_t> px(w * h * 4);
@@ -477,6 +487,7 @@ int main(int argc, char** argv) {
     const char* snapshot_path = nullptr;
     double snapshot_seconds = 6.0;
     bool snapshot_complete = false;
+    bool snapshot_write = false;
     std::string snapshot_tab;
     std::string load_dir, reference_path;  // --load <captures dir> [--reference <calibration>]: offline
     for (int i = 1; i < argc; ++i) {
@@ -486,6 +497,7 @@ int main(int argc, char** argv) {
             if (i + 2 < argc && argv[i + 2][0] != '-') snapshot_seconds = std::atof(argv[i + 2]);
         }
         if (a == "--complete") snapshot_complete = true;
+        if (a == "--write") snapshot_write = true;  // with --complete: write the result into the (emulated) scanner
         if (a == "--tab" && i + 1 < argc) snapshot_tab = argv[i + 1];
         if (a == "--load" && i + 1 < argc) load_dir = argv[i + 1];
         if (a == "--reference" && i + 1 < argc) reference_path = argv[i + 1];
@@ -545,6 +557,9 @@ int main(int argc, char** argv) {
         if (snapshot_tab == "live") tab_request = 0;
     }
     bool solve_requested = false;
+    app::CalibrationController::WritePlan write_plan;
+    bool write_confirmed = false;
+    std::string write_result, restore_path;
 
     while (!glfwWindowShouldClose(window)) {
         @autoreleasepool {
@@ -771,23 +786,80 @@ int main(int argc, char** argv) {
                     if (auto r = ctl.save_result(); !r) error = r.error().message;
                 }
                 ImGui::SameLine();
-                const bool active = std::filesystem::exists(ctl.active_calibration_path());
-                ImGui::BeginDisabled(!ctl.connected() || ctl.emulated());
-                const bool use_clicked = ImGui::Button("Use for scanning");
+                ImGui::BeginDisabled(!ctl.connected() || st.running);
+                if (ImGui::Button("Write to scanner...")) {
+                    write_plan = ctl.plan_write();
+                    write_confirmed = false;
+                    write_result.clear();
+                    ImGui::OpenPopup("Write calibration to scanner");
+                }
                 ImGui::EndDisabled();
-                if (use_clicked) {
-                    if (auto r = ctl.use_for_scanning(true); !r) error = r.error().message;
-                }
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                    ImGui::SetTooltip("The Einstar app will scan with this calibration instead of the one in the scanner (%s). The scanner is not written to. "
-                                      "Needs the real scanner connected.",
-                                                              ctl.active_calibration_path().c_str());
-                if (active) {
-                    ImGui::SameLine();
-                    if (ImGui::Button("Revert to flash")) (void)ctl.use_for_scanning(false);
-                }
+                    ImGui::SetTooltip("Stores this calibration in the scanner, replacing the current one, as EXStar's calibration does. "
+                                      "A backup of the current one is saved first.");
                 if (!st.saved_path.empty()) ImGui::TextWrapped("Saved %s", st.saved_path.c_str());
-                if (active) ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1), "The Einstar app uses a host calibration for this scanner.");
+            }
+            if (ctl.connected()) {
+                if (ImGui::Button("Restore a backup...")) {
+                    restore_path = choose_file();
+                    if (!restore_path.empty()) {
+                        write_result.clear();
+                        ImGui::OpenPopup("Restore calibration backup");
+                    }
+                }
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Puts a flash-backup-*.bin saved before a write back into the scanner.");
+            }
+            // ---- write confirmation ----
+            ImGui::SetNextWindowSize(ImVec2(640, 0), ImGuiCond_Appearing);
+            if (ImGui::BeginPopupModal("Write calibration to scanner", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+                if (!write_plan.error.empty()) {
+                    ImGui::TextColored(ImVec4(1, 0.45f, 0.35f, 1), "%s", write_plan.error.c_str());
+                } else {
+                    ImGui::TextWrapped("Replaces the calibration stored in the scanner (currently %s) with this one, dated %s. Only the "
+                                       "quick-calibration section changes, as with EXStar's calibration; the factory, colour and white-balance "
+                                       "data stay as they are.",
+                                       ctl.flash_time().c_str(), write_plan.update ? write_plan.update->calibration_time.c_str() : "-");
+                    ImGui::Separator();
+                    for (const auto& g : write_plan.gates)
+                        ImGui::TextColored(g.ok ? ImVec4(0.4f, 0.9f, 0.5f, 1) : ImVec4(1, 0.45f, 0.35f, 1), "%s  %s", g.ok ? "ok  " : "FAIL", g.what.c_str());
+                    ImGui::Separator();
+                    if (write_plan.update) {
+                        std::string pages;
+                        for (const int pg : write_plan.update->pages) pages += std::format("{}{}", pages.empty() ? "" : ", ", pg);
+                        ImGui::Text("Flash page(s) written: %s (4 KB each, erased and rewritten, then read back)", pages.empty() ? "none" : pages.c_str());
+                    }
+                    ImGui::Text("Extrinsics refer to the board in %s", write_plan.reference_view.c_str());
+                    ImGui::TextWrapped("Backup of the current calibration: %s", write_plan.backup_path.c_str());
+                    ImGui::TextDisabled("Keep the scanner connected until this finishes (a second or two).");
+                    if (ctl.emulated()) ImGui::TextColored(ImVec4(0.6f, 0.8f, 1, 1), "Emulator: writes the emulated flash only.");
+                    ImGui::BeginDisabled(!write_plan.ready());
+                    ImGui::Checkbox("Replace the scanner's calibration", &write_confirmed);
+                    ImGui::EndDisabled();
+                }
+                if (!write_result.empty()) ImGui::TextWrapped("%s", write_result.c_str());
+                ImGui::BeginDisabled(!write_plan.ready() || !write_confirmed || !write_result.empty());
+                if (ImGui::Button("Write", ImVec2(120, 0))) {
+                    auto r = ctl.write_to_scanner(write_plan);
+                    write_result = r ? *r : "FAILED: " + r.error().message;
+                }
+                ImGui::EndDisabled();
+                ImGui::SameLine();
+                if (ImGui::Button(write_result.empty() ? "Cancel" : "Close", ImVec2(120, 0))) ImGui::CloseCurrentPopup();
+                ImGui::EndPopup();
+            }
+            // ---- restore confirmation ----
+            if (ImGui::BeginPopupModal("Restore calibration backup", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+                ImGui::TextWrapped("Put %s back into the scanner (currently %s)?", restore_path.c_str(), ctl.flash_time().c_str());
+                if (!write_result.empty()) ImGui::TextWrapped("%s", write_result.c_str());
+                ImGui::BeginDisabled(!write_result.empty());
+                if (ImGui::Button("Restore", ImVec2(120, 0))) {
+                    auto r = ctl.restore_backup(restore_path);
+                    write_result = r ? *r : "FAILED: " + r.error().message;
+                }
+                ImGui::EndDisabled();
+                ImGui::SameLine();
+                if (ImGui::Button(write_result.empty() ? "Cancel" : "Close", ImVec2(120, 0))) ImGui::CloseCurrentPopup();
+                ImGui::EndPopup();
             }
             ImGui::Separator();
             if (ImGui::Button("Load captures folder...")) {
@@ -848,6 +920,19 @@ int main(int argc, char** argv) {
                     if (clock.elapsed_ms() > 240000) ready = true;
                 } else {
                     ready = clock.elapsed_ms() > snapshot_seconds * 1000.0;
+                }
+                if (ready && snapshot_frames < 0 && snapshot_write && st.ours) {
+                    snapshot_write = false;
+                    const auto plan = ctl.plan_write();
+                    for (const auto& g : plan.gates) std::println("gate {}: {}", g.ok ? "ok  " : "FAIL", g.what);
+                    if (!plan.error.empty()) std::println("plan: {}", plan.error);
+                    const auto r = ctl.write_to_scanner(plan);
+                    std::println("write: {}", r ? *r : "FAILED: " + r.error().message);
+                    if (ctl.flash_rig()) {
+                        const auto d = calibrate::compare_calibrations(st.ours->rig, *ctl.flash_rig());
+                        std::println("scanner now holds {}: vs the solve, rig {:.2e} deg, ray mapping {:.2e} / {:.2e} px", ctl.flash_time(),
+                                     d.rotation_deg.norm(), d.left.mapping_px, d.right.mapping_px);
+                    }
                 }
                 if (ready && snapshot_frames < 0) {
                     snapshot_frames = 3;  // a few frames for the layout to settle

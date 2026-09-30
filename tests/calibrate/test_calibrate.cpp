@@ -2,6 +2,8 @@
 
 #include <cmath>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <print>
 
 #include "einstar/calib/device_calibration.hpp"
@@ -161,4 +163,37 @@ TEST_CASE("calibration file round trip") {
     CHECK(std::abs(back->rig.right.dist[4] - f.rig.right.dist[4]) < 1e-9);
     CHECK(rotation_deg(back->rig.T_right_left, f.rig.T_right_left) < 1e-8);
     CHECK((back->rig.T_texture_left.translation() - f.rig.T_texture_left.translation()).norm() < 1e-6);
+}
+
+TEST_CASE("a solve becomes a flash blob that decodes to it and keeps everything else") {
+    const auto l = calib::load_ccf_directory(EINSTAR_TEST_CALIBRATION_DIR);
+    REQUIRE(l);
+    auto read = [](const std::string& p) {
+        std::ifstream f(p, std::ios::binary);
+        return std::vector<std::uint8_t>(std::istreambuf_iterator<char>(f), {});
+    };
+    const std::string dir = EINSTAR_TEST_CALIBRATION_DIR;
+    auto blob = calib::encode_quick_flash_blob(read(dir + "/LeftCCF.txt"), read(dir + "/RightCCF.txt"), read(dir + "/TexCCF.txt"), "2026-09-27 13:57");
+    for (std::size_t i = 0; i < 0x39B; ++i) blob[i] = static_cast<std::uint8_t>(i * 13 + 1);  // stand-in factory / colour data
+    const RigCalibration old = l->rig();
+    RigCalibration ours = old;
+    ours.right.cy += 2.0;
+    ours.left.dist[0] += 0.003;
+    ours.T_right_left.linear() = Eigen::AngleAxisd(0.003, Vec3::UnitX()).toRotationMatrix() * ours.T_right_left.linear();
+    SE3 world = SE3::Identity();
+    world.translation() = Vec3(-60, -50, 200);
+    const auto u = build_flash_update(blob, ours, world, "2026-09-30 12:00", 7);
+    REQUIRE(u);
+    CHECK(u->pages == std::vector<int>{0});  // the CCF data and time all lie below 0x1000
+    for (std::size_t i = 0; i < 0x39B; ++i) REQUIRE(u->blob[i] == blob[i]);
+    for (std::size_t i = 0x12BC; i < blob.size(); ++i) REQUIRE(u->blob[i] == blob[i]);
+    const auto back = calib::decode_flash_blob(u->blob);
+    REQUIRE(back);
+    const auto d = compare_calibrations(ours, back->rig());
+    CHECK(d.left.mapping_px < 1e-6);
+    CHECK(d.right.mapping_px < 1e-6);
+    CHECK(d.rotation_deg.norm() < 1e-9);
+    CHECK(rotation_deg(back->rig().T_texture_left, old.T_texture_left) < 1e-9);
+    CHECK((back->left.t_cam_world - world.translation()).norm() < 1e-9);
+    CHECK(!build_flash_update(std::vector<std::uint8_t>(calib::kFlashBlobSize, 0), ours, world, "x", 1));
 }

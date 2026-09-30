@@ -8,6 +8,7 @@
 #include <fstream>
 #include <iterator>
 #include <algorithm>
+#include <random>
 
 namespace einstar::calib {
 namespace {
@@ -229,6 +230,64 @@ Result<DeviceCalibration> decode_flash_blob(std::span<const std::uint8_t> blob) 
         cal->white_balance = wb;
     }
     return cal;
+}
+
+std::array<double, kCcfDoubles> ccf_doubles(const CameraCalibration& c) {
+    std::array<double, kCcfDoubles> d{};
+    d[0] = c.model.fx;
+    d[1] = c.model.fy;
+    d[4] = c.model.cx;
+    d[5] = c.model.cy;
+    d[8] = c.model.fx != 0 ? c.model.skew / c.model.fx : 0.0;  // alpha, dimensionless
+    for (std::size_t i = 0; i < 5; ++i) d[10 + i] = c.model.dist[i];
+    for (int i = 0; i < 3; ++i) d[static_cast<std::size_t>(20 + i)] = c.t_cam_world(i);
+    for (int i = 0; i < 9; ++i) d[static_cast<std::size_t>(23 + i)] = c.R_cam_world(i / 3, i % 3);
+    d[32] = c.rms_error;
+    return d;
+}
+
+CcfFiles encode_ccf_files(const DeviceCalibration& cal, std::uint32_t seed) {
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<std::int32_t> digit(0, 9);  // EXStar: rand() % 10 per entry
+    std::array<std::int32_t, kCcfTailInts> tl{}, tr{};
+    for (auto& v : tl) v = digit(rng);
+    for (auto& v : tr) v = digit(rng);
+    std::array<double, kCcfTailInts> key{};
+    for (const auto [k, sign] : kKeySigns) key[static_cast<std::size_t>(k)] = tl[static_cast<std::size_t>(k)] + sign * tr[static_cast<std::size_t>(k)];
+    auto obfuscated = [&](const CameraCalibration& c, const std::array<std::int32_t, kCcfTailInts>& tail) {
+        auto d = ccf_doubles(c);
+        d[32] = 0;  // Left/Right carry no error fields
+        for (const auto [field, k, sign] : kFieldKeys) d[static_cast<std::size_t>(field)] += sign * key[static_cast<std::size_t>(k)];
+        std::vector<std::uint8_t> out(kObfuscatedCcfSize);
+        std::memcpy(out.data(), d.data(), kPlainCcfSize);
+        std::memcpy(out.data() + kPlainCcfSize, tail.data(), kCcfTailInts * 4);
+        return out;
+    };
+    CcfFiles f;
+    f.left = obfuscated(cal.left, tl);
+    f.right = obfuscated(cal.right, tr);
+    const auto t = ccf_doubles(cal.texture);
+    f.tex.resize(kPlainCcfSize);
+    std::memcpy(f.tex.data(), t.data(), kPlainCcfSize);
+    f.calibration_time = cal.calibration_time;
+    return f;
+}
+
+Result<std::vector<std::uint8_t>> replace_quick_section(std::span<const std::uint8_t> blob, const CcfFiles& files) {
+    if (blob.size() != kFlashBlobSize) return make_error(Errc::invalid_argument, "flash blob must be 6568 bytes");
+    if (load_le<std::uint32_t>(blob.data() + kQuickSectionOffset) != 4 || !tag_at(blob, 0x12B7, "FQFQ"))
+        return make_error(Errc::invalid_argument, "flash blob has no quick-calibration section to replace");
+    if (files.left.size() != kObfuscatedCcfSize || files.right.size() != kObfuscatedCcfSize || files.tex.size() != kPlainCcfSize)
+        return make_error(Errc::invalid_argument, "CCF files have the wrong sizes");
+    if (files.calibration_time.size() > 259) return make_error(Errc::invalid_argument, "calibration time too long");
+    std::vector<std::uint8_t> out(blob.begin(), blob.end());
+    std::fill_n(out.begin() + static_cast<std::ptrdiff_t>(kQuickSectionOffset), kQuickSectionSize, std::uint8_t{0});
+    const auto quick = encode_quick_flash_blob(files.left, files.right, files.tex, files.calibration_time);
+    std::copy_n(quick.begin() + static_cast<std::ptrdiff_t>(kQuickSectionOffset), kQuickSectionSize, out.begin() + static_cast<std::ptrdiff_t>(kQuickSectionOffset));
+    for (std::size_t i = 0; i < out.size(); ++i)
+        if ((i < kQuickSectionOffset || i >= kQuickSectionOffset + kQuickSectionSize) && out[i] != blob[i])
+            return make_error(Errc::invalid_argument, std::format("internal error: byte {} outside the quick section would change", i));
+    return out;
 }
 
 std::vector<std::uint8_t> encode_quick_flash_blob(std::span<const std::uint8_t> l, std::span<const std::uint8_t> r,

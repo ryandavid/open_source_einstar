@@ -114,7 +114,7 @@ Result<void> CalibrationController::connect(bool emulator) {
         transport = std::move(*t);
         opts.reopen = [info] { return usb::reopen_libusb(info); };
     } else {
-        auto sim = std::make_shared<sim::SimDevice>();
+        auto sim = std::make_shared<sim::SimDevice>();  // its flash takes 10/58 writes as the scanner's does
         emu = std::make_shared<Emulator>();
         RigCalibration stored = synth::synthetic_einstar_rig();
         for (const char* dir : {kExstarCalibrationCache, EINSTAR_CALIBRATION_FIXTURE}) {
@@ -154,19 +154,11 @@ Result<void> CalibrationController::connect(bool emulator) {
     if (!dev) return std::unexpected(dev.error());
     const auto& info = (*dev)->info();
     serial_ = info.serial;
-    auto blob = (*dev)->read_flash(0, calib::kFlashBlobSize);
-    flash_.reset();
-    factory_.reset();
-    flash_time_.clear();
-    if (blob) {
-        if (auto cal = calib::decode_flash_blob(*blob)) flash_ = cal->rig(), flash_time_ = cal->calibration_time;
-        if (auto cal = calib::decode_factory_section(*blob)) factory_ = cal->rig();
-    }
-    guidance_rig_ = flash_ ? *flash_ : synth::synthetic_einstar_rig();
     emulated_ = emulator;
     emulator_ = emu;
     description_ = std::format("{} {} (serial {}, firmware {})", emulator ? "Emulated" : "Scanner", info.product_name, info.serial, info.firmware);
     device_ = std::move(*dev);
+    if (auto r = reread_flash(); !r) log::warn("calibration: {}", r.error().message);
     device_->set_button_sink([this](int button, device::ButtonAction a) {
         if (button == 1 && a == device::ButtonAction::single_click) capture_now();  // start / pause: capture
     });
@@ -174,13 +166,9 @@ Result<void> CalibrationController::connect(bool emulator) {
         disconnect();
         return r;
     }
-    if (auto r = device_->configure_texture_mode(100000); !r) {
-        disconnect();
-        return r;
-    }
     (void)device_->set_indication(device::DistanceIndication::zone2);
     worker_ = std::jthread([this](std::stop_token st) { worker_loop(st); });
-    if (auto r = device_->start_stream([this](usb::FrameGroup&& g) { on_group(std::move(g)); }); !r) {
+    if (auto r = resume_stream(); !r) {
         disconnect();
         return r;
     }
@@ -191,6 +179,25 @@ Result<void> CalibrationController::connect(bool emulator) {
     }
     new_session_dir();
     return {};
+}
+
+Result<void> CalibrationController::reread_flash() {
+    flash_.reset();
+    factory_.reset();
+    flash_time_.clear();
+    flash_blob_.clear();
+    auto blob = device_->read_flash(0, calib::kFlashBlobSize);
+    if (!blob) return std::unexpected(blob.error());
+    flash_blob_ = *blob;
+    if (auto cal = calib::decode_flash_blob(*blob)) flash_ = cal->rig(), flash_time_ = cal->calibration_time;
+    if (auto cal = calib::decode_factory_section(*blob)) factory_ = cal->rig();
+    guidance_rig_ = flash_ ? *flash_ : synth::synthetic_einstar_rig();
+    return {};
+}
+
+Result<void> CalibrationController::resume_stream() {
+    if (auto r = device_->configure_texture_mode(100000); !r) return r;
+    return device_->start_stream([this](usb::FrameGroup&& g) { on_group(std::move(g)); });
 }
 
 void CalibrationController::disconnect() {
@@ -530,25 +537,96 @@ Result<fs::path> CalibrationController::save_result() {
     return path;
 }
 
-fs::path CalibrationController::active_calibration_path() const { return calibrate::active_calibration_path(serial_); }
-
-Result<void> CalibrationController::use_for_scanning(bool use) {
-    const auto active = active_calibration_path();
-    std::error_code ec;
-    if (use && (emulated_ || !device_))
-        return make_error(Errc::invalid_argument, "Only a calibration made with the scanner connected can be used for scanning");
-    if (!use) {
-        fs::remove(active, ec);
-        return {};
-    }
+CalibrationController::WritePlan CalibrationController::plan_write() const {
+    WritePlan p;
     const auto st = solve_state();
-    if (st.saved_path.empty()) {
-        if (auto r = save_result(); !r) return std::unexpected(r.error());
+    if (!device_) return p.error = "Connect the scanner first.", p;
+    if (!st.ours) return p.error = "Solve first.", p;
+    if (flash_blob_.empty() || !flash_) return p.error = "The scanner's current calibration could not be read.", p;
+    const auto& o = *st.ours;
+    const int used = static_cast<int>(std::ranges::count_if(o.views, &calibrate::ViewReport::used));
+    const auto d = calibrate::compare_calibrations(*flash_, o.rig);
+    auto gate = [&](bool ok, std::string what) { p.gates.push_back({std::move(what), ok}); };
+    gate(used >= 15, std::format("{} views solved (at least 15)", used));
+    gate(o.row_rms_px < 0.15, std::format("rectified rows {:.3f} px (below 0.15)", o.row_rms_px));
+    gate(o.rms_px < 0.5, std::format("reprojection {:.3f} px (below 0.5)", o.rms_px));
+    const double df = std::max({std::abs(d.left.dfx), std::abs(d.left.dfy), std::abs(d.right.dfx), std::abs(d.right.dfy)});
+    const double dc = std::max({std::abs(d.left.dcx), std::abs(d.left.dcy), std::abs(d.right.dcx), std::abs(d.right.dcy)});
+    gate(df < 20 && dc < 25, std::format("intrinsics close to the current calibration (focal {:.1f} px, centre {:.1f} px apart)", df, dc));
+    gate(d.rotation_deg.norm() < 1.0 && std::abs(d.baseline_mm) < 2.0,
+         std::format("camera pair close to the current calibration ({:.2f} deg, baseline {:+.2f} mm)", d.rotation_deg.norm(), d.baseline_mm));
+
+    // Extrinsics refer to a board pose, as EXStar's do (its first, face-on, nearest view).
+    const calibrate::ViewReport* ref = nullptr;
+    for (std::size_t i = 0; i < o.views.size(); ++i) {
+        const auto& v = o.views[i];
+        if (!v.used) continue;
+        const bool face_on = std::abs(v.tilt_x_deg) < 12 && std::abs(v.tilt_y_deg) < 12;
+        if (!ref || (face_on && (!(std::abs(ref->tilt_x_deg) < 12 && std::abs(ref->tilt_y_deg) < 12) || v.distance_mm < ref->distance_mm))) ref = &v;
     }
-    fs::create_directories(active.parent_path(), ec);
-    fs::copy_file(solve_state().saved_path, active, fs::copy_options::overwrite_existing, ec);
-    if (ec) return make_error(Errc::io, std::format("cannot write {}: {}", active.string(), ec.message()));
-    return {};
+    if (!ref) return p.error = "No usable view.", p;
+    p.reference_view = std::format("{} ({:.0f} mm)", ref->name, ref->distance_mm);
+    auto u = calibrate::build_flash_update(flash_blob_, o.rig, ref->T_left_board, now_string("%Y-%m-%d %H:%M"),
+                                           static_cast<std::uint32_t>(std::random_device{}()));
+    if (!u) return p.error = u.error().message, p;
+    p.update = std::move(*u);
+    p.backup_path = calibration_root() / (emulated_ ? "emulator" : serial_) / std::format("flash-backup-{}.bin", now_string("%Y-%m-%d_%H%M%S"));
+    return p;
+}
+
+Result<std::string> CalibrationController::write_to_scanner(const WritePlan& plan) {
+    if (!device_) return make_error(Errc::invalid_argument, "not connected");
+    if (!plan.ready()) return make_error(Errc::invalid_argument, "the write plan did not pass its checks");
+    device_->stop_stream();
+    auto backup = [&](std::span<const std::uint8_t> pages) -> Result<void> {
+        std::error_code ec;
+        fs::create_directories(plan.backup_path.parent_path(), ec);
+        {
+            std::ofstream f(plan.backup_path, std::ios::binary);
+            f.write(reinterpret_cast<const char*>(pages.data()), static_cast<std::streamsize>(pages.size()));
+            f.flush();
+            if (!f) return make_error(Errc::io, std::format("cannot write {}", plan.backup_path.string()));
+        }
+        std::ifstream check(plan.backup_path, std::ios::binary);
+        const std::vector<std::uint8_t> back((std::istreambuf_iterator<char>(check)), {});
+        if (!std::ranges::equal(back, pages)) return make_error(Errc::io, std::format("{} did not read back", plan.backup_path.string()));
+        return {};
+    };
+    const auto written = device_->write_calibration_blob(plan.update->blob, backup);
+    std::string msg;
+    if (written) {
+        msg = std::format("Calibration {} written to the scanner (page{} {}); backup {}", plan.update->calibration_time, written->size() == 1 ? "" : "s",
+                          written->empty() ? std::string("none: unchanged") : std::format("{}", written->front()), plan.backup_path.string());
+    }
+    // Whatever happened, show what the scanner holds now.
+    const auto reread = reread_flash();
+    if (written && (!reread || !flash_ || flash_blob_ != plan.update->blob))
+        msg += "; WARNING: the calibration read back from the scanner differs from what was written";
+    if (auto r = resume_stream(); !r) log::warn("stream: {}", r.error().message);
+    {
+        std::lock_guard lk(state_mutex_);
+        status_ = written ? msg : "Write failed: " + written.error().message;
+    }
+    if (!written) return std::unexpected(written.error());
+    log::info("{}", msg);
+    return msg;
+}
+
+Result<std::string> CalibrationController::restore_backup(const fs::path& file) {
+    if (!device_) return make_error(Errc::invalid_argument, "not connected");
+    std::ifstream f(file, std::ios::binary);
+    const std::vector<std::uint8_t> pages((std::istreambuf_iterator<char>(f)), {});
+    if (pages.size() != device::EinstarDevice::kCalibrationPagesSize) return make_error(Errc::invalid_argument, "not a calibration backup (8192 bytes)");
+    if (!calib::decode_flash_blob(std::span(pages).first(calib::kFlashBlobSize))) return make_error(Errc::invalid_argument, "the backup's calibration does not decode");
+    device_->stop_stream();
+    const auto r = device_->restore_calibration_pages(pages);
+    (void)reread_flash();
+    if (auto s = resume_stream(); !s) log::warn("stream: {}", s.error().message);
+    if (!r) return std::unexpected(r.error());
+    const auto msg = std::format("Restored {} ({} page{} rewritten); the scanner's calibration is now {}", file.string(), r->size(), r->size() == 1 ? "" : "s", flash_time_);
+    std::lock_guard lk(state_mutex_);
+    status_ = msg;
+    return msg;
 }
 
 }  // namespace einstar::app

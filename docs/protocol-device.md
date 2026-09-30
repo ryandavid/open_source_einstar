@@ -423,8 +423,11 @@ Logic-layer execute names seen in the log, `ReadData(offset, size)` and
   3. For each page send `ss 00 10 58 00 00 10 02 p_hi p_lo <4096 bytes>`
      (length 0x1002, 5120-byte buffer, reply capacity 1024).
 
-  There is no separate erase command, so the firmware presumably erases on
-  write. Write failures are **ignored** (the function still returns 0).
+  There is no separate erase command: the firmware erases the page's 4 KB
+  sector and programs it (`user_page_write`, firmware/src/update.c), and
+  reports neither result. Write failures are **ignored** (the function still
+  returns 0). Our write path reads every page back instead
+  (docs/calibration.md §8).
   EXStar did this once in the logged session: `WriteData` at offset 923,
   3873 bytes, pages 0–1, followed by `ReloadCustomInfo`.
 * **Blob layout (partial)** [M]. Fields read by `reloadCustomInfo` (0xa364)

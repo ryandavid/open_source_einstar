@@ -89,6 +89,22 @@ struct CcfFiles {
                                                                 const std::string& calibration_time);
 [[nodiscard]] Result<std::vector<std::uint8_t>> encode_quick_flash_blob_from_directory(const std::string& dir);
 
+// ---- Encoding (the inverse of the decoders above) ----
+// The quick-calibration section's extent in the blob: EXStar rewrites exactly these bytes (its
+// logged WriteData(923, 3873)); everything else in the blob stays as it is.
+inline constexpr std::size_t kQuickSectionOffset = 0x39B;
+inline constexpr std::size_t kQuickSectionSize = 0xF21;
+
+// One camera as its 33 CCF doubles (plain, before obfuscation; error fields 0).
+[[nodiscard]] std::array<double, kCcfDoubles> ccf_doubles(const CameraCalibration& camera);
+// LeftCCF / RightCCF (obfuscated with fresh 0..9 offset tables from `seed`, as EXStar's writer does)
+// and TexCCF (plain), for a calibration whose world frame is a reference board pose.
+[[nodiscard]] CcfFiles encode_ccf_files(const DeviceCalibration& calibration, std::uint32_t seed);
+// `blob` with its quick-calibration section rebuilt from `files` (type, entries, calibration time,
+// tag). Refuses a blob that is not 6568 bytes or has no quick section; the result is checked to differ
+// from `blob` only inside the section.
+[[nodiscard]] Result<std::vector<std::uint8_t>> replace_quick_section(std::span<const std::uint8_t> blob, const CcfFiles& files);
+
 // Reads LeftCCF.txt / RightCCF.txt / TexCCF.txt from a directory (e.g. EXStar's cache).
 [[nodiscard]] Result<DeviceCalibration> load_ccf_directory(const std::string& dir);
 

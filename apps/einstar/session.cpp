@@ -7,7 +7,6 @@
 #include <format>
 
 #include "einstar/calib/device_calibration.hpp"
-#include "einstar/calibrate/solve.hpp"
 #include "einstar/core/log.hpp"
 #include "einstar/sim/sim_transport.hpp"
 #include "einstar/synth/demo.hpp"
@@ -112,27 +111,17 @@ Result<std::unique_ptr<Session>> Session::open(bool force_emulator, UpdateSink u
 
     // Calibration straight from the scanner's flash (read-only).
     RigCalibration rig;
+    std::string calibration_source = "flash";
     auto blob = s->device_->read_flash(0, calib::kFlashBlobSize);
     if (!blob) return std::unexpected(blob.error());
     if (auto cal = calib::decode_flash_blob(*blob)) {
         rig = cal->rig();
+        calibration_source = std::format("flash, {}", cal->calibration_time);
         log::info("calibration {} from device flash, baseline {:.3f} mm", cal->calibration_time, rig.baseline_mm());
     } else if (s->emulated_) {
         rig = emu->rig;
     } else {
         return make_error(Errc::protocol, "could not decode the scanner's calibration: " + cal.error().message);
-    }
-    // A host-side calibration made with einstar-calibrate ("Use for scanning") replaces the flash one.
-    std::string calibration_source = "flash";
-    // (Not for the emulator: it renders through the flash calibration, and reports the real unit's serial.)
-    if (const auto host = calibrate::active_calibration_path(s->device_->info().serial); !s->emulated_ && std::filesystem::exists(host)) {
-        if (auto file = calibrate::read_calibration_file(host.string())) {
-            rig = file->rig;
-            calibration_source = std::format("host file {} ({})", host.string(), file->created);
-            log::info("calibration from {} ({}, rows {:.3f} px) instead of the flash", host.string(), file->created, file->row_rms_px);
-        } else {
-            log::warn("ignoring {}: {}", host.string(), file.error().message);
-        }
     }
 
     pipeline::ScanPipelineParams pp;

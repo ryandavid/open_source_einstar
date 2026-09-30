@@ -86,6 +86,7 @@ struct ReplyBuilder {
 SimDevice::SimDevice(SimConfig config) : config_(std::move(config)), flash_(1u << 20, 0xFF), rng_(config_.seed) {
     last_command_seq_ = config_.previous_command_sequence;
     last_bulk_seq_ = config_.previous_bulk_sequence;
+    flash_faults_left_ = config_.flash_fault_count;
     power_on_locked();
     provider_ = [](int sensor, std::uint32_t frame_id, ImageU8& out) {
         // Default content: a moving gradient so frames are distinguishable.
@@ -136,6 +137,18 @@ bool SimDevice::alive_locked(std::uint64_t generation) const {
 bool SimDevice::alive(std::uint64_t generation) const {
     std::lock_guard lock(mutex_);
     return alive_locked(generation);
+}
+
+std::vector<std::uint8_t> SimDevice::flash(std::uint32_t offset, std::uint32_t size) const {
+    std::lock_guard lock(mutex_);
+    const auto end = std::min<std::size_t>(flash_.size(), static_cast<std::size_t>(offset) + size);
+    if (offset >= end) return {};
+    return {flash_.begin() + offset, flash_.begin() + static_cast<std::ptrdiff_t>(end)};
+}
+
+int SimDevice::flash_page_writes() const {
+    std::lock_guard lock(mutex_);
+    return flash_page_writes_;
 }
 
 bool SimDevice::on_bus() const {
@@ -426,11 +439,18 @@ std::vector<std::uint8_t> SimDevice::handle_bulk(std::span<const std::uint8_t> r
             usb::write_be32(reply, 5, 4096);
             std::copy_n(flash_.begin() + static_cast<std::ptrdiff_t>(page) * 4096, 4096, reply.begin() + 9);
             return status(kOk);
-        case 0x1058:  // only a zero length is rejected; always writes 4096 bytes after the page number
+        case 0x1058: {  // only a zero length is rejected; erases the 4 KB sector, then programs the 4096 bytes
             if (length == 0 || page > 255) return status(kBadLength);
-            std::copy_n(req.begin() + 10, 4096, flash_.begin() + static_cast<std::ptrdiff_t>(page) * 4096);
+            const auto at = flash_.begin() + static_cast<std::ptrdiff_t>(page) * 4096;
+            std::fill_n(at, 4096, std::uint8_t{0xFF});
+            ++flash_page_writes_;
+            const bool fault = flash_faults_left_ > 0 && config_.flash_fault != SimConfig::FlashFault::none;
+            if (fault) --flash_faults_left_;
+            if (!fault || config_.flash_fault != SimConfig::FlashFault::erased_only) std::copy_n(req.begin() + 10, 4096, at);
+            if (fault && config_.flash_fault == SimConfig::FlashFault::corrupt_byte) at[1234] = static_cast<std::uint8_t>(at[1234] ^ 0x10);
             usb::write_be32(reply, 5, 4);
-            return status(kOk);
+            return status(kOk);  // (erase / program results are not reported)
+        }
         case 0x0006:  // firmware update: not emulated
             return status(kFailed);
         default:

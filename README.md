@@ -16,9 +16,10 @@ Older Command Line Tools keep `std::jthread` experimental; CMake detects that an
 ## Run
 - `build/default/apps/Einstar.app` — GUI; uses the scanner if attached, otherwise the built-in emulator.
 - `build/default/apps/EinstarCalibration.app` — guided calibration of the IR pair from the calibration board
-  (EXStar's 25 views: live guidance, auto-capture, solve, comparison with the scanner's stored calibration;
-  "Use for scanning" makes the Einstar app use the result, the scanner's flash is never written). Works with
-  the emulator, or offline on a folder of captures. See docs/calibration.md §8.
+  (EXStar's 25 views: live guidance, auto-capture, solve, comparison with the scanner's stored calibration,
+  and "Write to scanner…", which stores the result in the scanner as EXStar's calibration does, after a
+  backup, with read-back verification). Works with the emulator, or offline on a folder of captures. See
+  docs/calibration.md §8.
 - `build/default/apps/einstar-cli calib-solve <captures dir> --reference <calibration>` — the same solve and
   comparison from the command line (einstar-calibrate's or EXStar's `imageLeftN` folders).
 - `build/default/apps/einstar-cli probe --verbose` — read-only scanner check (first contact with hardware).

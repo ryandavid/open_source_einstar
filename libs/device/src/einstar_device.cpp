@@ -5,6 +5,7 @@
 #include <optional>
 #include <random>
 #include <chrono>
+#include <cstring>
 #include <format>
 #include <utility>
 
@@ -111,6 +112,10 @@ Result<usb::Reply> EinstarDevice::send(std::span<const std::uint8_t> payload) {
 Result<usb::Reply> EinstarDevice::send_checked(const OpcodeInfo& op, std::span<const std::uint8_t> payload, int attempts) {
     if (!guard_allows(op.group, op.opcode))
         return make_error(Errc::blocked, std::format("opcode {:02X}/{:02X} ({}) is blocked", op.group, op.opcode, op.name));
+    return send_unguarded(op, payload, attempts);
+}
+
+Result<usb::Reply> EinstarDevice::send_unguarded(const OpcodeInfo& op, std::span<const std::uint8_t> payload, int attempts) {
     // While offline only the heartbeat (probing, reattaching, replaying) talks to the scanner.
     const auto t = transport();
     if (!t || (!online_ && std::this_thread::get_id() != heartbeat_id_.load()))
@@ -220,6 +225,88 @@ Result<std::vector<std::uint8_t>> EinstarDevice::read_flash(std::uint32_t offset
         out.insert(out.end(), r->raw.begin() + 9 + from, r->raw.begin() + 9 + to);
     }
     return out;
+}
+
+Result<void> EinstarDevice::write_user_page(int page, std::span<const std::uint8_t> data) {
+    constexpr std::size_t kPage = 4096;
+    if ((page != 0 && page != 1) || data.size() != kPage) return make_error(Errc::blocked, "only calibration pages 0 and 1 can be written");
+    std::vector<std::uint8_t> payload{static_cast<std::uint8_t>(page >> 8), static_cast<std::uint8_t>(page)};
+    payload.insert(payload.end(), data.begin(), data.end());
+    log::warn("writing flash page {} (calibration)", page);
+    if (auto r = send_unguarded(op::kFlashWrite, payload); !r) return std::unexpected(r.error());
+    // The firmware reports no erase / program errors: the read-back is the only check.
+    auto back = read_flash(static_cast<std::uint32_t>(page) * kPage, kPage);
+    if (!back) return make_error(back.error().code, std::format("flash page {} written but not read back: {}", page, back.error().message));
+    if (!std::ranges::equal(*back, data)) return make_error(Errc::io, std::format("flash page {} did not verify after writing", page));
+    return {};
+}
+
+namespace {
+
+// The quick-calibration section's type (u32 4) and tag ("FQFQ\0"), docs/calibration.md 1.2.
+bool has_quick_section(std::span<const std::uint8_t> b) {
+    constexpr std::size_t kType = 0x39B, kTag = 0x12B7;
+    return b.size() >= kTag + 5 && std::memcmp(b.data() + kTag, "FQFQ", 5) == 0 && b[kType] == 4 && b[kType + 1] == 0 &&
+           b[kType + 2] == 0 && b[kType + 3] == 0;
+}
+
+}  // namespace
+
+Result<std::vector<int>> EinstarDevice::write_calibration_blob(std::span<const std::uint8_t> blob, const BackupSink& save_backup) {
+    constexpr std::size_t kPage = 4096;
+    if (streaming_) return make_error(Errc::busy, "stop the stream before writing the calibration");
+    if (blob.size() != kCalibrationBlobSize) return make_error(Errc::invalid_argument, "calibration blob must be 6568 bytes");
+    if (!has_quick_section(blob)) return make_error(Errc::invalid_argument, "new calibration blob has no quick-calibration section");
+    auto current = read_flash(0, kCalibrationPagesSize);
+    if (!current) return std::unexpected(current.error());
+    if (!has_quick_section(*current))
+        return make_error(Errc::blocked, "the scanner's flash has no quick-calibration section: not writing over unknown contents");
+    for (std::size_t i = 0; i < blob.size(); ++i)
+        if ((i < kQuickSectionBegin || i >= kQuickSectionEnd) && blob[i] != (*current)[i])
+            return make_error(Errc::blocked, std::format("refused: byte {:#x} outside the quick-calibration section would change", i));
+    if (!save_backup) return make_error(Errc::invalid_argument, "a backup is required");
+    if (auto r = save_backup(*current); !r) return make_error(r.error().code, "backup failed, nothing written: " + r.error().message);
+
+    std::vector<std::uint8_t> next = *current;
+    std::ranges::copy(blob, next.begin());
+    std::vector<int> written;
+    for (int page = 0; page < 2; ++page) {
+        const std::span<const std::uint8_t> want(next.data() + page * kPage, kPage), old(current->data() + page * kPage, kPage);
+        if (std::ranges::equal(want, old)) continue;
+        auto r = write_user_page(page, want);
+        if (!r) {
+            log::warn("{}; writing page {} once more", r.error().message, page);
+            r = write_user_page(page, want);
+        }
+        if (!r) {
+            // Put back every page touched so far.
+            std::string outcome = "the previous calibration was put back";
+            for (int p = 0; p <= page; ++p)
+                if (auto back = write_user_page(p, std::span<const std::uint8_t>(current->data() + p * kPage, kPage)); !back)
+                    outcome = std::format("page {} could NOT be put back ({}): restore it from the backup", p, back.error().message);
+            return make_error(r.error().code, std::format("{}; {}", r.error().message, outcome));
+        }
+        written.push_back(page);
+    }
+    return written;
+}
+
+Result<std::vector<int>> EinstarDevice::restore_calibration_pages(std::span<const std::uint8_t> backup) {
+    constexpr std::size_t kPage = 4096;
+    if (streaming_) return make_error(Errc::busy, "stop the stream before restoring the calibration");
+    if (backup.size() != kCalibrationPagesSize) return make_error(Errc::invalid_argument, "a calibration backup is 8192 bytes (pages 0-1)");
+    if (!has_quick_section(backup)) return make_error(Errc::blocked, "not a calibration backup (no quick-calibration section)");
+    const auto current = read_flash(0, kCalibrationPagesSize);  // (may fail after an interrupted write: then write both)
+    std::vector<int> written;
+    for (int page = 0; page < 2; ++page) {
+        const std::span<const std::uint8_t> want(backup.data() + page * kPage, kPage);
+        if (current && std::ranges::equal(want, std::span<const std::uint8_t>(current->data() + page * kPage, kPage))) continue;
+        auto r = write_user_page(page, want);
+        if (!r) r = write_user_page(page, want);
+        if (!r) return std::unexpected(r.error());
+        written.push_back(page);
+    }
+    return written;
 }
 
 Result<double> EinstarDevice::temperature_c() {
