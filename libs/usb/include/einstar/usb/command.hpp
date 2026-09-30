@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <span>
+#include <string_view>
 #include <vector>
 
 #include "einstar/core/error.hpp"
@@ -49,6 +50,8 @@ struct Reply {
     [[nodiscard]] std::span<const std::uint8_t> payload() const;
 };
 
+// What a non-zero reply status (byte 4) means, per channel.
+[[nodiscard]] std::string_view status_meaning(std::uint8_t status, bool bulk);
 // Checks that bytes 0, 2, 3 echo the request and (optionally) status byte 4 == 0.
 [[nodiscard]] Result<Reply> validate_reply(std::span<const std::uint8_t> request, std::vector<std::uint8_t> reply,
                                            bool require_status_ok);

@@ -57,6 +57,12 @@ std::span<const std::uint8_t> Reply::payload() const {
     return std::span(raw).subspan(9, n);
 }
 
+std::string_view status_meaning(std::uint8_t status, bool bulk) {
+    // docs/firmware.md 5 (the scanner's firmware).
+    if (bulk) return status == 1 ? "unknown command" : status == 2 ? "bad length or update error" : "unknown status";
+    return status == 2 ? "bad payload length or value out of range" : status == 3 ? "command failed or unknown" : "unknown status";
+}
+
 Result<Reply> validate_reply(std::span<const std::uint8_t> request, std::vector<std::uint8_t> reply,
                              bool require_status_ok) {
     if (reply.size() < 5) return make_error(Errc::protocol, std::format("short reply ({} bytes)", reply.size()));

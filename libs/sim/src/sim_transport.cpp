@@ -36,6 +36,8 @@ bool is_dangerous(std::uint8_t group, std::uint8_t op) {
 }  // namespace
 
 SimTransport::SimTransport(SimConfig config) : config_(std::move(config)), flash_(1u << 20, 0xFF), rng_(config_.seed) {
+    last_command_seq_ = config_.previous_command_sequence;
+    last_bulk_seq_ = config_.previous_bulk_sequence;
     provider_ = [](int sensor, std::uint32_t frame_id, ImageU8& out) {
         // Default content: a moving gradient so frames are distinguishable.
         for (int y = 0; y < out.height(); ++y)
@@ -86,7 +88,9 @@ std::vector<std::uint8_t> SimTransport::handle(std::span<const std::uint8_t> req
     const std::uint32_t len = req.size() >= 8 ? be32_at(req, 4) : 0;
     std::span<const std::uint8_t> payload = req.size() >= 8 ? req.subspan(8, std::min<std::size_t>(len, req.size() - 8))
                                                             : std::span<const std::uint8_t>{};
-    received_.push_back({group, op, std::vector<std::uint8_t>(payload.begin(), payload.end())});
+    received_.push_back({seq, group, op, std::vector<std::uint8_t>(payload.begin(), payload.end())});
+    if (const auto it = config_.status_override.find(static_cast<std::uint16_t>(group << 8 | op)); it != config_.status_override.end())
+        return {seq, 0x00, group, op, it->second, 0, 0, 0, 0};
     if (is_dangerous(group, op)) dangerous_seen_ = true;
 
     std::uint8_t status = 0;
@@ -193,9 +197,24 @@ std::vector<std::uint8_t> SimTransport::handle(std::span<const std::uint8_t> req
     return reply;
 }
 
+std::uint64_t SimTransport::dropped_repeats() const {
+    std::lock_guard lock(mutex_);
+    return dropped_repeats_;
+}
+
 Result<std::vector<std::uint8_t>> SimTransport::command(std::span<const std::uint8_t> request, std::size_t cap,
                                                         unsigned) {
     if (request.size() < 4) return make_error(Errc::invalid_argument, "short request");
+    {
+        std::lock_guard lock(mutex_);
+        const std::uint8_t seq = request[0];
+        const bool repeat = seq < 0xFE && last_command_seq_ == seq;
+        last_command_seq_ = repeat ? std::nullopt : std::optional<std::uint8_t>(seq);  // a drop clears it
+        if (repeat) {
+            ++dropped_repeats_;
+            return make_error(Errc::timeout, "no reply (repeated sequence number)");
+        }
+    }
     auto reply = handle(request);
     if (reply.size() > cap) reply.resize(cap);
     return reply;
@@ -204,6 +223,16 @@ Result<std::vector<std::uint8_t>> SimTransport::command(std::span<const std::uin
 Result<std::vector<std::uint8_t>> SimTransport::bulk(std::span<const std::uint8_t> request, std::size_t cap, unsigned) {
     if (request.size() % usb::kBulkChunk != 0)
         return make_error(Errc::protocol, "bulk request not padded to 1 KiB");  // the real transport pads
+    {
+        std::lock_guard lock(mutex_);
+        const std::uint8_t seq = request[0];
+        const bool repeat = last_bulk_seq_ == seq;  // (no exemption on the bulk channel)
+        last_bulk_seq_ = repeat ? std::nullopt : std::optional<std::uint8_t>(seq);
+        if (repeat) {
+            ++dropped_repeats_;
+            return make_error(Errc::timeout, "no reply (repeated sequence number)");
+        }
+    }
     auto reply = handle(request);
     if (reply.size() > cap) reply.resize(cap);
     return reply;
@@ -232,7 +261,7 @@ void SimTransport::emit_frame(int sensor, std::uint32_t frame_id, std::uint64_t 
         std::fill(packet.begin(), packet.begin() + usb::kStreamHeaderSize, 0);
         packet[2] = static_cast<std::uint8_t>(((1u << sensor) & 0x7) << 3);
         packet[8] = off + n == total ? 1 : 0;
-        usb::write_be32(packet, 12, frame_id);
+        usb::write_be32(packet, 12, frame_id & 0xFFu);  // the scanner's group id counts modulo 256
         usb::write_be32(packet, 16, static_cast<std::uint32_t>(timestamp >> 32));
         usb::write_be32(packet, 20, static_cast<std::uint32_t>(timestamp));
         std::memcpy(packet.data() + usb::kStreamHeaderSize, img.data() + off, n);
@@ -271,6 +300,8 @@ void SimTransport::stream_loop(std::stop_token st) {
             const std::uint64_t ts = virtual_time_us_;
             for (int sensor = 0; sensor < 2; ++sensor) {
                 provider(sensor, frame_id, img);
+                // As the scanner sends it: this camera is mounted upside down (usb::kUpsideDownSensor).
+                if (sensor == usb::kUpsideDownSensor) std::ranges::reverse(img.pixels());
                 emit_frame(sensor, frame_id, ts, img);
             }
             if (g == 0 && s.rgb_triggers > 0) {

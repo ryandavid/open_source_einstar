@@ -8,7 +8,9 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
+#include <optional>
 #include <mutex>
 #include <random>
 #include <string>
@@ -32,11 +34,17 @@ struct SimConfig {
     double temperature_c = 38.5;
     bool mask_replies = false;         // exercise the XOR decode path
     double packet_drop_rate = 0.0;     // fault injection on the image stream
+    // The firmware drops (no reply, not executed) a request whose sequence number repeats the previous
+    // one on its channel; the command channel exempts 0xFE / 0xFF (docs/firmware.md 5). These are the
+    // last numbers an earlier session left behind.
+    std::optional<std::uint8_t> previous_command_sequence, previous_bulk_sequence;
+    // Fault injection: reply to (group << 8 | opcode) with this status instead of executing it.
+    std::map<std::uint16_t, std::uint8_t> status_override;
     std::uint32_t seed = 7;
 };
 
 struct ReceivedCommand {
-    std::uint8_t group, opcode;
+    std::uint8_t sequence, group, opcode;
     std::vector<std::uint8_t> payload;
 };
 
@@ -53,6 +61,8 @@ public:
     void press_button(int button, std::uint8_t action = 1);
 
     [[nodiscard]] std::vector<ReceivedCommand> received() const;
+    // Requests dropped as repeats of the previous sequence number (see SimConfig).
+    [[nodiscard]] std::uint64_t dropped_repeats() const;
     [[nodiscard]] bool dangerous_command_seen() const { return dangerous_seen_.load(); }
 
     // Emulated device state (for assertions).
@@ -98,6 +108,8 @@ private:
     std::vector<std::uint8_t> flash_;
     std::array<std::uint8_t, 3> buttons_{};
     std::vector<ReceivedCommand> received_;
+    std::optional<std::uint8_t> last_command_seq_, last_bulk_seq_;
+    std::uint64_t dropped_repeats_ = 0;
     std::atomic<bool> dangerous_seen_{false};
     std::shared_ptr<Observer> observer_ = std::make_shared<Observer>();
 

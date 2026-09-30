@@ -155,7 +155,13 @@ Result<void> Session::apply(const ScanSettings& st) {
     session::CaptureSettings cs;
     for (int sensor = 0; sensor < 2; ++sensor) {
         const auto e = device_->exposure(sensor);
-        const auto g = device_->gain(sensor);
+        auto g = device_->gain(sensor);
+        // A failed low-byte write can leave a wrong gain (see EinstarDevice::set_gain): write it once more.
+        if (g && std::abs(static_cast<int>(*g) - st.gain) > 4) {
+            log::warn("gain of sensor {} reads {} after writing {}; writing again", sensor, *g, st.gain);
+            if (auto r = device_->set_gain(sensor, static_cast<std::uint16_t>(st.gain)); !r) return r;
+            g = device_->gain(sensor);
+        }
         cs.exposure[static_cast<std::size_t>(sensor)] = e ? *e : static_cast<std::uint32_t>(st.exposure);
         cs.gain[static_cast<std::size_t>(sensor)] = g ? *g : static_cast<std::uint16_t>(st.gain);
     }

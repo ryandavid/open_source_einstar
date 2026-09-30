@@ -168,6 +168,7 @@ public:
         s.stream_bytes = bytes_.load(std::memory_order_relaxed);
         s.stream_timeouts = timeouts_.load(std::memory_order_relaxed);
         s.stream_errors = errors_.load(std::memory_order_relaxed);
+        s.stream_stalls = stalls_.load(std::memory_order_relaxed);
         return s;
     }
 
@@ -191,6 +192,17 @@ private:
             case LIBUSB_TRANSFER_CANCELLED:
                 --self->in_flight_;
                 return;
+            case LIBUSB_TRANSFER_STALL: {
+                // The image endpoint halted: resubmitting cannot succeed until the halt is cleared. Park the
+                // transfer; the event thread clears the halt (a synchronous request, not allowed here) and
+                // resubmits. The firmware then restarts its endpoints on the next device-state read
+                // (00/07, the heartbeat; docs/firmware.md 5).
+                self->errors_.fetch_add(1, std::memory_order_relaxed);
+                std::lock_guard lock(self->stall_mutex_);
+                self->stalled_.push_back(t);
+                --self->in_flight_;
+                return;
+            }
             default:
                 self->errors_.fetch_add(1, std::memory_order_relaxed);
                 break;
@@ -204,6 +216,18 @@ private:
         std::optional<std::chrono::steady_clock::time_point> deadline;
         while (!st.stop_requested() || in_flight_ > 0) {
             libusb_handle_events_timeout_completed(ctx_.get(), &tv, nullptr);
+            std::vector<libusb_transfer*> stalled;
+            {
+                std::lock_guard lock(stall_mutex_);
+                stalled.swap(stalled_);
+            }
+            if (!stalled.empty() && resubmit_ && !st.stop_requested()) {
+                log::warn("image endpoint stalled; clearing the halt and resuming");
+                stalls_.fetch_add(1, std::memory_order_relaxed);
+                libusb_clear_halt(handle_, kEpStreamIn);
+                for (auto* t : stalled)
+                    if (libusb_submit_transfer(t) == 0) ++in_flight_;
+            }
             if (st.stop_requested() && in_flight_ > 0) {
                 if (!deadline) deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
                 if (std::chrono::steady_clock::now() > *deadline) {
@@ -230,10 +254,12 @@ private:
     PacketHandler handler_;
     std::vector<Slot> transfers_;
     std::atomic<bool> resubmit_{false};
+    std::mutex stall_mutex_;
+    std::vector<libusb_transfer*> stalled_;  // (guarded by stall_mutex_)
     std::atomic<int> in_flight_{0};
     bool streaming_ = false;
     std::jthread event_thread_;
-    std::atomic<std::uint64_t> packets_{0}, bytes_{0}, timeouts_{0}, errors_{0};
+    std::atomic<std::uint64_t> packets_{0}, bytes_{0}, timeouts_{0}, errors_{0}, stalls_{0};
 };
 
 }  // namespace

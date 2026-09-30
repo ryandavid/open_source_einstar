@@ -2,6 +2,8 @@
 #include "einstar/device/einstar_device.hpp"
 
 #include <algorithm>
+#include <optional>
+#include <random>
 #include <chrono>
 #include <format>
 
@@ -49,6 +51,8 @@ EinstarDevice::~EinstarDevice() { disconnect(); }
 Result<std::unique_ptr<EinstarDevice>> EinstarDevice::connect(std::unique_ptr<usb::Transport> transport,
                                                                ConnectOptions options) {
     auto dev = std::unique_ptr<EinstarDevice>(new EinstarDevice(std::move(transport), std::move(options)));
+    dev->seq_ = dev->options_.first_sequence ? static_cast<std::uint8_t>(*dev->options_.first_sequence % 254)
+                                             : static_cast<std::uint8_t>(std::random_device{}() % 254);
     if (auto r = dev->identify(); !r) return std::unexpected(r.error());
     if (dev->options_.heartbeat_ms > 0)
         dev->heartbeat_ = std::jthread([d = dev.get()](std::stop_token st) { d->heartbeat_loop(st); });
@@ -92,8 +96,15 @@ Result<usb::Reply> EinstarDevice::send_checked(const OpcodeInfo& op, std::span<c
                                                : transport_->command(request, op.buffer, usb::kCommandTimeoutMs);
         if (raw) {
             transcript("<<", *raw);
-            auto reply = usb::validate_reply(request, std::move(*raw), true);
-            if (reply) return reply;
+            auto reply = usb::validate_reply(request, std::move(*raw), false);
+            if (reply) {
+                // A status is the firmware's answer, not a transport fault: retrying would repeat it (and
+                // re-execute a write).
+                if (const auto status = reply->raw[4]; status != 0)
+                    return make_error(Errc::protocol, std::format("{}: device status {} ({})", op.name, status,
+                                                                  usb::status_meaning(status, op.channel == Channel::bulk)));
+                return reply;
+            }
             last = reply.error();
         } else {
             last = raw.error();
@@ -309,10 +320,23 @@ Result<void> EinstarDevice::start_stream(GroupSink sink) {
     if (s0.width <= 0 || s0.height <= 0) return make_error(Errc::protocol, "unknown sensor size");
     {
         std::lock_guard lock(stream_mutex_);
-        groups_ = std::make_unique<usb::GroupAssembler>(std::move(sink));
+        // The scanner's group id counts modulo 256 (measured; the header field is 32 bits wide): extend
+        // it so ids keep increasing for the whole stream (recordings use them as frame indices).
+        groups_ = std::make_unique<usb::GroupAssembler>(
+            [sink = std::move(sink), base = std::uint32_t{0}, last = std::optional<std::uint32_t>{}](usb::FrameGroup&& g) mutable {
+                if (last && g.frame_id < *last && *last <= 0xFFu) base += 256;
+                last = g.frame_id;
+                g.frame_id += base;
+                for (auto& s : g.sensors)
+                    if (s) s->frame_id = g.frame_id;
+                sink(std::move(g));
+            });
         groups_->set_expected_mask(rgb_triggers_ > 0 ? 0b111u : 0b011u);
-        frames_ = std::make_unique<usb::FrameAssembler>(s0.width, s0.height,
-                                                        [this](usb::StreamFrame&& f) { groups_->push(std::move(f)); });
+        frames_ = std::make_unique<usb::FrameAssembler>(s0.width, s0.height, [this](usb::StreamFrame&& f) {
+            // Upright, as the calibration expects (tightly packed: a 180-degree turn is a reversal).
+            if (f.sensor == usb::kUpsideDownSensor) std::ranges::reverse(f.pixels.pixels());
+            groups_->push(std::move(f));
+        });
     }
     auto r = transport_->start_stream([this](std::span<const std::uint8_t> packet) {
         std::lock_guard lock(stream_mutex_);

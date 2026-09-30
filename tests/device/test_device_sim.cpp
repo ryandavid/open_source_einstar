@@ -1,8 +1,13 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <mutex>
+#include <set>
+#include <string>
 #include <thread>
+#include <vector>
 
 #include "einstar/device/einstar_device.hpp"
 #include "einstar/sim/sim_transport.hpp"
@@ -161,6 +166,95 @@ TEST_CASE("streaming delivers synchronised IR pairs") {
     CHECK(groups >= 6);
     CHECK(ok);
     CHECK(h.dev->stream_stats().resyncs == 0);
+}
+
+TEST_CASE("the upside-down IR camera is delivered upright") {
+    auto h = connect();
+    h.sim->set_frame_provider([](int sensor, std::uint32_t, ImageU8& out) {
+        for (int y = 0; y < out.height(); ++y)
+            for (int x = 0; x < out.width(); ++x) out(x, y) = static_cast<std::uint8_t>((x / 16 + 3 * (y / 16) + 40 * sensor) & 0xFF);
+    });
+    REQUIRE(h.dev->configure_scan_mode(30000).has_value());
+    std::atomic<int> groups{0};
+    std::atomic<bool> upright{true};
+    REQUIRE(h.dev->start_stream([&](usb::FrameGroup&& g) {
+        for (int s = 0; s < 2; ++s) {
+            if (!g.sensors[static_cast<std::size_t>(s)]) continue;
+            const auto& img = g.sensors[static_cast<std::size_t>(s)]->pixels;
+            for (const auto [x, y] : {std::pair{0, 0}, std::pair{1279, 0}, std::pair{17, 1023}, std::pair{640, 512}})
+                if (img(x, y) != static_cast<std::uint8_t>((x / 16 + 3 * (y / 16) + 40 * s) & 0xFF)) upright = false;
+        }
+        ++groups;
+    }).has_value());
+    for (int i = 0; i < 200 && groups < 3; ++i) std::this_thread::sleep_for(10ms);
+    h.dev->stop_stream();
+    CHECK(groups >= 3);
+    CHECK(upright);
+}
+
+TEST_CASE("group ids keep increasing past the scanner's 8-bit counter") {
+    auto h = connect();
+    REQUIRE(h.dev->configure_scan_mode(1000).has_value());  // 1 ms: 300 groups in well under a second
+    std::mutex m;
+    std::vector<std::uint32_t> ids;
+    REQUIRE(h.dev->start_stream([&](usb::FrameGroup&& g) {
+        std::lock_guard lock(m);
+        ids.push_back(g.frame_id);
+    }).has_value());
+    for (int i = 0; i < 500; ++i) {
+        std::this_thread::sleep_for(10ms);
+        std::lock_guard lock(m);
+        if (ids.size() >= 300) break;
+    }
+    h.dev->stop_stream();
+    std::lock_guard lock(m);
+    REQUIRE(ids.size() >= 300);
+    for (std::size_t i = 1; i < ids.size(); ++i) REQUIRE(ids[i] == ids[i - 1] + 1);
+    CHECK(ids.back() > 255);
+}
+
+TEST_CASE("a request repeating the previous session's sequence number is dropped, and the retry recovers") {
+    // The scanner still holds the numbers the previous session ended on; this session happens to
+    // start on the same command number, and its first flash read on the same bulk number.
+    sim::SimConfig cfg;
+    cfg.previous_command_sequence = 9;
+    auto t = std::make_unique<sim::SimTransport>(cfg);
+    auto* sim = t.get();
+    device::ConnectOptions opts;
+    opts.heartbeat_ms = 0;
+    opts.first_sequence = 9;
+    auto dev = device::EinstarDevice::connect(std::move(t), opts);
+    REQUIRE(dev.has_value());  // the dropped first request was retried under the next number
+    CHECK(sim->dropped_repeats() == 1);
+    CHECK((*dev)->info().vendor_name == cfg.vendor_name);
+}
+
+TEST_CASE("sessions start at a random sequence number") {
+    std::set<std::uint8_t> firsts;
+    for (int i = 0; i < 8; ++i) {
+        auto t = std::make_unique<sim::SimTransport>();
+        auto* sim = t.get();
+        device::ConnectOptions opts;
+        opts.heartbeat_ms = 0;
+        auto dev = device::EinstarDevice::connect(std::move(t), opts);  // (owns the emulator)
+        REQUIRE(dev.has_value());
+        const auto rx = sim->received();
+        REQUIRE(!rx.empty());
+        CHECK(rx.front().sequence < 0xFE);
+        firsts.insert(rx.front().sequence);
+    }
+    CHECK(firsts.size() > 1);  // (all eight equal by chance: 254^-7)
+}
+
+TEST_CASE("a device status error is reported with its meaning and not retried") {
+    sim::SimConfig cfg;
+    cfg.status_override[0x1027] = 2;  // set gain: "bad payload length"
+    auto h = connect(cfg);
+    auto r = h.dev->set_gain(0, 120);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().message.find("bad payload length") != std::string::npos);
+    const auto rx = h.sim->received();
+    CHECK(std::ranges::count_if(rx, [](const sim::ReceivedCommand& c) { return c.group == 0x10 && c.opcode == 0x27; }) == 1);
 }
 
 TEST_CASE("disconnect turns light sources and triggers off") {

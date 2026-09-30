@@ -32,4 +32,9 @@ inline constexpr std::size_t kStreamPayloadPerPacket = kStreamPacketSize - kStre
 inline constexpr unsigned kStreamTransferTimeoutMs = 500;
 inline constexpr std::size_t kStreamTransfersInFlight = 32;
 
+// Sensor 1 (the second IR camera) is mounted upside down: its frames arrive rotated by 180 degrees
+// relative to the calibration (measured on the scanner: only that rotation gives stereo depth).
+// EinstarDevice returns it upright; the emulator sends it rotated like the scanner.
+inline constexpr int kUpsideDownSensor = 1;
+
 }  // namespace einstar::usb

@@ -78,8 +78,12 @@ enum class DistanceIndication : std::uint8_t { zone0 = 0, zone1 = 1, zone2 = 2 }
 struct ConnectOptions {
     bool verbose_transcript = false;             // log every request/reply as hex
     std::function<void(std::string_view)> transcript_sink;  // defaults to log::debug
-    int heartbeat_ms = 250;                      // 0 disables polling
+    int heartbeat_ms = 250;                      // 0 disables polling (also the firmware's stream-stall recovery)
     int command_retries = 5;
+    // Sequence number of the first request. The firmware silently drops a request whose number repeats
+    // the previous one on that channel, including the last request of an earlier session
+    // (docs/firmware.md 5), so a session starts at a random number; set it only for tests.
+    std::optional<std::uint8_t> first_sequence;
 };
 
 class EinstarDevice {
@@ -112,7 +116,10 @@ public:
     // and still reply OK).
     Result<void> set_trigger_period_us(std::uint32_t period);
     Result<void> set_exposure(int sensor, std::uint32_t value);  // clamped to the sensor's range; 0 and 1 shared
-    Result<void> set_gain(int sensor, std::uint16_t value);      // clamped to the sensor's range
+    // Clamped to the sensor's range. Percent; reads back rounded (register = percent x 32 / 100). If the
+    // firmware's write of the low byte fails, its retry writes the high byte there (docs/firmware.md 5.1):
+    // callers that must be sure read the gain back.
+    Result<void> set_gain(int sensor, std::uint16_t value);
     Result<void> set_laser_percent(int percent);                 // clamped to 0..100
     Result<void> set_strobe(int route, int luminance);           // route 0/1, clamped to 0..kMaxStrobeLuminance
     Result<void> set_indication(DistanceIndication distance);

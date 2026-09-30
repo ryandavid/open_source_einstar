@@ -19,6 +19,7 @@ struct TransportStats {
     std::uint64_t stream_bytes = 0;
     std::uint64_t stream_timeouts = 0;   // idle 500 ms transfers (normal when not triggering)
     std::uint64_t stream_errors = 0;
+    std::uint64_t stream_stalls = 0;     // halts on the image endpoint, cleared and resumed
     std::uint64_t commands = 0;
     std::uint64_t command_failures = 0;
 };
