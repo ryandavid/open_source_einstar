@@ -23,12 +23,16 @@ Older Command Line Tools keep `std::jthread` experimental; CMake detects that an
 - `build/default/apps/einstar-cli calib-solve <captures dir> --reference <calibration>` — the same solve and
   comparison from the command line (einstar-calibrate's or EXStar's `imageLeftN` folders).
 - `build/default/apps/einstar-cli probe --verbose` — read-only scanner check (first contact with hardware).
+- `build/default/apps/einstar-firmware version | inspect <package> | flash <package>` — the scanner's firmware
+  version; check an update package offline; flash one (ours from `firmware/`, or EXStar's to go back).
+  See docs/firmware.md §4.7.
 - `build/default/apps/einstar-cli hw-test` — full scanner check (streams; turns the projector and strobe on).
 - `build/default/apps/einstar-cli track-fixture <Project.ir_E10_prj> --stl <ref.stl>` — evaluate tracking on an EXStar recording.
 
 ## Safety
 Flash writes, firmware update, reboot and bootloader commands are not sendable (compile-time guard,
-`libs/device/include/einstar/device/opcodes.hpp`). Laser/strobe are clamped to EXStar's maxima and
+`libs/device/include/einstar/device/opcodes.hpp`), except through the two dedicated, verified paths: the
+calibration write (pages 0-1) and `einstar-firmware flash`. Laser/strobe are clamped to EXStar's maxima and
 switched off on disconnect or destruction.
 
 ## Docs

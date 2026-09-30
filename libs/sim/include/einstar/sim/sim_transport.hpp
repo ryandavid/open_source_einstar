@@ -57,6 +57,11 @@ struct SimConfig {
     enum class FlashFault : std::uint8_t { none, erased_only, corrupt_byte };
     FlashFault flash_fault = FlashFault::none;
     int flash_fault_count = 1;
+    // The firmware drops an update when no page arrives for 2 s (update_timer). Tests may lengthen it: a
+    // machine that deschedules the test process for seconds would otherwise fail them.
+    std::chrono::milliseconds update_timeout{2000};
+    // What 00/05 reports once a firmware update has been written and booted (default: `firmware`).
+    std::optional<std::string> updated_firmware;
     std::uint32_t seed = 7;
 };
 
@@ -99,6 +104,11 @@ public:
     // The emulated flash's user area (for assertions), and the 10/58 page writes executed.
     [[nodiscard]] std::vector<std::uint8_t> flash(std::uint32_t offset, std::uint32_t size) const;
     [[nodiscard]] int flash_page_writes() const;
+    // Firmware update (update.c): the SPI flash below the user area (slots, boot record), the slot the boot
+    // record selects (0x040000 = A, 0x1C0000 = B), and whether an update is being received.
+    [[nodiscard]] std::vector<std::uint8_t> system_flash(std::uint32_t offset, std::uint32_t size) const;
+    [[nodiscard]] std::uint32_t boot_slot() const;
+    [[nodiscard]] bool update_active() const;
 
     // Emulated state, decoded from the FPGA registers and sensor gain registers as the firmware's read
     // commands would report it.
@@ -119,8 +129,9 @@ private:
 
     struct Reply {
         std::vector<std::uint8_t> bytes;
-        bool restart = false;   // the firmware restarts right after this command (the reply is lost)
-        bool reboot = false;
+        // What the firmware does after this command. app_restart (00/07 after a cleared halt) and CC/00 reset
+        // inside the dispatcher: no reply. 00/08 replies, then resets 25 ms later.
+        enum class Then : std::uint8_t { nothing, restart_no_reply, reboot_no_reply, reboot_after_reply } then = Then::nothing;
     };
     // `generation` identifies the connection; stale connections see the device as gone.
     [[nodiscard]] bool alive(std::uint64_t generation) const;
@@ -130,7 +141,9 @@ private:
     Result<std::vector<std::uint8_t>> bulk(std::uint64_t generation, std::span<const std::uint8_t> request,
                                            std::size_t reply_size);
     Reply handle_command(std::span<const std::uint8_t> request);          // (mutex_ held)
-    std::vector<std::uint8_t> handle_bulk(std::span<const std::uint8_t> request);  // (mutex_ held)
+    std::vector<std::uint8_t> handle_bulk(std::span<const std::uint8_t> request, bool& reboot);  // (mutex_ held)
+    std::uint8_t update_write_page(std::span<const std::uint8_t> request, bool& reboot);            // (mutex_ held)
+    [[nodiscard]] std::uint32_t boot_slot_locked() const;
     void restart_locked(bool reboot);
     void power_on_locked();
     [[nodiscard]] State state_locked() const;
@@ -153,7 +166,17 @@ private:
     std::array<std::uint8_t, 3> buttons_{};
     bool ep83_halt_cleared_ = false;
     bool image_halted_ = false;
-    std::vector<std::uint8_t> flash_;
+    std::vector<std::uint8_t> flash_;               // the user area (0x400000..)
+    std::vector<std::uint8_t> system_flash_;        // 0 .. 0x400000: boot record, slots A and B
+    std::map<std::uint32_t, std::string> slot_firmware_;  // what each slot's image reports on 00/05
+    struct Update {                                 // update.c's globals: survive everything but a reboot
+        bool active = false;
+        std::uint32_t size = 0, received = 0;
+        int page = 0;
+        std::uint32_t new_app = 0, old_app = 0;
+        std::uint8_t boot_new = 0;
+        std::chrono::steady_clock::time_point deadline{};
+    } update_;
     int flash_page_writes_ = 0;
     int flash_faults_left_ = 0;
     std::vector<ReceivedCommand> received_;

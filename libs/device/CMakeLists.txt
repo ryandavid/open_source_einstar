@@ -1,4 +1,4 @@
-add_library(einstar_device src/einstar_device.cpp)
+add_library(einstar_device src/einstar_device.cpp src/firmware_package.cpp src/firmware_update.cpp)
 add_library(einstar::device ALIAS einstar_device)
 target_include_directories(einstar_device PUBLIC include)
 target_link_libraries(einstar_device PUBLIC einstar::usb einstar::core)

@@ -454,21 +454,30 @@ Logic-layer execute names seen in the log, `ReadData(offset, size)` and
 * `set/getInterestSize`, `set/getAOIOffset` and `set/getTriggerMode`
   (camera-interface versions) are stubs with no device traffic.
 
-### 3.14 Firmware update / IAP. **DANGEROUS, existence only** **[H]**
+### 3.14 Firmware update / IAP. **DANGEROUS** **[H]**
 * `updateFirmware` (0xffdc):
   1. Verify the image with an 8-bit additive checksum after each 4096-byte
      block, so blocks are 0x1001 bytes.
   2. Set the "updating" flag, which pauses the heartbeat.
-  3. On the bulk channel, send a header packet group 00 op 06 carrying the
-     total image size.
-  4. Send 0x1001-byte chunks with op 06, pausing 50 ms between chunks.
+  3. On the bulk channel, send a header packet group 00 op 06: payload length 5,
+     a zero byte, then the **data size** as BE32: the package size minus one
+     check byte per page (1 311 040 − 320 = 1 310 720), which is what the
+     firmware counts. 5120-byte request, 1024-byte reply.
+  4. Send each 0x1001-byte chunk (4096 data bytes + check byte) with op 06:
+     payload length 4098, a zero byte, then the chunk; 5120-byte request,
+     1024-byte reply. It pauses 50 ms before each chunk. No reboot first.
   5. `Progress` runs 100 → 950, then 1000.
 * `eraseAppHead` (CC/00): the application erases flash 0x000000–0x00FFFF and
   resets, with no reply (firmware.md 4.5). What the bootloader then does is
   not known.
 * Device side of the update, and a retry defect that can leave a shifted
   image booting: firmware.md 4.6 and 5.1.
-* **Do not implement either in the open driver without a recovery path.**
+* The open driver implements the update (`device::flash_firmware`, the
+  `einstar-firmware` tool) with the same packets, plus a reboot first (it
+  clears an abandoned update's page count, firmware.md 5.1), exactly one
+  send per packet, and a reconnect afterwards to read the new version. The
+  host's conversation is replayed into the firmware itself to check it
+  (tools/fx3emu `replay`). CC/00 stays blocked.
 
 ---
 

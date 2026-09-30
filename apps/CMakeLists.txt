@@ -22,6 +22,11 @@ target_compile_options(einstar-calibrate PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-f
 einstar_target_defaults(einstar-calibrate)
 endif()
 
+# Firmware: report the scanner's version, check an update package, flash one (docs/firmware.md 4).
+add_executable(einstar-firmware einstar-firmware/main.cpp)
+target_link_libraries(einstar-firmware PRIVATE einstar::device einstar::sim)
+einstar_target_defaults(einstar-firmware)
+
 add_executable(einstar-cli einstar-cli/main.cpp)
 target_link_libraries(einstar-cli PRIVATE einstar::device einstar::sim einstar::calib einstar::fixtures einstar::track einstar::track_metal einstar::session einstar::recon einstar::eval einstar::pipeline einstar::optim einstar::calibrate)
 einstar_target_defaults(einstar-cli)

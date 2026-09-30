@@ -85,6 +85,21 @@ the Arm GNU Toolchain gcc (`FX3_ARMGNU_GCC`) and a host C compiler for `elf2img`
 * **Package** (`tools/mkpackage.c`): FX3 image, 0xFF to 0x40000, bitstream, 0xFF to 1.25 MB, as
   4 KB pages each followed by its 8-bit sum -- the update package EXStar sends over bulk 00/06.
 
+## Flashing
+The host tool `einstar-firmware` (built with the main project, `apps/einstar-firmware`):
+```
+build/default/apps/einstar-firmware version                    # what the scanner runs (00/05), serial
+build/default/apps/einstar-firmware inspect firmware/build/EN/EinScan10_01_SC130_FX3_V2.10_FPGA_V3.7_EN_IAP.img
+build/default/apps/einstar-firmware flash   firmware/build/EN/EinScan10_01_SC130_FX3_V2.10_FPGA_V3.7_EN_IAP.img
+build/default/apps/einstar-firmware flash   <EXStar.app>/Contents/MacOS/fabu_UPDATE/Configure/..._EN_IAP.img   # back to the vendor's
+```
+`flash` checks the package, reboots the scanner (clearing any abandoned update, see the retry bug
+below), writes the inactive slot exactly as EXStar does, and reconnects to read the version; `--emulator`
+runs it against the emulated scanner. The previous firmware stays in the other slot but no command
+selects it, so going back is flashing EXStar's package. Our build reports the same version string as the
+vendor's, so `version` cannot tell them apart. The host side was checked against this firmware with
+`tools/fx3emu` (`python -m fx3emu replay`, see its README). Not yet run on the scanner.
+
 ## Layout
 | File | Contents |
 |---|---|

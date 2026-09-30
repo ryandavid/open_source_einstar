@@ -17,6 +17,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -27,6 +28,7 @@
 #include <vector>
 
 #include "einstar/core/error.hpp"
+#include "einstar/device/firmware_package.hpp"
 #include "einstar/device/opcodes.hpp"
 #include "einstar/usb/command.hpp"
 #include "einstar/usb/stream.hpp"
@@ -144,6 +146,21 @@ public:
     // Refused unless the backup carries the quick-calibration section. Returns the pages rewritten.
     Result<std::vector<int>> restore_calibration_pages(std::span<const std::uint8_t> backup);
 
+    // ---- firmware (docs/firmware.md 4; use device::flash_firmware, which wraps these safely) ----
+    // Reboots the scanner (00/08): it replies, then resets 25 ms later and re-enumerates. This object is
+    // offline afterwards; open the scanner again.
+    Result<void> reboot();
+    // Writes `package` into the scanner's inactive A/B slot as EXStar's updateFirmware does (bulk 00/06: the
+    // data size, then one packet per page with a 50 ms pause before each). After the last page the firmware
+    // points its boot record at that slot and resets within ~1 s; this object is then offline. Any failure
+    // abandons the update (the old firmware keeps booting). Every packet is sent exactly once: the firmware
+    // takes a repeated page as the next one. The scanner must have been rebooted since any earlier update
+    // attempt -- the firmware keeps an abandoned update's page count, and a new update would then be written
+    // shifted and booted (docs/firmware.md 5.1). The stream must be stopped.
+    using FirmwareProgress = std::function<void(int pages_done, int pages)>;
+    Result<void> write_firmware(const FirmwarePackage& package, const FirmwareProgress& progress = {},
+                                std::chrono::milliseconds page_pause = std::chrono::milliseconds(50));
+
     // ---- volatile configuration ----
     Result<void> set_trigger(int mono_count, int rgb_count);
     // kMinTriggerPeriodUs..kMaxTriggerPeriodUs, else invalid_argument (the firmware would ignore it
@@ -224,6 +241,7 @@ private:
     std::atomic<bool> online_{true};
     std::atomic<bool> streaming_{false};
     std::atomic<int> reconnects_{0};
+    std::atomic<bool> updating_{false};  // a firmware update owns the bulk channel
     std::atomic<std::thread::id> heartbeat_id_{};  // the heartbeat's own commands pass while offline
     std::string foreign_serial_;                   // another scanner found while reconnecting (heartbeat only)
     std::atomic<int> rgb_triggers_{0};  // (also set by the heartbeat when it replays the trigger)

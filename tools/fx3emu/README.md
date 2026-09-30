@@ -18,7 +18,13 @@ python -m fx3emu diff                      # vendor image vs the open build: all
 python -m fx3emu diff --b path/to/fw.elf   # vendor image vs another build
 python -m fx3emu coverage --image build    # which application code the scenarios reach, stack use
 python -m fx3emu trace update-good --grep flash
+python -m fx3emu replay TRACE --image vendor # a host conversation, recorded by the host's own code
 ```
+`replay` checks the host against the firmware: `test_device` records its conversations when
+`EINSTAR_FIRMWARE_TRACE=<file>` (a full firmware flash; `EINSTAR_FIRMWARE_TRACE_PACKAGE=<img>` for a real
+package) or `EINSTAR_SESSION_TRACE=<file>` (a typical session) is set, and `replay` sends the same
+requests to the firmware, compares every reply with what the host's emulator answered, checks that the
+firmware reset wherever the host reconnected, and, for an update, the written slot and boot record.
 `diff` exits non-zero if any scenario differs and prints the first differing event with context, the
 differing replies and the differing final state (application variables by name, flash, I2C devices,
 GPIOs).

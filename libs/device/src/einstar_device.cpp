@@ -116,6 +116,9 @@ Result<usb::Reply> EinstarDevice::send_checked(const OpcodeInfo& op, std::span<c
 }
 
 Result<usb::Reply> EinstarDevice::send_unguarded(const OpcodeInfo& op, std::span<const std::uint8_t> payload, int attempts) {
+    // While an update runs, the firmware takes every bulk packet as an update page.
+    if (updating_ && op.channel == Channel::bulk && &op != &op::kFirmwareUpdate)
+        return make_error(Errc::busy, std::format("{}: a firmware update is using the bulk channel", op.name));
     // While offline only the heartbeat (probing, reattaching, replaying) talks to the scanner.
     const auto t = transport();
     if (!t || (!online_ && std::this_thread::get_id() != heartbeat_id_.load()))
@@ -307,6 +310,53 @@ Result<std::vector<int>> EinstarDevice::restore_calibration_pages(std::span<cons
         written.push_back(page);
     }
     return written;
+}
+
+Result<void> EinstarDevice::reboot() {
+    log::warn("rebooting the scanner");
+    // One attempt: a lost reply may mean it already rebooted, and a second 00/08 would reboot it again.
+    auto r = send_unguarded(op::kReboot, {}, 1);
+    mark_offline("rebooting");
+    if (!r) return std::unexpected(r.error());
+    return {};
+}
+
+Result<void> EinstarDevice::write_firmware(const FirmwarePackage& package, const FirmwareProgress& progress,
+                                           std::chrono::milliseconds page_pause) {
+    if (streaming_) return make_error(Errc::busy, "stop the stream before updating the firmware");
+    if (package.pages <= 0 || package.bytes.size() != static_cast<std::size_t>(package.pages) * kFirmwarePackagePage)
+        return make_error(Errc::invalid_argument, "not a parsed firmware package");
+    if (updating_.exchange(true)) return make_error(Errc::busy, "a firmware update is already running");
+    struct Done {
+        std::atomic<bool>& flag;
+        ~Done() { flag = false; }
+    } done{updating_};
+
+    const auto abandoned = [&](int page, const Error& e) {
+        const bool status = e.code == Errc::protocol;  // the firmware answered with an error status
+        return make_error(e.code, std::format(
+            "firmware update stopped at {} of {}: {}. {} The scanner keeps booting its current firmware; reboot it "
+            "before trying again (the firmware keeps an abandoned update's page count, docs/firmware.md 5.1)",
+            page < 0 ? std::string("the start") : std::format("page {}", page), package.pages, e.message,
+            status ? "The firmware abandoned the update." : "The scanner's state is unknown: it drops the update 2 s after the last page it got."));
+    };
+    // 00/06: payload byte 0 unused, then the data size (BE32).
+    const std::uint32_t n = package.data_size;
+    const std::uint8_t head[5] = {0, static_cast<std::uint8_t>(n >> 24), static_cast<std::uint8_t>(n >> 16),
+                                  static_cast<std::uint8_t>(n >> 8), static_cast<std::uint8_t>(n)};
+    log::warn("firmware update: {} pages, {} bytes", package.pages, n);
+    if (auto r = send_unguarded(op::kFirmwareUpdate, head, 1); !r) return abandoned(-1, r.error());
+    // Pages: payload byte 0 unused, the 4096 data bytes, the check byte.
+    std::vector<std::uint8_t> payload(1 + kFirmwarePackagePage, 0);
+    for (int page = 0; page < package.pages; ++page) {
+        std::this_thread::sleep_for(page_pause);
+        std::ranges::copy(package.page_with_check(page), payload.begin() + 1);
+        if (auto r = send_unguarded(op::kFirmwareUpdate, payload, 1); !r) return abandoned(page, r.error());
+        if (progress) progress(page + 1, package.pages);
+    }
+    // The firmware now switches its boot record to the new slot; its watchdog resets it within ~1 s.
+    mark_offline("rebooting into the new firmware");
+    return {};
 }
 
 Result<double> EinstarDevice::temperature_c() {

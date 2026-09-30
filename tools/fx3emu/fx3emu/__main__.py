@@ -3,6 +3,7 @@
     python -m fx3emu diff [--a IMAGE] [--b IMAGE] [--only NAME,...] [--fuzz N]
     python -m fx3emu coverage [--image IMAGE] [--fuzz N]
     python -m fx3emu trace SCENARIO [--image IMAGE] [--grep TEXT]
+    python -m fx3emu replay TRACE [--image IMAGE]    (a host conversation; see replay.py)
 
 IMAGE is `vendor` (EXStar's package, named via reference/vendor-names.elf), `build` (the open build's
 output, default for --b) or a path to an ELF.
@@ -82,6 +83,9 @@ def main(argv=None):
     p.add_argument("scenario")
     p.add_argument("--image", default="build")
     p.add_argument("--grep")
+    p = sub.add_parser("replay")
+    p.add_argument("trace")
+    p.add_argument("--image", default="build")
     args = ap.parse_args(argv)
 
     if args.cmd == "diff":
@@ -100,6 +104,11 @@ def main(argv=None):
         print("\nstack use:")
         stacks(devices)
         return 0
+    if args.cmd == "replay":
+        from .replay import replay
+        img = load(args.image)
+        print("image: %s" % img.label)
+        return 1 if replay(img, args.trace) else 0
     if args.cmd == "trace":
         img = load(args.image)
         sc = [s for s in scenarios.all_scenarios(range(64)) if s.__name__ == args.scenario]

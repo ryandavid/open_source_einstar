@@ -20,6 +20,13 @@ constexpr std::uint8_t kStale = 0xCD;
 // Status codes (firmware/include/protocol.h)
 constexpr std::uint8_t kOk = 0, kUnknownBulk = 1, kBadLength = 2, kFailed = 3;
 
+// Flash layout (firmware/include/board.h)
+constexpr std::uint32_t kSlotA = 0x040000, kSlotB = 0x1C0000, kBootRecord = 0x03F000, kSystemFlash = 0x400000;
+
+std::uint32_t le32(const std::vector<std::uint8_t>& b, std::size_t o) {
+    return std::uint32_t{b[o]} | std::uint32_t{b[o + 1]} << 8 | std::uint32_t{b[o + 2]} << 16 | std::uint32_t{b[o + 3]} << 24;
+}
+
 // FPGA registers (firmware/include/fpga_regs.h)
 constexpr int kRegExposure = 1, kRegTriggerPeriod = 2, kRegTriggerSwitch = 3, kRegStrobe0 = 4, kRegStrobe1 = 5,
               kRegTriggerAux = 7, kRegLdBrightness = 8, kRegMode = 10, kRegControl = 12;
@@ -83,7 +90,12 @@ struct ReplyBuilder {
 // ---------------------------------------------------------------------------------------------------------
 // SimDevice
 
-SimDevice::SimDevice(SimConfig config) : config_(std::move(config)), flash_(1u << 20, 0xFF), rng_(config_.seed) {
+SimDevice::SimDevice(SimConfig config)
+    : config_(std::move(config)), flash_(1u << 20, 0xFF), system_flash_(kSystemFlash, 0xFF), rng_(config_.seed) {
+    // Boot record: slot A written last and booted (new_app, old_app, boot_new; little-endian, 12 bytes).
+    const std::uint8_t record[9] = {0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x1C, 0x00, 0x01};
+    std::ranges::copy(record, system_flash_.begin() + kBootRecord);
+    slot_firmware_[kSlotA] = slot_firmware_[kSlotB] = config_.firmware;
     last_command_seq_ = config_.previous_command_sequence;
     last_bulk_seq_ = config_.previous_bulk_sequence;
     flash_faults_left_ = config_.flash_fault_count;
@@ -116,8 +128,12 @@ void SimDevice::restart_locked(bool reboot) {
     restarts_.fetch_add(1);
     off_bus_until_ = clock::now() + config_.restart_time;
     power_on_locked();
-    // A reboot also resets the firmware's sequence memory; app_restart() (after a cleared halt) does not.
-    if (reboot) last_command_seq_ = last_bulk_seq_ = std::nullopt;
+    // A reboot also resets the firmware's globals (sequence memory, update state); app_restart() (after a
+    // cleared halt) does not.
+    if (reboot) {
+        last_command_seq_ = last_bulk_seq_ = std::nullopt;
+        update_ = {};
+    }
 }
 
 Result<std::unique_ptr<usb::Transport>> SimDevice::connect() {
@@ -144,6 +160,32 @@ std::vector<std::uint8_t> SimDevice::flash(std::uint32_t offset, std::uint32_t s
     const auto end = std::min<std::size_t>(flash_.size(), static_cast<std::size_t>(offset) + size);
     if (offset >= end) return {};
     return {flash_.begin() + offset, flash_.begin() + static_cast<std::ptrdiff_t>(end)};
+}
+
+std::vector<std::uint8_t> SimDevice::system_flash(std::uint32_t offset, std::uint32_t size) const {
+    std::lock_guard lock(mutex_);
+    const auto end = std::min<std::size_t>(system_flash_.size(), static_cast<std::size_t>(offset) + size);
+    if (offset >= end) return {};
+    return {system_flash_.begin() + offset, system_flash_.begin() + static_cast<std::ptrdiff_t>(end)};
+}
+
+std::uint32_t SimDevice::boot_slot() const {
+    std::lock_guard lock(mutex_);
+    return boot_slot_locked();
+}
+
+std::uint32_t SimDevice::boot_slot_locked() const {
+    // fpga_load_addr_get(): the slot the boot record selects (the bootloader is assumed to agree).
+    const std::uint32_t new_app = le32(system_flash_, kBootRecord);
+    const bool boot_new = system_flash_[kBootRecord + 8] == 1;
+    if (new_app == kSlotB) return boot_new ? kSlotB : kSlotA;
+    if (new_app == kSlotA) return boot_new ? kSlotA : kSlotB;
+    return kSlotA;
+}
+
+bool SimDevice::update_active() const {
+    std::lock_guard lock(mutex_);
+    return update_.active && clock::now() <= update_.deadline;
 }
 
 int SimDevice::flash_page_writes() const {
@@ -227,11 +269,12 @@ Result<std::vector<std::uint8_t>> SimDevice::command(std::uint64_t generation, s
         return make_error(Errc::timeout, "no reply (repeated sequence number)");
     }
     auto reply = handle_command(request);
-    if (reply.restart || reply.reboot) {
-        // The firmware restarts before (app_restart) or right after replying; either way the host loses it.
-        restart_locked(reply.reboot);
+    using Then = Reply::Then;
+    if (reply.then == Then::restart_no_reply || reply.then == Then::reboot_no_reply) {
+        restart_locked(reply.then == Then::reboot_no_reply);
         return make_error(Errc::disconnected, "emulated scanner restarted");
     }
+    if (reply.then == Then::reboot_after_reply) restart_locked(true);  // (the reply is already on its way)
     if (reply.bytes.size() > cap)
         return make_error(Errc::io, std::format("reply of {} bytes overflows a {}-byte read", reply.bytes.size(), cap));
     return std::move(reply.bytes);
@@ -252,7 +295,10 @@ Result<std::vector<std::uint8_t>> SimDevice::bulk(std::uint64_t generation, std:
         ++dropped_repeats_;
         return make_error(Errc::timeout, "no reply (repeated sequence number)");
     }
-    auto reply = handle_bulk(request);
+    bool reboot = false;
+    auto reply = handle_bulk(request, reboot);
+    // A completed update: the reply goes out, then the watchdog thread resets the device within ~1 s.
+    if (reboot) restart_locked(true);
     // Reading more than the firmware sends waits for data that never comes.
     if (reply.size() < reply_size)
         return make_error(Errc::timeout, std::format("bulk reply is {} bytes, {} were expected", reply.size(), reply_size));
@@ -277,16 +323,20 @@ SimDevice::Reply SimDevice::handle_command(std::span<const std::uint8_t> req) {
         out.bytes = std::move(r.bytes);
         return out;
     }
+    // The reply is 9 + `declared` bytes; the firmware may copy more into its buffer (00/01 copies the NUL
+    // too), but only the declared length is sent.
     auto string_reply = [&](const std::string& s, std::uint32_t declared, std::size_t copied) {
         if (!r.check(length, 0, declared)) return;
-        r.bytes.resize(9 + std::max<std::size_t>(declared, copied), kStale);
-        for (std::size_t i = 0; i < copied; ++i) r.data(i) = i < s.size() ? static_cast<std::uint8_t>(s[i]) : 0;
+        for (std::size_t i = 0; i < std::min<std::size_t>(copied, declared); ++i) r.data(i) = i < s.size() ? static_cast<std::uint8_t>(s[i]) : 0;
     };
 
     switch (group << 8 | op) {
         case 0x0000: string_reply(config_.vendor_name, 18, 18); break;
         case 0x0001: string_reply(config_.product_name, 12, 13); break;  // (copies the NUL too)
-        case 0x0005: string_reply(config_.firmware, 42, 42); break;
+        case 0x0005: string_reply(slot_firmware_[boot_slot_locked()], 42, 42); break;
+        case 0x000D:  // clears an FPGA register and cancels a pending reboot or update (its page count stays)
+            if (r.check(length, 0, 0)) update_.active = false;
+            break;
         case 0x0004:  // declares 12 bytes, fills 8: the FX3 die id
             if (r.check(length, 0, 12))
                 for (std::size_t i = 0; i < 8; ++i) r.data(i) = config_.serial[i];
@@ -306,15 +356,15 @@ SimDevice::Reply SimDevice::handle_command(std::span<const std::uint8_t> req) {
             // After a cleared image-endpoint halt: the full restart (USB, FPGA, sensors).
             if (ep83_halt_cleared_ && (v >> 17) & 1) {
                 ep83_halt_cleared_ = false;
-                out.restart = true;
+                out.then = Reply::Then::restart_no_reply;
             }
             break;
         }
         case 0x0008:  // reboot after the reply
-            if (r.check(length, 0, 0)) out.reboot = true;
+            if (r.check(length, 0, 0)) out.then = Reply::Then::reboot_after_reply;
             break;
         case 0xCC00:  // erases flash block 0 and resets, no reply
-            out.reboot = true;
+            out.then = Reply::Then::reboot_no_reply;
             break;
         case 0x1000: if (r.check(length, 0, 2)) r.put_be(0, usb::kVendorId, 2); break;
         case 0x1001: if (r.check(length, 0, 2)) r.put_be(0, 1, 2); break;  // (the USB PID is 3)
@@ -411,7 +461,7 @@ SimDevice::Reply SimDevice::handle_command(std::span<const std::uint8_t> req) {
     return out;
 }
 
-std::vector<std::uint8_t> SimDevice::handle_bulk(std::span<const std::uint8_t> req) {
+std::vector<std::uint8_t> SimDevice::handle_bulk(std::span<const std::uint8_t> req, bool& reboot) {
     const std::uint8_t seq = req[0], group = req[2], op = req[3];
     const std::uint32_t length = usb::read_be32(req, 4);
     const std::size_t payload_n = std::min<std::size_t>(length, req.size() - 8);
@@ -428,8 +478,13 @@ std::vector<std::uint8_t> SimDevice::handle_bulk(std::span<const std::uint8_t> r
         reply[4] = s;
         return reply;
     };
+    // (Fault injection first, so a test can fail an update page.)
     if (const auto it = config_.status_override.find(static_cast<std::uint16_t>(group << 8 | op)); it != config_.status_override.end())
         return status(it->second);
+    // update_timer: 2 s without a page drops the update (its page and byte counts stay).
+    if (update_.active && clock::now() > update_.deadline) update_.active = false;
+    // While an update runs, every bulk packet is an update page, whatever its key.
+    if (update_.active) return status(update_write_page(req, reboot));
     const std::uint16_t page = static_cast<std::uint16_t>(req[8] << 8 | req[9]);
     switch (group << 8 | op) {
         case 0x1057:
@@ -451,11 +506,65 @@ std::vector<std::uint8_t> SimDevice::handle_bulk(std::span<const std::uint8_t> r
             usb::write_be32(reply, 5, 4);
             return status(kOk);  // (erase / program results are not reported)
         }
-        case 0x0006:  // firmware update: not emulated
-            return status(kFailed);
+        case 0x0006:  // update_begin(): payload byte 0 unused, then the data size (BE32). The page and byte
+                      // counts are NOT reset (docs/firmware.md 5.1).
+            if (length != 5) return status(kBadLength);
+            update_.size = usb::read_be32(req, 9);
+            update_.active = true;
+            update_.deadline = clock::now() + config_.update_timeout;
+            return status(kOk);
         default:
             return status(kUnknownBulk);
     }
+}
+
+std::uint8_t SimDevice::update_write_page(std::span<const std::uint8_t> req, bool& reboot) {
+    // update_write_page(): payload byte 0 unused, the data, the check byte (8-bit sum of the data).
+    const std::uint32_t data_len = usb::read_be32(req, 4) - 2;
+    auto fail = [&] {
+        update_.page = 0;
+        update_.received = 0;
+        update_.active = false;
+        return kBadLength;
+    };
+    if (data_len > 4096) return fail();
+    const auto data = req.subspan(9);
+    const std::uint8_t check = data[data_len];
+    update_.deadline = clock::now() + config_.update_timeout;
+    if (update_.page == 0) {
+        // Target: the slot that does not boot, from the boot record (update.c's first-page rule).
+        const std::uint32_t new_app = le32(system_flash_, kBootRecord);
+        const bool boot_new = system_flash_[kBootRecord + 8] == 1;
+        const bool write_a = new_app == kSlotB ? boot_new : new_app == kSlotA ? !boot_new : false;
+        update_.new_app = write_a ? kSlotA : kSlotB;
+        update_.old_app = write_a ? kSlotB : kSlotA;
+        update_.boot_new = 1;
+    }
+    // Erase the sector, program 4096 bytes (always a whole page), read back and sum the data length.
+    const auto at = system_flash_.begin() + static_cast<std::ptrdiff_t>(update_.new_app + static_cast<std::uint32_t>(update_.page) * 4096);
+    std::copy_n(data.begin(), 4096, at);
+    std::uint8_t sum = 0;
+    for (std::uint32_t i = 0; i < data_len; ++i) sum = static_cast<std::uint8_t>(sum + at[i]);
+    if (sum != check) return fail();
+    ++update_.page;
+    update_.received += data_len;
+    if (update_.size <= update_.received) {
+        // Done: erase the boot-record sector, write the 12-byte record, reset (emc_wdg_thread).
+        std::fill_n(system_flash_.begin() + kBootRecord, 4096, std::uint8_t{0xFF});
+        const std::uint8_t record[12] = {
+            static_cast<std::uint8_t>(update_.new_app), static_cast<std::uint8_t>(update_.new_app >> 8),
+            static_cast<std::uint8_t>(update_.new_app >> 16), static_cast<std::uint8_t>(update_.new_app >> 24),
+            static_cast<std::uint8_t>(update_.old_app), static_cast<std::uint8_t>(update_.old_app >> 8),
+            static_cast<std::uint8_t>(update_.old_app >> 16), static_cast<std::uint8_t>(update_.old_app >> 24),
+            update_.boot_new, 0, 0, 0};
+        std::ranges::copy(record, system_flash_.begin() + kBootRecord);
+        slot_firmware_[update_.new_app] = config_.updated_firmware.value_or(config_.firmware);
+        update_.page = 0;
+        update_.received = 0;
+        update_.active = false;
+        reboot = true;
+    }
+    return kOk;
 }
 
 bool SimDevice::take_image_halt(std::uint64_t generation) {

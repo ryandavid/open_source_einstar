@@ -6,6 +6,7 @@
 |---|---|---|
 | USB transport (libusb) | done | codec/mask round trip on documented example; packet reassembly + resync tests |
 | Device control | done | full command set via typed API; dangerous opcodes blocked at compile time; emulator tests match EXStar's logged bytes; reconnects and replays every setting when the scanner leaves the bus (it reboots or restarts its USB side on its own, docs/firmware.md 5) |
+| Firmware flashing | done, not yet run on hardware | `einstar-firmware version / inspect / flash`: package checks, reboot first, EXStar's packets sent once each, reconnect and read the version; the host's recorded conversations (a full flash with our package, a typical session) replayed into the vendor firmware and our build in fx3emu agree reply for reply |
 | Device emulator | done | modelled on the firmware source (`firmware/src`): payload-length checks, status codes, reply and bulk sizes, shared IR exposure, gain rounding, laser halving, strobe wrap, the restart after a cleared image-endpoint halt, reboots; streams packetised frames, serves flash, buttons, temperature |
 | Calibration | done | decodes EXStar CCF / flash blob; matches documented values; baseline 159.913 mm |
 | Rectification | done | row alignment < 1e-6 px on synthetic rig with distortion + toe-in |

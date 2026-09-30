@@ -88,7 +88,20 @@ user area. The slots, the boot record and the EEPROM cannot be read back with st
    update is dropped (see 5.1). While the update runs, *every* bulk packet is treated as an update
    page, whatever its key. Any error (page too long, check-byte mismatch) abandons the update with
    status 2; the old slot keeps booting. After the last page the boot record is written and the
-   watchdog thread resets the device within 1 s.
+   watchdog thread resets the device within 1 s. The size the update counts is the **data** size
+   (the package minus its check bytes), which is what EXStar announces.
+7. **Flashing from this project** (`einstar-firmware flash <package>`, `device::flash_firmware`):
+   check the package offline (every check byte, the FX3 image's sections and checksum, a bitstream
+   at +0x40000, the slot size); reboot the scanner first (00/08) so no abandoned update's page count
+   is left; send the update exactly as EXStar does, each packet once (a resent page would be taken
+   as the next page); then reconnect and read the version. The previous firmware stays in the other
+   slot, but no command selects it: going back means flashing the previous package (EXStar's).
+   The host's recorded conversation has been replayed into both the vendor image and our build in
+   `tools/fx3emu` (`python -m fx3emu replay`): every reply agrees, the firmware resets where the
+   host reconnects, and the written slot and boot record come out right. Not yet run on the
+   scanner. A host that stalls for more than 2 s between pages loses the update (safely: the old
+   firmware keeps booting). `einstar-firmware version` cannot tell our build from the vendor's:
+   both report the same version string.
 
 ## 5. Command handling **[H]**
 * Command channel: one large dispatcher; the bulk channel: a 3-entry table (00/06 update,
@@ -220,7 +233,8 @@ laser timing, and FPGA-to-FX3 interface all re-implemented.
   the boot-mode pins allow USB fallback. Otherwise it leaves a device that needs an EEPROM programmer.
 * Neither the EEPROM nor the slots can be backed up through stock commands.
 
-Every one of these operations stays blocked in `DeviceGuard`. The one exception is 10/58 for the
+Every one of these operations stays blocked in `DeviceGuard`. The firmware update (00/06) and its
+reboot (00/08) are sent only by `device::flash_firmware` (4.7). The other exception is 10/58 for the
 calibration pages 0–1, sent only by `EinstarDevice::write_calibration_blob` / `restore_calibration_pages`
 (docs/calibration.md §8). Its handler (`user_page_write`, firmware/src/update.c; bulk table entry at
 0x40030330) checks page ≤ 255, erases the 4 KB sector at 0x400000 + page × 4096 (write-enable 0x06, then
