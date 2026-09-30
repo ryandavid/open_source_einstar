@@ -208,8 +208,8 @@ StereoFrontend::FittedMarkers StereoFrontend::fit_gpu_blobs(const ImageU8& raw_l
     };
     FittedMarkers f;
     f.candidates = static_cast<int>(blobs[0].size() + blobs[1].size());
-    tbb::parallel_invoke([&] { f.left = markers::fit_blobs(raw_left.view(), to_blobs(blobs[0]), params_.marker_detect); },
-                         [&] { f.right = markers::fit_blobs(raw_right.view(), to_blobs(blobs[1]), params_.marker_detect); });
+    f.left = markers::fit_blobs(raw_left.view(), to_blobs(blobs[0]), params_.marker_detect);
+    f.right = markers::fit_blobs(raw_right.view(), to_blobs(blobs[1]), params_.marker_detect);
     f.ms = sw.elapsed_ms();
     return f;
 }
