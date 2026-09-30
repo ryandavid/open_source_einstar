@@ -12,7 +12,10 @@
 
 #include <Metal/Metal.hpp>
 
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <thread>
 #include <cstdlib>
 #include <cstring>
 #include <string_view>
@@ -192,6 +195,12 @@ int main(int argc, char** argv) {
 
     id<MTLTexture> offscreen = nil;
     Stopwatch snapshot_clock;
+    auto next_view_frame = std::chrono::steady_clock::now();
+    struct ViewGpuTime {
+        std::atomic<std::int64_t> ns{0};
+        std::atomic<int> frames{0};
+    };
+    auto view_gpu = std::make_shared<ViewGpuTime>();
     if (snapshot_path) {
         // Headless runs record into a temporary directory, never the user's scans.
         const auto tmp = std::filesystem::temp_directory_path() / "einstar_snapshot_scans";
@@ -275,7 +284,8 @@ int main(int argc, char** argv) {
                                                                                                height:NSUInteger(fb_h)
                                                                                             mipmapped:NO];
                     d.usage = MTLTextureUsageRenderTarget;
-                    d.storageMode = MTLStorageModeShared;
+                    // Shared textures need unified memory; a discrete GPU reads back through a managed copy.
+                    d.storageMode = device.hasUnifiedMemory ? MTLStorageModeShared : MTLStorageModeManaged;
                     offscreen = [device newTextureWithDescriptor:d];
                 }
                 pass.colorAttachments[0].texture = offscreen;
@@ -468,8 +478,26 @@ int main(int argc, char** argv) {
             ImGui::Render();
             ImGui_ImplMetal_RenderDrawData(ImGui::GetDrawData(), cmd, enc);
             [enc endEncoding];
+            if (offscreen && !drawable && offscreen.storageMode == MTLStorageModeManaged) {
+                id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+                [blit synchronizeResource:offscreen];
+                [blit endEncoding];
+            }
             if (drawable) [cmd presentDrawable:drawable];
+            if (snapshot_path) {
+                // GPU time of the view (reported with the snapshot: it shares the GPU with the scan).
+                [cmd addCompletedHandler:^(id<MTLCommandBuffer> c) {
+                    view_gpu->ns.fetch_add(static_cast<std::int64_t>((c.GPUEndTime - c.GPUStartTime) * 1e9));
+                    view_gpu->frames.fetch_add(1);
+                }];
+            }
             [cmd commit];
+            if (snapshot_path) {
+                // Headless: no display to pace the loop, so pace it like a 60 Hz display (unpaced, it
+                // floods the GPU with view renders and starves the scan).
+                std::this_thread::sleep_until(next_view_frame);
+                next_view_frame = std::max(next_view_frame + std::chrono::microseconds(16667), std::chrono::steady_clock::now());
+            }
             if (snapshot_path && snapshot_process && snapshot_clock.elapsed_ms() > snapshot_seconds * 1000.0) {
                 if (!snapshot_processing) {
                     state.stop_scan();
@@ -493,6 +521,11 @@ int main(int argc, char** argv) {
             }
             if (snapshot_path && !snapshot_process && snapshot_clock.elapsed_ms() > snapshot_seconds * 1000.0) {
                 [cmd waitUntilCompleted];
+                const auto st = state.hud();
+                std::println("view: {:.2f} ms GPU per frame over {} frames; scan: {:.1f} fps, depth {:.1f} ms, track {:.1f} ms, "
+                             "{} frames, queue {}, {} dropped",
+                             view_gpu->frames.load() ? static_cast<double>(view_gpu->ns.load()) * 1e-6 / view_gpu->frames.load() : 0.0,
+                             view_gpu->frames.load(), st.fps, st.depth_ms, st.track_ms, st.frames, st.queue_depth, st.dropped);
                 std::println("snapshot: {}", write_png(offscreen, snapshot_path) ? snapshot_path : "FAILED");
                 break;
             }

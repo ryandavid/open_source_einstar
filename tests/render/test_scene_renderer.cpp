@@ -28,7 +28,9 @@ TEST_CASE("scene renderer draws splats, markers and lines offscreen") {
     auto* dev = (*ctx)->device();
     auto* cd = MTL::TextureDescriptor::texture2DDescriptor(MTL::PixelFormatBGRA8Unorm, W, H, false);
     cd->setUsage(MTL::TextureUsageRenderTarget);
-    cd->setStorageMode(MTL::StorageModeShared);
+    // Shared textures need unified memory; a discrete GPU reads back through a managed copy.
+    const bool unified = dev->hasUnifiedMemory();
+    cd->setStorageMode(unified ? MTL::StorageModeShared : MTL::StorageModeManaged);
     gpu::Ref<MTL::Texture> color(dev->newTexture(cd));
     auto* dd = MTL::TextureDescriptor::texture2DDescriptor(MTL::PixelFormatDepth32Float, W, H, false);
     dd->setUsage(MTL::TextureUsageRenderTarget);
@@ -51,6 +53,11 @@ TEST_CASE("scene renderer draws splats, markers and lines offscreen") {
     auto* enc = cmd->renderCommandEncoder(pass);
     (*renderer)->encode(enc, cam, W, H, {});
     enc->endEncoding();
+    if (!unified) {
+        auto* blit = cmd->blitCommandEncoder();
+        blit->synchronizeResource(color.get());
+        blit->endEncoding();
+    }
     cmd->commit();
     cmd->waitUntilCompleted();
 

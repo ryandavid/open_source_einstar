@@ -1,9 +1,11 @@
 #pragma once
 
 // Metal implementation of the stereo pipeline in libs/depth (same algorithm, same parameters).
-// All buffers use shared storage, so results are read by the CPU without copies.
+// Buffers follow gpu::Context's storage rules: shared on unified memory (results are read in place),
+// VRAM with explicit copies on a discrete GPU.
 
 #include <array>
+#include <functional>
 #include <memory>
 #include <vector>
 #include <optional>
@@ -40,6 +42,12 @@ struct FrameRequest {
     bool preview_textures = false;  // rectified pair as GPU textures (for display)
     bool preview_images = false;    // rectified pair copied to CPU images
     bool marker_blobs = false;      // needs set_blob_params()
+    // Called with the blob candidates (left, right) as soon as the blob search has finished, while the
+    // stereo is still running on the GPU, so CPU work on them overlaps it (they are also returned).
+    std::function<void(const std::array<std::vector<struct BlobBox>, 2>&)> on_blobs;
+    // The caller will read the frame on the CPU: on a discrete GPU, copy it back as part of the frame
+    // rather than on first access (no effect on unified memory).
+    bool cpu_frame_access = false;
 };
 
 struct FrameOutputs {

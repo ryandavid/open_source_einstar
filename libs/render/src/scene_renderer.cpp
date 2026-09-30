@@ -82,15 +82,18 @@ Result<std::unique_ptr<SceneRenderer>> SceneRenderer::create(std::shared_ptr<gpu
 void SceneRenderer::upload(Layer& layer, const void* data, std::size_t count, std::size_t stride, bool append) {
     const std::size_t start = append ? layer.count : 0;
     const std::size_t needed = start + count;
+    std::size_t dirty_from = start;
     if (needed > layer.capacity || layer.capacity == 0) {
+        dirty_from = 0;
         const std::size_t cap = std::max<std::size_t>(needed + needed / 2, 1024);
-        auto grown = ctx_->buffer(cap * stride);
-        if (append && layer.buffer && layer.count > 0)
-            std::memcpy(grown->contents(), layer.buffer->contents(), layer.count * stride);
+        auto grown = ctx_->mirrored_buffer(cap * stride);
+        // (The old buffer may be an external GPU-only one: see set_model_buffer.)
+        if (append && layer.buffer && layer.count > 0) ctx_->download(layer.buffer.get(), 0, grown->contents(), layer.count * stride);
         layer.buffer = std::move(grown);
         layer.capacity = cap;
     }
     if (count > 0) std::memcpy(static_cast<std::byte*>(layer.buffer->contents()) + start * stride, data, count * stride);
+    gpu::Context::cpu_modified(layer.buffer.get(), dirty_from * stride, (needed - dirty_from) * stride);
     layer.count = needed;
 }
 
@@ -115,11 +118,13 @@ void SceneRenderer::set_mesh(std::span<const MeshVertex> vertices, std::span<con
     mesh_vertices_ = {};
     mesh_indices_ = {};
     if (vertices.empty() || indices.empty()) return;
-    mesh_vertices_ = ctx_->buffer(vertices.size_bytes());
-    mesh_indices_ = ctx_->buffer(indices.size_bytes());
+    mesh_vertices_ = ctx_->mirrored_buffer(vertices.size_bytes());
+    mesh_indices_ = ctx_->mirrored_buffer(indices.size_bytes());
     if (!mesh_vertices_ || !mesh_indices_) return;
     std::memcpy(mesh_vertices_->contents(), vertices.data(), vertices.size_bytes());
     std::memcpy(mesh_indices_->contents(), indices.data(), indices.size_bytes());
+    gpu::Context::cpu_modified(mesh_vertices_.get());
+    gpu::Context::cpu_modified(mesh_indices_.get());
     mesh_index_count_ = indices.size();
 }
 

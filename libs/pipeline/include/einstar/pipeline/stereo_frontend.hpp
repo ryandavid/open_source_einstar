@@ -68,8 +68,16 @@ public:
     [[nodiscard]] const markers::MarkerStereo& marker_stereo() const { return *marker_stereo_; }
 
 private:
-    void add_markers(const ImageU8& raw_left, const ImageU8& raw_right, DepthOutput& out,
-                     const std::array<std::vector<depth_metal::BlobBox>, 2>* gpu_blobs = nullptr) const;
+    // Sub-pixel ellipse fits of the GPU's blob candidates (left, right).
+    struct FittedMarkers {
+        std::vector<markers::Ellipse> left, right;
+        int candidates = 0;
+        double ms = 0;
+    };
+    [[nodiscard]] FittedMarkers fit_gpu_blobs(const ImageU8& raw_left, const ImageU8& raw_right,
+                                              const std::array<std::vector<depth_metal::BlobBox>, 2>& blobs) const;
+    // Markers from `fitted`, or detected on the CPU when null.
+    void add_markers(const ImageU8& raw_left, const ImageU8& raw_right, DepthOutput& out, FittedMarkers* fitted = nullptr) const;
 
     StereoFrontendParams params_;
     calib::StereoRectification rect_;

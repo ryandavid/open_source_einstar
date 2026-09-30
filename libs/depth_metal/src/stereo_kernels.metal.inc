@@ -98,10 +98,12 @@ constant uint kMaxD = 512;
 kernel void sgm_path(device const uchar* cost [[buffer(0)]], device ushort* sum [[buffer(1)]],
                      device const uchar* guide [[buffer(2)]], constant PathArgs& a [[buffer(3)]],
                      uint line [[threadgroup_position_in_grid]], uint k [[thread_index_in_threadgroup]],
-                     uint tg_size [[threads_per_threadgroup]], uint lane [[thread_index_in_simdgroup]],
-                     uint simd_id [[simdgroup_index_in_threadgroup]]) {
+                     uint lane [[thread_index_in_simdgroup]], uint simd_id [[simdgroup_index_in_threadgroup]],
+                     uint nsimd [[simdgroups_per_threadgroup]]) {
     threadgroup ushort prev[kMaxD];
-    threadgroup ushort simd_mins[32];
+    // One slot per SIMD group. The width is the GPU's (32 on Apple, 64 on AMD, 8-32 on Intel), so
+    // size for the narrowest and read back only the groups that exist.
+    threadgroup ushort simd_mins[kMaxD / 8];
     threadgroup ushort prev_min_shared;
 
     // Start pixel of this scanline (same enumeration as the CPU: x-entry border first, then y border).
@@ -133,7 +135,7 @@ kernel void sgm_path(device const uchar* cost [[buffer(0)]], device ushort* sum 
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (k == 0) {
         ushort mm = 0xFFFF;
-        for (uint s = 0; s < (tg_size + 31) / 32; ++s) mm = min(mm, simd_mins[s]);
+        for (uint s = 0; s < nsimd; ++s) mm = min(mm, simd_mins[s]);
         prev_min_shared = mm;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -167,7 +169,7 @@ kernel void sgm_path(device const uchar* cost [[buffer(0)]], device ushort* sum 
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (k == 0) {
             ushort mm = 0xFFFF;
-            for (uint s = 0; s < (tg_size + 31) / 32; ++s) mm = min(mm, simd_mins[s]);
+            for (uint s = 0; s < nsimd; ++s) mm = min(mm, simd_mins[s]);
             prev_min_shared = mm;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -175,6 +177,91 @@ kernel void sgm_path(device const uchar* cost [[buffer(0)]], device ushort* sum 
         y += a.dy;
     }
 }
+
+// Barrier-free variant for GPUs where the threadgroup barriers above dominate (AMD: 3 barriers per
+// step across 4 wavefronts). One SIMD group per scanline; lane l holds disparities l*DPL .. l*DPL+DPL-1
+// and gets its neighbours' edge values by shuffles. Same integer arithmetic, so the same sums.
+template <int DPL>
+inline void sgm_path_simd_body(device const uchar* cost, device ushort* sum, device const uchar* guide, constant PathArgs& a,
+                               uint line, uint lane) {
+    int x, y;
+    const int W = int(a.w), H = int(a.h);
+    if (a.dx != 0 && a.dy == 0) { x = a.dx > 0 ? 0 : W - 1; y = int(line); }
+    else if (a.dx == 0) { x = int(line); y = a.dy > 0 ? 0 : H - 1; }
+    else {
+        if (int(line) < H) { x = a.dx > 0 ? 0 : W - 1; y = int(line); }
+        else {
+            int idx = int(line) - H;
+            const int corner = a.dx > 0 ? 0 : W - 1;
+            if (idx >= corner) idx += 1;
+            x = idx; y = a.dy > 0 ? 0 : H - 1;
+        }
+    }
+    const int nd = int(a.nd);
+    const int k0 = int(lane) * DPL;
+    uint prev[DPL];
+    uint lmin = 0xFFFF;
+    {
+        const ulong base = (ulong(y) * a.w + uint(x)) * a.nd;
+        for (int j = 0; j < DPL; ++j) {
+            const int k = k0 + j;
+            const uint v = k < nd ? uint(cost[base + uint(k)]) : 0xFFFFu;
+            prev[j] = v;
+            if (k < nd) sum[base + uint(k)] = a.first ? ushort(v) : ushort(sum[base + uint(k)] + v);
+            lmin = min(lmin, v);
+        }
+    }
+    int pm = int(simd_min(lmin));
+    int prev_intensity = guide[uint(y) * a.w + uint(x)];
+    x += a.dx;
+    y += a.dy;
+    while (x >= 0 && y >= 0 && x < W && y < H) {
+        const int intensity = guide[uint(y) * a.w + uint(x)];
+        int p2 = a.p2;
+        if (a.adaptive) p2 = max(a.p1 + 1, a.p2 / (abs(intensity - prev_intensity) / 8 + 1));
+        prev_intensity = intensity;
+        // Neighbouring lanes' edge values (only read where k - 1, k - 2, k + 1, k + 2 are in range).
+        const uint l1 = simd_shuffle_up(prev[DPL - 1], 1), l2 = simd_shuffle_up(prev[DPL - 2], 1);
+        const uint r1 = simd_shuffle_down(prev[0], 1), r2 = simd_shuffle_down(prev[1], 1);
+        const ulong base = (ulong(y) * a.w + uint(x)) * a.nd;
+        uint cur[DPL];
+        lmin = 0xFFFF;
+        for (int j = 0; j < DPL; ++j) {
+            const int k = k0 + j;
+            if (k >= nd) { cur[j] = 0xFFFF; continue; }
+            const int c = int(cost[base + uint(k)]);
+            const int km1 = j >= 1 ? int(prev[j - 1]) : int(l1);
+            const int km2 = j >= 2 ? int(prev[j - 2]) : (j == 1 ? int(l1) : int(l2));
+            const int kp1 = j + 1 < DPL ? int(prev[j + 1]) : int(r1);
+            const int kp2 = j + 2 < DPL ? int(prev[j + 2]) : (j + 1 < DPL ? int(r1) : int(r2));
+            int best = min(int(prev[j]), pm + p2);
+            if (k > 0) best = min(best, km1 + a.p1);
+            if (k + 1 < nd) best = min(best, kp1 + a.p1);
+            if (a.slant) {
+                if (k > 1) best = min(best, km2 + a.p1);
+                if (k + 2 < nd) best = min(best, kp2 + a.p1);
+            }
+            const uint v = uint(ushort(c + best - pm));
+            cur[j] = v;
+            sum[base + uint(k)] = a.first ? ushort(v) : ushort(sum[base + uint(k)] + v);
+            lmin = min(lmin, v);
+        }
+        for (int j = 0; j < DPL; ++j) prev[j] = cur[j];
+        pm = int(simd_min(lmin));
+        x += a.dx;
+        y += a.dy;
+    }
+}
+
+#define SGM_PATH_SIMD(DPL)                                                                                       \
+    kernel void sgm_path_simd##DPL(device const uchar* cost [[buffer(0)]], device ushort* sum [[buffer(1)]],     \
+                                   device const uchar* guide [[buffer(2)]], constant PathArgs& a [[buffer(3)]], \
+                                   uint line [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) { \
+        sgm_path_simd_body<DPL>(cost, sum, guide, a, line, lane);                                                \
+    }
+SGM_PATH_SIMD(2)
+SGM_PATH_SIMD(4)
+SGM_PATH_SIMD(8)
 
 // ---- winner-takes-all (left) + right disparity from the same volume ----
 struct WtaArgs { uint w; uint h; uint nd; int min_disp; float uniqueness; uint subpixel; };
@@ -204,6 +291,59 @@ kernel void wta_left(device const ushort* sum [[buffer(0)]], device float* disp 
         }
     }
     disp[gid.y * a.w + gid.x] = out;
+}
+
+// Both WTA passes for one image row per threadgroup, for GPUs whose memory system does not absorb the
+// strided per-pixel scans above (AMD: 40 -> 0.7 ms). One SIMD group per left pixel, lanes over the
+// disparities, so every read is contiguous; the right disparities come from the same reads as a
+// per-row minimum of packed (cost << 16 | k) keys in threadgroup memory. Results are identical to
+// wta_left + wta_right: ties go to the lowest k, and all-0xFFFF right candidates stay invalid.
+constant uint kWtaMaxRow = 1024;
+
+kernel void wta_rows(device const ushort* sum [[buffer(0)]], device float* disp [[buffer(1)]], device int* rdisp [[buffer(2)]],
+                     constant WtaArgs& a [[buffer(3)]], uint y [[threadgroup_position_in_grid]],
+                     uint tid [[thread_index_in_threadgroup]], uint tg_size [[threads_per_threadgroup]],
+                     uint lane [[thread_index_in_simdgroup]], uint width [[threads_per_simdgroup]],
+                     uint simd_id [[simdgroup_index_in_threadgroup]], uint nsimd [[simdgroups_per_threadgroup]]) {
+    threadgroup atomic_uint right_best[kWtaMaxRow];
+    for (uint x = tid; x < a.w; x += tg_size) atomic_store_explicit(&right_best[x], 0xFFFFFFFFu, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint x = simd_id; x < a.w; x += nsimd) {
+        device const ushort* s = sum + (ulong(y) * a.w + x) * a.nd;
+        const int max_k = min(int(a.nd), int(x) - a.min_disp + 1);
+        if (max_k <= 0) {  // uniform across the SIMD group
+            if (lane == 0) disp[y * a.w + x] = kInvalid;
+            continue;
+        }
+        uint best = 0xFFFFFFFFu;
+        for (int k = int(lane); k < max_k; k += int(width)) {
+            const uint v = s[k];
+            const uint key = (v << 16) | uint(k);
+            best = min(best, key);
+            // The right pixel that sees this candidate: xr = x - min_disp - k (>= 0 because k < max_k).
+            if (v != 0xFFFFu) atomic_fetch_min_explicit(&right_best[uint(int(x) - a.min_disp - k)], key, memory_order_relaxed);
+        }
+        best = simd_min(best);
+        const int best_k = int(best & 0xFFFFu);
+        ushort second = 0xFFFF;
+        for (int k = int(lane); k < max_k; k += int(width))
+            if (abs(k - best_k) > 1) second = min(second, s[k]);
+        second = simd_min(second);
+        if (lane == 0) {
+            float out = kInvalid;
+            if (!(second != 0xFFFF && float(best >> 16) >= a.uniqueness * float(second))) {
+                float d = float(a.min_disp + best_k);
+                if (a.subpixel && best_k > 0 && best_k + 1 < max_k) d += subpixel_offset(s[best_k - 1], s[best_k], s[best_k + 1]);
+                out = d;
+            }
+            disp[y * a.w + x] = out;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint x = tid; x < a.w; x += tg_size) {
+        const uint key = atomic_load_explicit(&right_best[x], memory_order_relaxed);
+        rdisp[y * a.w + x] = key == 0xFFFFFFFFu ? -1 : a.min_disp + int(key & 0xFFFFu);
+    }
 }
 
 kernel void wta_right(device const ushort* sum [[buffer(0)]], device int* rdisp [[buffer(1)]],
@@ -486,7 +626,7 @@ struct BlobOut { uint x0; uint y0; uint x1; uint y1; uint pixels; uint peak; };
 kernel void blob_init(device const uchar* img [[buffer(0)]], device atomic_int* L [[buffer(1)]],
                       device atomic_uint* count [[buffer(2)]], device atomic_uint* bx0 [[buffer(3)]], device atomic_uint* by0 [[buffer(4)]],
                       device atomic_uint* bx1 [[buffer(5)]], device atomic_uint* by1 [[buffer(6)]], device atomic_uint* peak [[buffer(7)]],
-                      device atomic_float* mom [[buffer(8)]], constant BlobArgs& a [[buffer(9)]], uint2 gid [[thread_position_in_grid]]) {
+                      device atomic_int* mom [[buffer(8)]], constant BlobArgs& a [[buffer(9)]], uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= a.w || gid.y >= a.h) return;
     const uint i = gid.y * a.w + gid.x;
     const bool fg = img[i] > a.threshold;
@@ -498,7 +638,7 @@ kernel void blob_init(device const uchar* img [[buffer(0)]], device atomic_int* 
     atomic_store_explicit(&bx1[i], 0u, memory_order_relaxed);
     atomic_store_explicit(&by1[i], 0u, memory_order_relaxed);
     atomic_store_explicit(&peak[i], 0u, memory_order_relaxed);
-    for (uint k = 0; k < 5; ++k) atomic_store_explicit(&mom[5 * i + k], 0.0f, memory_order_relaxed);
+    for (uint k = 0; k < 5; ++k) atomic_store_explicit(&mom[5 * i + k], 0, memory_order_relaxed);
 }
 
 kernel void blob_merge(device const uchar* img [[buffer(0)]], device atomic_int* L [[buffer(1)]], constant BlobArgs& a [[buffer(2)]],
@@ -513,7 +653,7 @@ kernel void blob_merge(device const uchar* img [[buffer(0)]], device atomic_int*
 kernel void blob_stats(device const uchar* img [[buffer(0)]], device atomic_int* L [[buffer(1)]],
                        device atomic_uint* count [[buffer(2)]], device atomic_uint* bx0 [[buffer(3)]], device atomic_uint* by0 [[buffer(4)]],
                        device atomic_uint* bx1 [[buffer(5)]], device atomic_uint* by1 [[buffer(6)]], device atomic_uint* peak [[buffer(7)]],
-                       device atomic_float* mom [[buffer(8)]], constant BlobArgs& a [[buffer(9)]], uint2 gid [[thread_position_in_grid]]) {
+                       device atomic_int* mom [[buffer(8)]], constant BlobArgs& a [[buffer(9)]], uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= a.w || gid.y >= a.h) return;
     const uint i = gid.y * a.w + gid.x;
     if (img[i] <= a.threshold) return;
@@ -524,8 +664,10 @@ kernel void blob_stats(device const uchar* img [[buffer(0)]], device atomic_int*
     atomic_fetch_max_explicit(&bx1[r], gid.x, memory_order_relaxed);
     atomic_fetch_max_explicit(&by1[r], gid.y, memory_order_relaxed);
     atomic_fetch_max_explicit(&peak[r], uint(img[i]), memory_order_relaxed);
-    // Moments relative to the root pixel (small numbers: no cancellation in float).
-    const float dx = float(int(gid.x) - int(uint(r) % a.w)), dy = float(int(gid.y) - int(uint(r) / a.w));
+    // Moments relative to the root pixel, exact in integers: blobs that can pass the size gates span at
+    // most max_diameter pixels, so the sums stay far below 2^31 (larger blobs may wrap; they are
+    // rejected by their box first). Integer atomics are native everywhere; float adds are not.
+    const int dx = int(gid.x) - int(uint(r) % a.w), dy = int(gid.y) - int(uint(r) / a.w);
     atomic_fetch_add_explicit(&mom[5 * uint(r) + 0], dx, memory_order_relaxed);
     atomic_fetch_add_explicit(&mom[5 * uint(r) + 1], dy, memory_order_relaxed);
     atomic_fetch_add_explicit(&mom[5 * uint(r) + 2], dx * dx, memory_order_relaxed);
@@ -541,7 +683,7 @@ inline float sample_img(device const uchar* img, constant BlobArgs& a, float x, 
 kernel void blob_select(device const uchar* img [[buffer(0)]], device atomic_int* L [[buffer(1)]],
                         device atomic_uint* count [[buffer(2)]], device atomic_uint* bx0 [[buffer(3)]], device atomic_uint* by0 [[buffer(4)]],
                         device atomic_uint* bx1 [[buffer(5)]], device atomic_uint* by1 [[buffer(6)]], device atomic_uint* peak [[buffer(7)]],
-                        device atomic_float* mom [[buffer(8)]], device BlobOut* out [[buffer(9)]], device atomic_uint* n_out [[buffer(10)]],
+                        device atomic_int* mom [[buffer(8)]], device BlobOut* out [[buffer(9)]], device atomic_uint* n_out [[buffer(10)]],
                         constant BlobArgs& a [[buffer(11)]], uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= a.w || gid.y >= a.h) return;
     const uint i = gid.y * a.w + gid.x;
@@ -559,11 +701,11 @@ kernel void blob_select(device const uchar* img [[buffer(0)]], device atomic_int
         return;
     // Ellipse of the blob from its second moments (a filled ellipse has variance (axis/2)^2).
     const float n = float(px);
-    const float mx = atomic_load_explicit(&mom[5 * i + 0], memory_order_relaxed) / n;
-    const float my = atomic_load_explicit(&mom[5 * i + 1], memory_order_relaxed) / n;
-    const float cxx = atomic_load_explicit(&mom[5 * i + 2], memory_order_relaxed) / n - mx * mx;
-    const float cxy = atomic_load_explicit(&mom[5 * i + 3], memory_order_relaxed) / n - mx * my;
-    const float cyy = atomic_load_explicit(&mom[5 * i + 4], memory_order_relaxed) / n - my * my;
+    const float mx = float(atomic_load_explicit(&mom[5 * i + 0], memory_order_relaxed)) / n;
+    const float my = float(atomic_load_explicit(&mom[5 * i + 1], memory_order_relaxed)) / n;
+    const float cxx = float(atomic_load_explicit(&mom[5 * i + 2], memory_order_relaxed)) / n - mx * mx;
+    const float cxy = float(atomic_load_explicit(&mom[5 * i + 3], memory_order_relaxed)) / n - mx * my;
+    const float cyy = float(atomic_load_explicit(&mom[5 * i + 4], memory_order_relaxed)) / n - my * my;
     const float tr = 0.5f * (cxx + cyy), det = sqrt(max(0.0f, 0.25f * (cxx - cyy) * (cxx - cyy) + cxy * cxy));
     const float l1 = tr + det, l2 = max(tr - det, 0.0625f);
     const float ea = 2.0f * sqrt(l1) + 0.5f, eb = 2.0f * sqrt(l2) + 0.5f;  // + half a pixel: the threshold edge sits inside the half-level contour

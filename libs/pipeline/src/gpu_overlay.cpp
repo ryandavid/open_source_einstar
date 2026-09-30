@@ -47,7 +47,7 @@ std::unique_ptr<GpuOverlay> GpuOverlay::create(std::shared_ptr<gpu::Context> ctx
     auto o = std::make_unique<GpuOverlay>();
     o->ctx_ = std::move(ctx);
     o->pso_ = std::move(*pso);
-    o->counter_ = o->ctx_->buffer(4);
+    o->counter_ = o->ctx_->mirrored_buffer(4);
     return o;
 }
 
@@ -55,7 +55,7 @@ GpuOverlay::Points GpuOverlay::frame_points(const gpu::MetalFrameData& f, const 
     Points out;
     const int gw = (f.width() + step - 1) / step, gh = (f.height() + step - 1) / step;
     const auto cap = static_cast<std::size_t>(gw * gh);
-    out.buffer = ctx_->buffer(cap * sizeof(render::PointVertex));
+    out.buffer = ctx_->gpu_buffer(cap * sizeof(render::PointVertex));  // drawn by the renderer only
     Args a{};
     const Eigen::Matrix4f T = T_wc.matrix().cast<float>();
     std::memcpy(a.T, T.data(), sizeof(a.T));
@@ -65,6 +65,7 @@ GpuOverlay::Points GpuOverlay::frame_points(const gpu::MetalFrameData& f, const 
     a.capacity = static_cast<std::uint32_t>(cap);
     a.color = color;
     *static_cast<std::uint32_t*>(counter_->contents()) = 0;
+    gpu::Context::cpu_modified(counter_.get());
     NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
     MTL::CommandBuffer* cmd = ctx_->queue()->commandBuffer();
     MTL::ComputeCommandEncoder* enc = cmd->computeCommandEncoder();
@@ -76,6 +77,7 @@ GpuOverlay::Points GpuOverlay::frame_points(const gpu::MetalFrameData& f, const 
     enc->setBytes(&a, sizeof(a), 4);
     enc->dispatchThreads(MTL::Size(static_cast<NS::UInteger>(gw), static_cast<NS::UInteger>(gh), 1), MTL::Size(16, 16, 1));
     enc->endEncoding();
+    gpu::Context::sync_for_cpu(cmd, {counter_.get()});
     gpu::profile::commit_and_wait(cmd, "overlay/frame points");
     pool->release();
     out.count = std::min<std::size_t>(*static_cast<std::uint32_t*>(counter_->contents()), cap);

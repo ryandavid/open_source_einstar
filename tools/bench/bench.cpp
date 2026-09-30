@@ -121,7 +121,11 @@ static void bench_pipeline(const RigCalibration& rig) {
         pipeline::StereoFrontendParams fp;
         fp.detect_markers = markers;
         std::atomic<int> done{0};
-        pipeline::ScanPipeline pipe(std::make_unique<pipeline::StereoFrontend>(rig, fp), pp, [&](pipeline::LiveUpdate&&) { ++done; });
+        pipeline::LiveStats stats;  // written by the pipeline thread, read after stop()
+        pipeline::ScanPipeline pipe(std::make_unique<pipeline::StereoFrontend>(rig, fp), pp, [&](pipeline::LiveUpdate&& u) {
+            stats = u.stats;
+            ++done;
+        });
         if (record) pipe.set_recording_directory(dir.string());
         pipe.start();
         auto wait_all = [&](int count) {
@@ -144,7 +148,8 @@ static void bench_pipeline(const RigCalibration& rig) {
         const double wall = sw.elapsed_ms(), cpu = process_cpu_ms() - c0;
         pipe.stop();
         std::filesystem::remove_all(dir);
-        std::println("{:34} wall {:6.2f} ms/frame, process CPU {:6.2f} ms/frame", name, wall / (n - 5), cpu / (n - 5));
+        std::println("{:34} wall {:6.2f} ms/frame, process CPU {:6.2f} ms/frame (median stereo {:.1f}, markers {:.1f}, track {:.1f} ms)", name,
+                     wall / (n - 5), cpu / (n - 5), stats.stereo_ms, stats.marker_ms, stats.track_ms);
         if (gpu::profile::enabled()) std::print("{}", gpu::profile::report(n - 5));
     };
     std::println("== scan pipeline ({} frames) ==", n - 5);
@@ -153,19 +158,20 @@ static void bench_pipeline(const RigCalibration& rig) {
     run("no recording, no markers", false, false);
 }
 
+// The scanner's calibration: EXStar's cache when installed, else the copy in tests/fixtures.
+static RigCalibration bench_rig() {
+    if (auto cal = calib::load_ccf_directory("/Applications/EXStar.app/Contents/Resources/res/Einscan-E10/200x150")) return cal->rig();
+    if (auto cal = calib::load_ccf_directory(EINSTAR_CALIBRATION_FIXTURE)) return cal->rig();
+    std::println(stderr, "no calibration found; using the synthetic Einstar rig");
+    return synth::synthetic_einstar_rig();
+}
+
 int main(int argc, char** argv) {
     if (argc > 1 && std::string_view(argv[1]) == "pipeline") {
-        auto cal = calib::load_ccf_directory("/Applications/EXStar.app/Contents/Resources/res/Einscan-E10/200x150");
-        if (!cal) return 1;
-        bench_pipeline(cal->rig());
+        bench_pipeline(bench_rig());
         return 0;
     }
-    auto cal = calib::load_ccf_directory("/Applications/EXStar.app/Contents/Resources/res/Einscan-E10/200x150");
-    if (!cal) {
-        std::println(stderr, "needs EXStar calibration cache");
-        return 1;
-    }
-    const auto rig = cal->rig();
+    const auto rig = bench_rig();
     const SE3 T_lr = rig.T_right_left.inverse();
     synth::Scene scene;
     scene.primitives.push_back(synth::Plane{Vec3(0, 70, 0), Vec3(0, -1, 0)});
@@ -265,10 +271,10 @@ int main(int argc, char** argv) {
             if (std::getenv("EINSTAR_ICP_DUMP")) {
                 // Exact result of repeated solves (determinism / kernel-change parity).
                 for (int rep = 0; rep < 3; ++rep) {
-                    const auto r = (*gicp)->solve(df, model, pose, pose, ip);
+                    const auto res = (*gicp)->solve(df, model, pose, pose, ip);
                     std::print("  pose");
-                    for (int e = 0; e < 12; ++e) std::print(" {:a}", static_cast<float>(r.T_world_camera.matrix()(e % 3, e / 3)));
-                    std::println("  n {} rms {:a}", r.correspondences, static_cast<float>(r.rms_mm));
+                    for (int e = 0; e < 12; ++e) std::print(" {:a}", static_cast<float>(res.T_world_camera.matrix()(e % 3, e / 3)));
+                    std::println("  n {} rms {:a}", res.correspondences, static_cast<float>(res.rms_mm));
                 }
             }
         }

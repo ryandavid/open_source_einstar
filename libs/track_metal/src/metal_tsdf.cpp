@@ -100,12 +100,15 @@ struct MetalTsdfVolume::Impl {
         return a;
     }
 
-    void run(const char* label, const std::function<void(MTL::ComputeCommandEncoder*)>& encode) const {
+    // Runs one command buffer; `read_back` are managed buffers the CPU reads afterwards.
+    void run(const char* label, const std::function<void(MTL::ComputeCommandEncoder*)>& encode,
+             std::initializer_list<MTL::Buffer*> read_back = {}) const {
         NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
         MTL::CommandBuffer* cmd = ctx->queue()->commandBuffer();
         MTL::ComputeCommandEncoder* enc = cmd->computeCommandEncoder();
         encode(enc);
         enc->endEncoding();
+        gpu::Context::sync_for_cpu(cmd, read_back);
         gpu::profile::commit_and_wait(cmd, label);
         if (cmd->status() == MTL::CommandBufferStatusError) log::error("Metal TSDF command buffer failed");
         pool->release();
@@ -113,11 +116,17 @@ struct MetalTsdfVolume::Impl {
 
     [[nodiscard]] std::uint32_t count() const { return std::min(*static_cast<std::uint32_t*>(brick_count->contents()), opt.brick_capacity); }
 
-    int lookup(const track::BrickCoord& b) const {
+    // CPU view of the first `bytes` of a GPU buffer: in place on unified memory, else a copy in `scratch`.
+    const void* host_view(MTL::Buffer* b, std::size_t bytes, std::vector<std::byte>& scratch) const {
+        if (b->storageMode() == MTL::StorageModeShared) return b->contents();
+        scratch.resize(bytes);
+        ctx->download(b, 0, scratch.data(), bytes);
+        return scratch.data();
+    }
+
+    int lookup(const track::BrickCoord& b, const std::uint32_t* k, const std::int32_t* v) const {
         std::uint32_t key;
         if (!pack_key(b, key)) return -1;
-        const auto* k = static_cast<const std::uint32_t*>(keys->contents());
-        const auto* v = static_cast<const std::int32_t*>(values->contents());
         std::uint32_t i = hash_key(key, opt.table_size - 1);
         for (int probe = 0; probe < 128; ++probe) {
             if (k[i] == key) return v[i];
@@ -148,17 +157,19 @@ Result<std::unique_ptr<MetalTsdfVolume>> MetalTsdfVolume::create(std::shared_ptr
         *slot = std::move(*p);
     }
     const std::size_t cap = opt.brick_capacity;
-    im->keys = im->ctx->buffer(opt.table_size * 4ull);
-    im->values = im->ctx->buffer(opt.table_size * 4ull);
-    im->coords = im->ctx->buffer(cap * 16);
-    im->brick_count = im->ctx->buffer(4);
-    im->stamps = im->ctx->buffer(cap * 4);
-    im->visible_count = im->ctx->buffer(4);
-    im->visible = im->ctx->buffer(cap * 4);
-    im->voxels = im->ctx->buffer(cap * 512 * 4);
-    im->last_update = im->ctx->buffer(cap * 4);
-    im->occupancy = im->ctx->buffer((256ull * 256 * 128) / 8);  // see occupancy_index in the kernels
-    im->ext_count = im->ctx->buffer(4);
+    // The volume lives on the GPU (the CPU only reads it back for processing); the counters are
+    // written and read by the CPU around each dispatch (see gpu::Context).
+    im->keys = im->ctx->gpu_buffer(opt.table_size * 4ull);
+    im->values = im->ctx->gpu_buffer(opt.table_size * 4ull);
+    im->coords = im->ctx->gpu_buffer(cap * 16);
+    im->brick_count = im->ctx->mirrored_buffer(4);
+    im->stamps = im->ctx->gpu_buffer(cap * 4);
+    im->visible_count = im->ctx->mirrored_buffer(4);
+    im->visible = im->ctx->gpu_buffer(cap * 4);
+    im->voxels = im->ctx->gpu_buffer(cap * 512 * 4);
+    im->last_update = im->ctx->gpu_buffer(cap * 4);
+    im->occupancy = im->ctx->gpu_buffer((256ull * 256 * 128) / 8);  // see occupancy_index in the kernels
+    im->ext_count = im->ctx->mirrored_buffer(4);
     if (!im->voxels) return make_error(Errc::unsupported, "could not allocate the brick pool");
     auto vol = std::unique_ptr<MetalTsdfVolume>(new MetalTsdfVolume(std::move(im), params));
     vol->clear();
@@ -168,12 +179,13 @@ Result<std::unique_ptr<MetalTsdfVolume>> MetalTsdfVolume::create(std::shared_ptr
 
 void MetalTsdfVolume::clear() {
     auto& im = *impl_;
-    std::memset(im.keys->contents(), 0xFF, im.keys->length());
-    std::memset(im.values->contents(), 0xFF, im.values->length());
-    std::memset(im.stamps->contents(), 0, im.stamps->length());
-    std::memset(im.last_update->contents(), 0, im.last_update->length());
-    std::memset(im.occupancy->contents(), 0, im.occupancy->length());
+    im.ctx->fill(im.keys.get(), 0xFF);
+    im.ctx->fill(im.values.get(), 0xFF);
+    im.ctx->fill(im.stamps.get(), 0);
+    im.ctx->fill(im.last_update.get(), 0);
+    im.ctx->fill(im.occupancy.get(), 0);
     *static_cast<std::uint32_t*>(im.brick_count->contents()) = 0;
+    gpu::Context::cpu_modified(im.brick_count.get());
     im.run("tsdf/init_voxels", [&](MTL::ComputeCommandEncoder* enc) {
         enc->setComputePipelineState(im.init_voxels.get());
         enc->setBuffer(im.voxels.get(), 0, 0);
@@ -185,10 +197,11 @@ void MetalTsdfVolume::clear() {
 std::size_t MetalTsdfVolume::brick_count() const { return impl_->count(); }
 
 void MetalTsdfVolume::for_each_brick(const BrickVisitor& fn) const {
-    // Shared storage: read the pool in place (half sdf, half weight per voxel).
+    // The pool: half sdf, half weight per voxel (read in place on unified memory).
     const auto& im = *impl_;
-    const auto* coords = static_cast<const std::int32_t*>(im.coords->contents());
-    const auto* vox = static_cast<const _Float16*>(im.voxels->contents());
+    std::vector<std::byte> coords_copy, vox_copy;
+    const auto* coords = static_cast<const std::int32_t*>(im.host_view(im.coords.get(), im.count() * 16ull, coords_copy));
+    const auto* vox = static_cast<const _Float16*>(im.host_view(im.voxels.get(), im.count() * 512ull * 4, vox_copy));
     std::array<float, track::kBrickVoxels> sdf{}, weight{};
     for (std::uint32_t b = 0; b < im.count(); ++b) {
         const track::BrickCoord c{coords[4 * b], coords[4 * b + 1], coords[4 * b + 2]};
@@ -217,8 +230,8 @@ void MetalTsdfVolume::integrate(const track::DepthFrame& frame, const SE3& T_wor
         weights_buf = dev->weights_buffer();
     } else {
         if (n != im.frame_pixels) {
-            im.points = im.ctx->buffer(n * 16);
-            im.weights = im.ctx->buffer(n * 4);
+            im.points = im.ctx->mirrored_buffer(n * 16);
+            im.weights = im.ctx->mirrored_buffer(n * 4);
             im.frame_pixels = n;
         }
         frame.ensure_cpu();
@@ -232,6 +245,8 @@ void MetalTsdfVolume::integrate(const track::DepthFrame& frame, const SE3& T_wor
             pts[4 * i + 3] = 1.0f;
             wts[i] = frame.weights.empty() ? 1.0f : frame.weights.data()[i];
         }
+        gpu::Context::cpu_modified(im.points.get());
+        gpu::Context::cpu_modified(im.weights.get());
         points_buf = im.points.get();
         weights_buf = im.weights.get();
     }
@@ -242,6 +257,7 @@ void MetalTsdfVolume::integrate(const track::DepthFrame& frame, const SE3& T_wor
     const auto& k = frame.intrinsics;
     const CameraArgs cam = camera_args(T_world_camera, k.fx, k.fy, k.cx, k.cy, w, h);
     *static_cast<std::uint32_t*>(im.visible_count->contents()) = 0;
+    gpu::Context::cpu_modified(im.visible_count.get());
     im.run("tsdf/allocate", [&](MTL::ComputeCommandEncoder* enc) {
         enc->setComputePipelineState(im.allocate.get());
         enc->setBuffer(points_buf, 0, 0);
@@ -256,7 +272,7 @@ void MetalTsdfVolume::integrate(const track::DepthFrame& frame, const SE3& T_wor
         enc->setBytes(&cam, sizeof(cam), 9);
         enc->setBuffer(im.occupancy.get(), 0, 10);
         enc->dispatchThreads(MTL::Size(static_cast<NS::UInteger>(w), static_cast<NS::UInteger>(h), 1), MTL::Size(16, 16, 1));
-    });
+    }, {im.visible_count.get(), im.brick_count.get()});
     const std::uint32_t visible = std::min(*static_cast<std::uint32_t*>(im.visible_count->contents()), im.opt.brick_capacity);
     if (pool_exhausted()) log::warn("Metal TSDF brick pool exhausted ({} bricks); new surface is not stored", im.opt.brick_capacity);
     if (visible == 0) return;
@@ -278,8 +294,8 @@ track::RaycastResult MetalTsdfVolume::raycast(const SE3& T_world_camera, const t
     auto& im = *impl_;
     const auto n = static_cast<std::size_t>(k.width * k.height);
     // Fresh output buffers each call: the result may be held (e.g. by ICP) while the next raycast runs.
-    auto points = im.ctx->buffer(n * 16);
-    auto normals = im.ctx->buffer(n * 16);
+    auto points = im.ctx->mirrored_buffer(n * 16);
+    auto normals = im.ctx->mirrored_buffer(n * 16);
     const VolumeArgs a = im.args(params_, frame_);
     const CameraArgs cam = camera_args(T_world_camera, k.fx, k.fy, k.cx, k.cy, k.width, k.height);
     im.run("tsdf/raycast", [&](MTL::ComputeCommandEncoder* enc) {
@@ -292,11 +308,13 @@ track::RaycastResult MetalTsdfVolume::raycast(const SE3& T_world_camera, const t
         enc->setBytes(&a, sizeof(a), 5);
         enc->setBytes(&cam, sizeof(cam), 6);
         enc->setBuffer(im.occupancy.get(), 0, 7);
-        enc->dispatchThreads(MTL::Size(static_cast<NS::UInteger>(k.width), static_cast<NS::UInteger>(k.height), 1), MTL::Size(16, 16, 1));
+        // 8x8 tiles keep a (64-wide) AMD wavefront's rays together; Apple GPUs keep their 16x16.
+        const NS::UInteger tile = im.ctx->apple_gpu() ? 16 : 8;
+        enc->dispatchThreads(MTL::Size(static_cast<NS::UInteger>(k.width), static_cast<NS::UInteger>(k.height), 1), MTL::Size(tile, tile, 1));
     });
     track::RaycastResult out;
     out.intrinsics = k;
-    out.device = std::make_shared<gpu::MetalRaycastData>(k.width, k.height, std::move(points), std::move(normals));
+    out.device = std::make_shared<gpu::MetalRaycastData>(k.width, k.height, std::move(points), std::move(normals), im.ctx);
     return out;
 }
 
@@ -311,11 +329,12 @@ std::vector<track::SurfacePoint> MetalTsdfVolume::extract_points(std::uint32_t s
     for (int attempt = 0; attempt < 3; ++attempt) {
         const std::size_t cap = std::max<std::size_t>(im.ext_capacity, static_cast<std::size_t>(bricks) * 128);
         if (cap > im.ext_capacity) {
-            im.ext_out = im.ctx->buffer(cap * sizeof(GpuSurfacePoint));
+            im.ext_out = im.ctx->gpu_buffer(cap * sizeof(GpuSurfacePoint));
             im.ext_capacity = cap;
         }
-        if (!im.ext_list) im.ext_list = im.ctx->buffer(4);
+        if (!im.ext_list) im.ext_list = im.ctx->gpu_buffer(4);
         *static_cast<std::uint32_t*>(im.ext_count->contents()) = 0;
+        gpu::Context::cpu_modified(im.ext_count.get());
         const auto cap32 = static_cast<std::uint32_t>(im.ext_capacity);
         const std::uint32_t use_list = 0;
         im.run("tsdf/extract", [&](MTL::ComputeCommandEncoder* enc) {
@@ -332,15 +351,16 @@ std::vector<track::SurfacePoint> MetalTsdfVolume::extract_points(std::uint32_t s
             enc->setBuffer(im.ext_list.get(), 0, 9);
             enc->setBytes(&use_list, sizeof(use_list), 10);
             enc->dispatchThreadgroups(MTL::Size(bricks, 1, 1), MTL::Size(8, 8, 8));
-        });
+        }, {im.ext_count.get()});
         const std::uint32_t found = *static_cast<std::uint32_t*>(im.ext_count->contents());
         if (found > im.ext_capacity) {
             im.ext_capacity = found + found / 4;
-            im.ext_out = im.ctx->buffer(im.ext_capacity * sizeof(GpuSurfacePoint));
+            im.ext_out = im.ctx->gpu_buffer(im.ext_capacity * sizeof(GpuSurfacePoint));
             continue;
         }
         std::vector<track::SurfacePoint> out(found);
-        const auto* src = static_cast<const GpuSurfacePoint*>(im.ext_out->contents());
+        std::vector<std::byte> copy;
+        const auto* src = static_cast<const GpuSurfacePoint*>(im.host_view(im.ext_out.get(), found * sizeof(GpuSurfacePoint), copy));
         for (std::uint32_t i = 0; i < found; ++i)
             out[i] = {Vec3f(src[i].p[0], src[i].p[1], src[i].p[2]), Vec3f(src[i].n[0], src[i].n[1], src[i].n[2]), src[i].w};
         if (canonical) track::sort_canonical(out);  // atomic appends: the order varies between runs
@@ -359,8 +379,9 @@ MetalTsdfVolume::RenderPoints MetalTsdfVolume::extract_render_points(float min_w
     constexpr std::size_t kVertex = 28;  // render::PointVertex
     for (int attempt = 0; attempt < 2; ++attempt) {
         const std::size_t cap = std::max<std::size_t>(im.render_capacity, static_cast<std::size_t>(bricks) * 96);
-        out.buffer = im.ctx->buffer(cap * kVertex);
+        out.buffer = im.ctx->gpu_buffer(cap * kVertex);  // drawn by the renderer only
         *static_cast<std::uint32_t*>(im.ext_count->contents()) = 0;
+        gpu::Context::cpu_modified(im.ext_count.get());
         const auto cap32 = static_cast<std::uint32_t>(cap);
         im.run("tsdf/extract_render", [&](MTL::ComputeCommandEncoder* enc) {
             enc->setComputePipelineState(im.extract_render.get());
@@ -373,7 +394,7 @@ MetalTsdfVolume::RenderPoints MetalTsdfVolume::extract_render_points(float min_w
             enc->setBytes(&a, sizeof(a), 6);
             enc->setBytes(&cap32, sizeof(cap32), 7);
             enc->dispatchThreadgroups(MTL::Size(bricks, 1, 1), MTL::Size(8, 8, 8));
-        });
+        }, {im.ext_count.get()});
         const std::uint32_t found = *static_cast<std::uint32_t*>(im.ext_count->contents());
         if (found <= cap) {
             out.count = found;
@@ -388,8 +409,9 @@ MetalTsdfVolume::RenderPoints MetalTsdfVolume::extract_render_points(float min_w
 std::vector<track::BrickCoord> MetalTsdfVolume::bricks_updated_since(std::uint32_t frame) const {
     auto& im = *impl_;
     const std::uint32_t n = im.count();
-    const auto* lu = static_cast<const std::uint32_t*>(im.last_update->contents());
-    const auto* c = static_cast<const std::int32_t*>(im.coords->contents());
+    std::vector<std::byte> lu_copy, c_copy;
+    const auto* lu = static_cast<const std::uint32_t*>(im.host_view(im.last_update.get(), n * 4ull, lu_copy));
+    const auto* c = static_cast<const std::int32_t*>(im.host_view(im.coords.get(), n * 16ull, c_copy));
     std::vector<track::BrickCoord> out;
     for (std::uint32_t i = 0; i < n; ++i)
         if (lu[i] > frame) out.push_back({c[4 * i], c[4 * i + 1], c[4 * i + 2]});
@@ -400,20 +422,26 @@ std::vector<track::SurfacePoint> MetalTsdfVolume::extract_points(const std::vect
     auto& im = *impl_;
     std::vector<std::uint32_t> idx;
     idx.reserve(bricks.size());
+    std::vector<std::byte> keys_copy, values_copy;
+    const auto table_bytes = static_cast<std::size_t>(im.opt.table_size) * 4;
+    const auto* keys = static_cast<const std::uint32_t*>(im.host_view(im.keys.get(), table_bytes, keys_copy));
+    const auto* values = static_cast<const std::int32_t*>(im.host_view(im.values.get(), table_bytes, values_copy));
     for (const auto& b : bricks)
-        if (const int i = im.lookup(b); i >= 0) idx.push_back(static_cast<std::uint32_t>(i));
+        if (const int i = im.lookup(b, keys, values); i >= 0) idx.push_back(static_cast<std::uint32_t>(i));
     if (idx.empty()) return {};
-    im.ext_list = im.ctx->buffer(idx.size() * 4);
+    im.ext_list = im.ctx->mirrored_buffer(idx.size() * 4);
     std::memcpy(im.ext_list->contents(), idx.data(), idx.size() * 4);
+    gpu::Context::cpu_modified(im.ext_list.get());
     const std::size_t cap = idx.size() * 512;
     if (cap > im.ext_capacity) {
-        im.ext_out = im.ctx->buffer(cap * sizeof(GpuSurfacePoint));
+        im.ext_out = im.ctx->gpu_buffer(cap * sizeof(GpuSurfacePoint));
         im.ext_capacity = cap;
     }
     VolumeArgs a = im.args(params_, frame_);
     a.min_weight = min_weight;
     a.since_frame = 0;
     *static_cast<std::uint32_t*>(im.ext_count->contents()) = 0;
+    gpu::Context::cpu_modified(im.ext_count.get());
     const auto cap32 = static_cast<std::uint32_t>(im.ext_capacity);
     const std::uint32_t use_list = 1;
     im.run("tsdf/extract", [&](MTL::ComputeCommandEncoder* enc) {
@@ -430,10 +458,11 @@ std::vector<track::SurfacePoint> MetalTsdfVolume::extract_points(const std::vect
         enc->setBuffer(im.ext_list.get(), 0, 9);
         enc->setBytes(&use_list, sizeof(use_list), 10);
         enc->dispatchThreadgroups(MTL::Size(idx.size(), 1, 1), MTL::Size(8, 8, 8));
-    });
+    }, {im.ext_count.get()});
     const std::uint32_t found = std::min<std::uint32_t>(*static_cast<std::uint32_t*>(im.ext_count->contents()), cap32);
     std::vector<track::SurfacePoint> out(found);
-    const auto* src = static_cast<const GpuSurfacePoint*>(im.ext_out->contents());
+    std::vector<std::byte> copy;
+    const auto* src = static_cast<const GpuSurfacePoint*>(im.host_view(im.ext_out.get(), found * sizeof(GpuSurfacePoint), copy));
     for (std::uint32_t i = 0; i < found; ++i)
         out[i] = {Vec3f(src[i].p[0], src[i].p[1], src[i].p[2]), Vec3f(src[i].n[0], src[i].n[1], src[i].n[2]), src[i].w};
     track::sort_canonical(out);

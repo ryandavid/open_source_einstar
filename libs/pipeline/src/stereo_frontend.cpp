@@ -73,6 +73,20 @@ struct FrameAccess {
     const track::DepthFrame* frame = nullptr;
     int width = 0, height = 0;
 
+    // Pixels written through set() (to publish to a managed GPU copy; see gpu::Context::cpu_modified).
+    mutable std::size_t dirty_begin = SIZE_MAX, dirty_end = 0;
+
+    FrameAccess(const FrameAccess&) = delete;
+    FrameAccess& operator=(const FrameAccess&) = delete;
+    ~FrameAccess() {
+        if (dirty_begin >= dirty_end) return;
+        if (const auto* md = dynamic_cast<const gpu::MetalFrameData*>(frame->device.get())) {
+            const std::size_t n = dirty_end - dirty_begin;
+            gpu::Context::cpu_modified(md->points_buffer(), 16 * dirty_begin, 16 * n);
+            gpu::Context::cpu_modified(md->normals_buffer(), 16 * dirty_begin, 16 * n);
+            gpu::Context::cpu_modified(md->weights_buffer(), 4 * dirty_begin, 4 * n);
+        }
+    }
     explicit FrameAccess(const track::DepthFrame& f) : frame(&f) {
         if (f.device) {
             dev_points = f.device->points_xyzw();
@@ -100,6 +114,8 @@ struct FrameAccess {
             P[0] = p.x(), P[1] = p.y(), P[2] = p.z(), P[3] = 1.0f;
             N[0] = n.x(), N[1] = n.y(), N[2] = n.z(), N[3] = 0.0f;
             static_cast<float*>(md->weights_buffer()->contents())[i] = w;
+            dirty_begin = std::min(dirty_begin, i);
+            dirty_end = std::max(dirty_end, i + 1);
             return;
         }
         frame->points(x, y) = p;
@@ -178,30 +194,42 @@ void fill_marker_hole(const FrameAccess& fa, const track::Intrinsics& k, const S
 
 }  // namespace
 
-void StereoFrontend::add_markers(const ImageU8& raw_left, const ImageU8& raw_right, DepthOutput& out,
-                                 const std::array<std::vector<depth_metal::BlobBox>, 2>* gpu_blobs) const {
+StereoFrontend::FittedMarkers StereoFrontend::fit_gpu_blobs(const ImageU8& raw_left, const ImageU8& raw_right,
+                                                            const std::array<std::vector<depth_metal::BlobBox>, 2>& blobs) const {
+    // The GPU already found the candidate blobs: only the sub-pixel fits run here.
+    Stopwatch sw;
+    auto to_blobs = [](const std::vector<depth_metal::BlobBox>& in) {
+        std::vector<markers::Blob> b;
+        b.reserve(in.size());
+        for (const auto& g : in)
+            b.push_back({static_cast<int>(g.x0), static_cast<int>(g.y0), static_cast<int>(g.x1), static_cast<int>(g.y1),
+                         static_cast<int>(g.pixels), static_cast<int>(g.peak)});
+        return b;
+    };
+    FittedMarkers f;
+    f.candidates = static_cast<int>(blobs[0].size() + blobs[1].size());
+    tbb::parallel_invoke([&] { f.left = markers::fit_blobs(raw_left.view(), to_blobs(blobs[0]), params_.marker_detect); },
+                         [&] { f.right = markers::fit_blobs(raw_right.view(), to_blobs(blobs[1]), params_.marker_detect); });
+    f.ms = sw.elapsed_ms();
+    return f;
+}
+
+void StereoFrontend::add_markers(const ImageU8& raw_left, const ImageU8& raw_right, DepthOutput& out, FittedMarkers* fitted) const {
     Stopwatch sw;
     std::vector<markers::Ellipse> left, right;
-    if (gpu_blobs) {
-        // The GPU already found the candidate blobs: only the sub-pixel fits run here.
-        auto to_blobs = [](const std::vector<depth_metal::BlobBox>& in) {
-            std::vector<markers::Blob> b;
-            b.reserve(in.size());
-            for (const auto& g : in)
-                b.push_back({static_cast<int>(g.x0), static_cast<int>(g.y0), static_cast<int>(g.x1), static_cast<int>(g.y1),
-                             static_cast<int>(g.pixels), static_cast<int>(g.peak)});
-            return b;
-        };
-        out.marker_candidates = static_cast<int>((*gpu_blobs)[0].size() + (*gpu_blobs)[1].size());
-        left = markers::fit_blobs(raw_left.view(), to_blobs((*gpu_blobs)[0]), params_.marker_detect);
-        right = markers::fit_blobs(raw_right.view(), to_blobs((*gpu_blobs)[1]), params_.marker_detect);
+    double fit_ms = 0;  // (fits done while the GPU ran the stereo still count as marker CPU time)
+    if (fitted) {
+        out.marker_candidates = fitted->candidates;
+        left = std::move(fitted->left);
+        right = std::move(fitted->right);
+        fit_ms = fitted->ms;
     } else {
         tbb::parallel_invoke([&] { left = markers::detect_markers(raw_left.view(), params_.marker_detect); },
                              [&] { right = markers::detect_markers(raw_right.view(), params_.marker_detect); });
     }
     if (left.empty() || right.empty()) {
         for (const auto& e : left) out.unmatched_left.push_back(marker_stereo_->rectify_left(e.center));
-        out.marker_ms = sw.elapsed_ms();
+        out.marker_ms = fit_ms + sw.elapsed_ms();
         return;
     }
 
@@ -260,7 +288,7 @@ void StereoFrontend::add_markers(const ImageU8& raw_left, const ImageU8& raw_rig
         if (!used[i]) out.unmatched_left.push_back(marker_stereo_->rectify_left(left[i].center));
     if (params_.fill_marker_holes)
         for (const auto& m : out.markers) fill_marker_hole(fa, depth_k_, params_, m, left[static_cast<std::size_t>(m.left_index)].a);
-    out.marker_ms = sw.elapsed_ms();
+    out.marker_ms = fit_ms + sw.elapsed_ms();
 }
 
 
@@ -274,6 +302,11 @@ DepthOutput StereoFrontend::process(const ImageU8& raw_left, const ImageU8& raw_
         req.preview_textures = params_.gpu_previews;
         req.preview_images = params_.cpu_previews;
         req.marker_blobs = params_.detect_markers;
+        // Fit the blob candidates while the GPU is still busy with the stereo.
+        FittedMarkers fitted;
+        if (params_.detect_markers)
+            req.on_blobs = [&](const std::array<std::vector<depth_metal::BlobBox>, 2>& blobs) { fitted = fit_gpu_blobs(raw_left, raw_right, blobs); };
+        req.cpu_frame_access = true;  // marker hole filling and the pipeline's depth statistics read it
         if (auto f = metal_->compute_frame(raw_left, raw_right, req)) {
             out.frame.intrinsics = depth_k_;
             out.frame.device = std::move(f->frame);
@@ -282,7 +315,7 @@ DepthOutput StereoFrontend::process(const ImageU8& raw_left, const ImageU8& raw_
             out.preview_left = std::move(f->preview_left);
             out.preview_right = std::move(f->preview_right);
             out.stereo_ms = sw.elapsed_ms();
-            if (params_.detect_markers) add_markers(raw_left, raw_right, out, &f->blobs);
+            if (params_.detect_markers) add_markers(raw_left, raw_right, out, &fitted);
             return out;
         } else {
             log::warn("Metal stereo failed ({}); using CPU for this frame", f.error().message);

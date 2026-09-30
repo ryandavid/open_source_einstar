@@ -102,10 +102,11 @@ Result<std::unique_ptr<MetalIcp>> MetalIcp::create(std::shared_ptr<gpu::Context>
         if (!p) return std::unexpected(p.error());
         *slot = std::move(*p);
     }
-    im->state = im->ctx->buffer(sizeof(IcpState));
-    im->arrived = im->ctx->buffer(4);  // zeroed on allocation; reset by icp_level_begin and each iteration
-    im->hist = im->ctx->buffer(128 * 4);
-    im->w_bin = im->ctx->buffer(128 * 4);
+    // Storage by access (see gpu::Context): the state and histogram are also touched by the CPU.
+    im->state = im->ctx->mirrored_buffer(sizeof(IcpState));
+    im->arrived = im->ctx->gpu_buffer(4);  // zeroed on allocation; reset by icp_level_begin and each iteration
+    im->hist = im->ctx->mirrored_buffer(128 * 4);
+    im->w_bin = im->ctx->gpu_buffer(128 * 4);
     return std::unique_ptr<MetalIcp>(new MetalIcp(std::move(im)));
 }
 
@@ -134,9 +135,9 @@ track::IcpResult MetalIcp::solve(const track::DepthFrame& frame, const track::Ra
     }
     if (!same_frame) {
         if (im.src_n != n) {
-            im.src_pts = im.ctx->buffer(n * 16);
-            im.src_nrm = im.ctx->buffer(n * 16);
-            im.src_w = im.ctx->buffer(n * 4);
+            im.src_pts = im.ctx->mirrored_buffer(n * 16);
+            im.src_nrm = im.ctx->mirrored_buffer(n * 16);
+            im.src_w = im.ctx->mirrored_buffer(n * 4);
             im.src_n = n;
         }
         if (dev_frame) {
@@ -145,6 +146,7 @@ track::IcpResult MetalIcp::solve(const track::DepthFrame& frame, const track::Ra
                 static_cast<std::uint32_t>(W), static_cast<std::uint32_t>(H), static_cast<float>(p.normal_balance_alpha),
                 p.normal_balance_alpha > 0 ? 1u : 0u};
             std::memset(im.hist->contents(), 0, 128 * 4);
+            gpu::Context::cpu_modified(im.hist.get());
             NS::AutoreleasePool* bp = NS::AutoreleasePool::alloc()->init();
             MTL::CommandBuffer* bcmd = im.ctx->queue()->commandBuffer();
             MTL::ComputeCommandEncoder* be = bcmd->computeCommandEncoder();
@@ -187,6 +189,9 @@ track::IcpResult MetalIcp::solve(const track::DepthFrame& frame, const track::Ra
                 if (!balance.empty()) w *= balance[i];
                 sw[i] = w;
             }
+            gpu::Context::cpu_modified(im.src_pts.get());
+            gpu::Context::cpu_modified(im.src_nrm.get());
+            gpu::Context::cpu_modified(im.src_w.get());
         }
         im.cached_frame = dev_frame ? static_cast<const void*>(dev_frame) : static_cast<const void*>(frame.points.data());
         im.cached_index = frame.index;
@@ -207,8 +212,8 @@ track::IcpResult MetalIcp::solve(const track::DepthFrame& frame, const track::Ra
         mdl_nrm = dev_model->normals_buffer();
     } else {
         if (im.mdl_n != mn) {
-            im.mdl_pts = im.ctx->buffer(mn * 16);
-            im.mdl_nrm = im.ctx->buffer(mn * 16);
+            im.mdl_pts = im.ctx->mirrored_buffer(mn * 16);
+            im.mdl_nrm = im.ctx->mirrored_buffer(mn * 16);
             im.mdl_n = mn;
         }
         model.ensure_cpu();
@@ -220,6 +225,8 @@ track::IcpResult MetalIcp::solve(const track::DepthFrame& frame, const track::Ra
             mp[4 * i] = q.x(), mp[4 * i + 1] = q.y(), mp[4 * i + 2] = q.z(), mp[4 * i + 3] = model.valid.data()[i] ? 1.0f : 0.0f;
             mnr[4 * i] = nq.x(), mnr[4 * i + 1] = nq.y(), mnr[4 * i + 2] = nq.z(), mnr[4 * i + 3] = 0;
         }
+        gpu::Context::cpu_modified(im.mdl_pts.get());
+        gpu::Context::cpu_modified(im.mdl_nrm.get());
         mdl_pts = im.mdl_pts.get();
         mdl_nrm = im.mdl_nrm.get();
     }
@@ -229,7 +236,7 @@ track::IcpResult MetalIcp::solve(const track::DepthFrame& frame, const track::Ra
 
     // Marker pairs (camera p, world q) as float4 pairs.
     const auto marker_count = static_cast<std::uint32_t>(std::min<std::size_t>(p.markers.size(), 256));
-    if (!im.markers) im.markers = im.ctx->buffer(256 * 32);
+    if (!im.markers) im.markers = im.ctx->mirrored_buffer(256 * 32);
     {
         auto* mk4 = static_cast<float*>(im.markers->contents());
         for (std::uint32_t m = 0; m < marker_count; ++m) {
@@ -239,11 +246,13 @@ track::IcpResult MetalIcp::solve(const track::DepthFrame& frame, const track::Ra
             mk4[8 * m + 4] = static_cast<float>(mm.q_world.x()), mk4[8 * m + 5] = static_cast<float>(mm.q_world.y());
             mk4[8 * m + 6] = static_cast<float>(mm.q_world.z()), mk4[8 * m + 7] = 1;
         }
+        gpu::Context::cpu_modified(im.markers.get(), 0, marker_count * 32);
     }
     IcpState st{};
     store(st.T, T_init);
     store(st.T_init, T_init);
     std::memcpy(im.state->contents(), &st, sizeof(st));
+    gpu::Context::cpu_modified(im.state.get());
 
     const float cos_max = std::cos(p.max_normal_angle_deg * static_cast<float>(M_PI) / 180.0f);
     const double s2 = p.data_sigma_mm * p.data_sigma_mm;
@@ -252,9 +261,9 @@ track::IcpResult MetalIcp::solve(const track::DepthFrame& frame, const track::Ra
 
     // Partials buffer sized for the finest level.
     const std::size_t max_groups = static_cast<std::size_t>((W + 15) / 16) * static_cast<std::size_t>((H + 15) / 16);
-    if (!im.partials || im.partials->length() < max_groups * 32 * 4) im.partials = im.ctx->buffer(max_groups * 32 * 4);
+    if (!im.partials || im.partials->length() < max_groups * 32 * 4) im.partials = im.ctx->gpu_buffer(max_groups * 32 * 4);
     if (!im.dispatch || im.dispatch->length() < static_cast<std::size_t>(p.levels) * 12)
-        im.dispatch = im.ctx->buffer(static_cast<std::size_t>(p.levels) * 12);
+        im.dispatch = im.ctx->gpu_buffer(static_cast<std::size_t>(p.levels) * 12);
 
     NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
     MTL::CommandBuffer* cmd = im.ctx->queue()->commandBuffer();
@@ -317,6 +326,7 @@ track::IcpResult MetalIcp::solve(const track::DepthFrame& frame, const track::Ra
         }
     }
     enc->endEncoding();
+    gpu::Context::sync_for_cpu(cmd, {im.state.get()});
     gpu::profile::commit_and_wait(cmd, "icp/iterations (all levels)");
     last_gpu_ms_ = (cmd->GPUEndTime() - cmd->GPUStartTime()) * 1000.0;
     last_iterations_ = static_cast<const IcpState*>(im.state->contents())->iterations;
