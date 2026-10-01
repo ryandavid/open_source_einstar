@@ -124,6 +124,9 @@ public:
 
     // ---- read-only ----
     Result<std::vector<std::uint8_t>> read_flash(std::uint32_t offset, std::uint32_t size);
+    // The ADT7420 on the scanner's board (10/50). Errc::unsupported when it reads exactly 0x0000: on the
+    // tested unit it does so always (idle, streaming, vendor and open firmware), the signature of an I2C
+    // segment with nothing answering (all-zero bits, which also read as acknowledgements), not 0 degC.
     Result<double> temperature_c();
     Result<DeviceState> read_state();
     // Sensors 0 and 1 (the IR pair) share one exposure register in the scanner: reading or setting

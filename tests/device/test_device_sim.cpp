@@ -220,6 +220,16 @@ TEST_CASE("temperature uses the signed ADT7420 scale") {
     CHECK(std::abs(*t + 5.25) < 1e-6);
 }
 
+TEST_CASE("a temperature sensor reading 0x0000 is reported as no reading, not 0 degC") {
+    // The tested scanner always answers 10/50 with 00 00 (status OK): nothing answers on that I2C segment.
+    sim::SimConfig cfg;
+    cfg.temperature_c = 0.0;
+    auto h = connect(cfg);
+    auto t = h.dev->temperature_c();
+    REQUIRE(!t.has_value());
+    CHECK(t.error().code == Errc::unsupported);
+}
+
 TEST_CASE("heartbeat reports button presses") {
     auto h = connect({}, 20);
     std::atomic<int> presses{0};

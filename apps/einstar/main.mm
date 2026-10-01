@@ -373,6 +373,7 @@ int main(int argc, char** argv) {
                 ImGui::Text("Raw IR         %llu frames%s", static_cast<unsigned long long>(hud.raw_frames),
                             hud.raw_dropped > 0 ? std::format(" ({} not written)", hud.raw_dropped).c_str() : "");
             if (hud.temperature_c > -100) ImGui::Text("Temperature    %4.1f C", hud.temperature_c);
+            else if (!hud.temperature_note.empty()) ImGui::TextDisabled("Temperature    n/a (%s)", hud.temperature_note.c_str());
             ImGui::Separator();
             ImGui::Text("Distance %s", hud.distance_mm > 0 ? std::format("{:.0f} mm", hud.distance_mm).c_str() : "--");
             draw_distance_bar(hud.distance_step, 10);

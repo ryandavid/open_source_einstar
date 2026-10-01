@@ -301,12 +301,19 @@ void AppState::update() {
     }
     if (session_->scanning()) session_->set_distance_indication(depth);
     static int ticks = 0;
-    if (++ticks % 4 == 0)
+    if (++ticks % 4 == 0) {
         if (auto t = session_->temperature()) {
             session_->pipeline().set_temperature(static_cast<float>(*t));
             std::lock_guard lock(mutex_);
             hud_.temperature_c = static_cast<float>(*t);
+            hud_.temperature_note.clear();
+        } else if (t.error().code == Errc::unsupported) {
+            std::lock_guard lock(mutex_);
+            if (hud_.temperature_note.empty()) log::info("temperature: {}", t.error().message);
+            hud_.temperature_c = -273.0f;
+            hud_.temperature_note = "no sensor reading";
         }
+    }
 }
 
 std::optional<RenderUpdate> AppState::take_render_update() {

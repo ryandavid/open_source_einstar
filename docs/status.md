@@ -43,7 +43,8 @@
   (10/68, `set_laser_percent`) alone changed nothing in the images, with DISTANCE 1 (laser mode 1) selected
   and the scanner face down on a table (scene out of focus and saturated).
 - Register 10/5D ("colour mode") read 8 on all three sensors (the firmware leaves that reply byte
-  unwritten; no longer queried). Temperature (10/50) reads 0 idle and streaming. Device-state reply byte
+  unwritten; no longer queried). Temperature (10/50) reads 0x0000 idle and streaming, on both firmwares: no sensor answers on that
+  I2C channel (protocol-device.md 3.11); the app shows "n/a" instead of 0 °C. Device-state reply byte
   21 is a run state: 01/02 idle, 08 scan streaming, 40 texture streaming.
 - With the scanner's light on (a bucket lid with marker stickers at ~45 cm, no ambient IR): brightness
   above black is linear in exposure (6.3 / 12.7 / 25.2 at 1100 / 2200 / 4400; 42 at 8800) and in gain as a

@@ -143,6 +143,7 @@ void print_device(device::EinstarDevice& dev) {
                      i == 2 ? "colour" : "mono", s.exposure_min, s.exposure_max, s.gain_min, s.gain_max);
     }
     if (auto t = dev.temperature_c()) std::println("temperature {:.2f} C", *t);
+    else std::println("temperature: {}", t.error().message);
     if (auto blob = dev.read_flash(0, calib::kFlashBlobSize)) {
         auto cal = calib::decode_flash_blob(*blob);
         if (cal) {
@@ -359,6 +360,7 @@ int hw_test(std::span<char*> args) {
               std::format("was {}/{}, wrote {}/{}, read {}/{}", *e, *g, e2, g2, e_rb ? *e_rb : 0u, g_rb ? *g_rb : 0));
     }
     if (auto t = dev->temperature_c()) std::println("  temperature (idle) {:.2f} C", *t);
+    else std::println("  temperature: {}", t.error().message);
     auto st = dev->read_state();
     check(st.has_value(), "device state / buttons read");
 
@@ -2315,6 +2317,17 @@ int inspect_cmd(const char* path, std::span<char*> args) {
             conf += n ? c / static_cast<double>(n) : 0;
             ++sampled;
         }
+        // Scanner temperature as stamped on the frames (the last reading; NaN before the first one).
+        float t_lo = std::numeric_limits<float>::infinity(), t_hi = -t_lo;
+        std::size_t t_none = 0;
+        for (std::size_t i = 0; i < s.frame_count(); ++i) {
+            const auto& m = s.meta(i);
+            const float t = m.extras ? m.extras->capture.temperature_c : std::numeric_limits<float>::quiet_NaN();
+            if (std::isnan(t)) ++t_none;
+            else t_lo = std::min(t_lo, t), t_hi = std::max(t_hi, t);
+        }
+        if (t_lo <= t_hi) std::println("temperature: {:.2f} .. {:.2f} C ({} frames without a reading)", t_lo, t_hi, t_none);
+        else std::println("temperature: no reading on any frame");
         const double nf = std::max<double>(1, static_cast<double>(s.frame_count()));
         std::println("per frame: {:.1f} markers recorded, {:.1f} seen by the tracker; valid depth {:.1f}% (mean confidence {:.2f}) over {} sampled frames",
                      markers / nf, matched / nf, sampled ? 100 * valid / sampled : 0.0, sampled ? conf / sampled : 0.0, sampled);

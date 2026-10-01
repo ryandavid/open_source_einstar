@@ -362,8 +362,11 @@ Result<void> EinstarDevice::write_firmware(const FirmwarePackage& package, const
 Result<double> EinstarDevice::temperature_c() {
     auto r = send<op::kTemperature>();
     if (!r) return std::unexpected(r.error());
-    // ADT7420 format: signed 16-bit, 1/128 degC per LSB (EXStar's integer conversion mishandles negatives).
-    return static_cast<std::int16_t>(reply_u16(*r)) / 128.0;
+    if (r->raw.size() < 11) return make_error(Errc::protocol, std::format("temperature reply too short ({} bytes)", r->raw.size()));
+    const std::uint16_t raw = reply_u16(*r);
+    if (raw == 0) return make_error(Errc::unsupported, "the scanner's temperature sensor reads 0x0000 (no sensor answering)");
+    // ADT7420 format: signed 16-bit, 1/128 degC per LSB.
+    return static_cast<std::int16_t>(raw) / 128.0;
 }
 
 namespace {

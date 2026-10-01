@@ -403,6 +403,13 @@ Logic-layer execute names seen in the log, `ReadData(offset, size)` and
   converted as **unsigned**. Negative temperatures therefore come out as
   about 2.7e8, a plugin bug.
 * The open-source driver should compute `int16(raw) / 128.0`.
+* **On the tested unit 10/50 always answers `00 00` with status OK** (idle and streaming, vendor and
+  open firmware; transcripts of 2026-09-29 and every recording since). The firmware selects I2C
+  target 8 (GPIO 27) and reads address 0x48 register 0 exactly as for the FPGA bridge, which works; an
+  I2C read that returns all-zero bits without an error is a segment with nothing pulling SDA up (zero
+  bits also read as acknowledgements). So no temperature sensor answers there on this unit, and
+  `EinstarDevice::temperature_c()` reports 0x0000 as `Errc::unsupported` (shown as "n/a") rather
+  than 0 °C. **[M]**
 * The GSY-variant board/IR temperatures in 00/07 are BE16 hundredths of °C.
 * No thresholds or alarms exist in CEinScan10.
 

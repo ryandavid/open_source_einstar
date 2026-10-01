@@ -58,6 +58,7 @@ struct Hud {
     int queue_depth = 0;
     int dropped = 0;
     float temperature_c = -273.0f;
+    std::string temperature_note;  // why there is no temperature (e.g. the sensor reads nothing)
     float distance_mm = 0;
     int distance_step = -1;  // 0..9, -1 = out of range
     std::size_t model_points = 0;
