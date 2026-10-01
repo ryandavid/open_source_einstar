@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <map>
@@ -183,4 +184,34 @@ TEST_CASE("simplification keeps the shape, manifoldness and orientation") {
     CHECK(max_err < 0.3);
     CHECK(bad_after <= bad_before);
     CHECK(outward >= static_cast<int>(0.999 * static_cast<double>(mesh.triangles.size())));
+}
+
+TEST_CASE("surface seen by too few frames is dropped when observations are required") {
+    track::TsdfParams tp;
+    tp.voxel_mm = 0.5f;
+    tp.count_observations = true;
+    track::TsdfVolume vol(tp);
+    const track::Intrinsics k{320, 256, 290.0, 290.0, 160.0, 128.0};
+    const Vec3 a(0, 0, 0), b(60, 0, 0);  // a: seen by four frames; b: a stray blob in two
+    for (int i = 0; i < 4; ++i) {
+        const SE3 T = synth::look_at(Vec3(-8.0 + 5.0 * i, 3.0 * (i % 2), -250), a);
+        vol.integrate(track::make_depth_frame(sphere_depth(a, 20.0, T, k), k), T);
+    }
+    for (int i = 0; i < 2; ++i) {  // b: a stray blob in two frames (one frame alone never reaches the weight threshold)
+        const SE3 T1 = synth::look_at(Vec3(60.0 + 3 * i, 0, -250), b);
+        vol.integrate(track::make_depth_frame(sphere_depth(b, 8.0, T1, k), k), T1);
+    }
+    auto near_b = [&](const recon::TriangleMesh& m) {
+        return std::ranges::count_if(m.vertices, [&](const Vec3f& v) { return (v.cast<double>() - b).norm() < 12.0; });
+    };
+    auto near_a = [&](const recon::TriangleMesh& m) {
+        return std::ranges::count_if(m.vertices, [&](const Vec3f& v) { return (v.cast<double>() - a).norm() < 24.0; });
+    };
+    const auto all = recon::extract_mesh(vol);
+    CHECK(near_b(all) > 100);
+    recon::ExtractParams ep;
+    ep.min_observations = 3;
+    const auto seen_thrice = recon::extract_mesh(vol, ep);
+    CHECK(near_b(seen_thrice) == 0);
+    CHECK(near_a(seen_thrice) > 0.8 * static_cast<double>(near_a(all)));
 }

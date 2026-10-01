@@ -95,7 +95,8 @@ const Brick* TsdfVolume::find(const BrickCoord& c) const {
 
 void TsdfVolume::for_each_brick(const BrickVisitor& fn) const {
     std::shared_lock lock(mutex_);
-    for (const auto& [c, b] : bricks_) fn(c, b->sdf, b->weight);
+    for (const auto& [c, b] : bricks_)
+        fn(c, b->sdf, b->weight, params_.count_observations ? std::span<const std::uint8_t>(b->observations) : std::span<const std::uint8_t>{});
 }
 
 std::size_t TsdfVolume::brick_count() const {
@@ -175,6 +176,7 @@ void TsdfVolume::integrate(const DepthFrame& frame, const SE3& T_world_camera, f
                     if (extend_only && w_old > 0.0f) continue;
                     b.sdf[i] = (b.sdf[i] * w_old + tsdf * w_new) / (w_old + w_new);
                     b.weight[i] = std::min(w_old + w_new, params_.max_weight);
+                    if (params_.count_observations && std::abs(sdf) < trunc && b.observations[i] < 255) ++b.observations[i];
                     updated = true;
                 }
         if (updated) b.last_update = frame_counter_;

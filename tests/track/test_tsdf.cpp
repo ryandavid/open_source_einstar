@@ -124,3 +124,69 @@ TEST_CASE("marker-only capture does not start without markers") {
     CHECK(tracker.process(f).accepted);
 }
 
+TEST_CASE("depth edge filter removes depth near steps and rims, keeps the interior") {
+    ImageF32 d(60, 40, 500.0f);                                      // background at 500 mm
+    for (int y = 10; y < 30; ++y)
+        for (int x = 10; x < 30; ++x) d(x, y) = 300.0f + 0.1f * x;   // a near square
+    for (int y = 18; y < 22; ++y)
+        for (int x = 45; x < 49; ++x) d(x, y) = 0.0f;                // a hole in the background
+    DepthEdgeFilter p;
+    p.radius_px = 2;
+    p.radius_rim_px = 1;
+    filter_depth_edges(d, p);
+    CHECK(d(20, 20) > 0);           // inside the square
+    CHECK(d(12, 20) > 0);           // 2 px inside its edge
+    CHECK(d(11, 20) == 0.0f);       // 1 px inside: within 2 px of the step
+    CHECK(d(10, 20) == 0.0f);
+    CHECK(d(8, 20) == 0.0f);        // background side of the step too
+    CHECK(d(7, 20) > 0);
+    CHECK(d(44, 20) == 0.0f);       // the hole's rim, 1 px
+    CHECK(d(43, 20) > 0);
+    CHECK(d(0, 0) == 0.0f);         // the image border counts as a rim
+    CHECK(d(1, 1) > 0);
+    // A smooth slope (0.1 mm per pixel) is not a step.
+    CHECK(d(25, 15) > 0);
+}
+
+TEST_CASE("grazing filter drops oblique surface and steep rims, keeps face-on borders") {
+    // A plane seen face-on, with a hole; and one seen at 80 degrees.
+    auto plane = [](double tilt_deg) {
+        ImageF32 d(kK.width, kK.height, 0.0f);
+        const double t = std::tan(tilt_deg * M_PI / 180.0);
+        for (int v = 0; v < kK.height; ++v)
+            for (int u = 0; u < kK.width; ++u) {
+                const double x = (u - kK.cx) / kK.fx;
+                const double z = 300.0 / (1.0 - t * x);  // plane z = 300 + t * X
+                if (z > 0 && z < 2000) d(u, v) = static_cast<float>(z);
+            }
+        return d;
+    };
+    ImageF32 flat = plane(0);
+    for (int v = 100; v < 120; ++v)
+        for (int u = 150; u < 170; ++u) flat(u, v) = 0.0f;
+    auto f = make_depth_frame(flat, kK);
+    filter_grazing(f, GrazingFilter{});
+    CHECK(f.points(149, 110).z() > 0);  // the hole's rim on a face-on plane stays
+    CHECK(f.points(50, 50).z() > 0);
+
+    // Tilted 80 degrees about the vertical: seen at 80 degrees along the centre column (beyond 70), less
+    // obliquely towards one side of the image (perspective).
+    auto steep = make_depth_frame(plane(80), kK);
+    int before = 0, left = 0;
+    for (int v = 0; v < kK.height; ++v)
+        for (int u = 0; u < kK.width; ++u) before += steep.points(u, v).z() > 0;
+    filter_grazing(steep, GrazingFilter{});
+    for (int v = 0; v < kK.height; ++v)
+        for (int u = 0; u < kK.width; ++u) left += steep.points(u, v).z() > 0;
+    CHECK(steep.points(static_cast<int>(kK.cx), 100).z() == 0.0f);
+    CHECK(left < 0.6 * before);  // the side seen at under 70 degrees stays
+
+    auto mid = make_depth_frame(plane(55), kK);  // within 70 degrees: kept, but its rims are steep
+    for (int v = 100; v < 120; ++v)
+        for (int u = 150; u < 170; ++u) mid.points(u, v) = Vec3f::Zero();
+    filter_grazing(mid, GrazingFilter{});
+    CHECK(mid.points(100, 50).z() > 0);
+    CHECK(mid.points(149, 110).z() == 0.0f);  // rim of the hole: dropped (2 px)
+    CHECK(mid.points(148, 110).z() == 0.0f);
+    CHECK(mid.points(146, 110).z() > 0);
+}

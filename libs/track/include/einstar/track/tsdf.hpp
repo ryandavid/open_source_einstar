@@ -37,6 +37,7 @@ struct BrickCoordHash {
 struct Brick {
     std::array<float, kBrickVoxels> sdf;     // normalised to [-1, 1] (units of truncation)
     std::array<float, kBrickVoxels> weight;
+    std::array<std::uint8_t, kBrickVoxels> observations{};  // frames that saw a surface here (TsdfParams::count_observations)
     std::uint32_t last_update = 0;           // frame counter
     Brick() {
         sdf.fill(1.0f);
@@ -50,6 +51,10 @@ struct TsdfParams {
     float max_weight = 64.0f;
     float min_depth_mm = 150.0f;
     float max_depth_mm = 700.0f;
+    // Count, per voxel, the frames that observed a surface within the truncation band (saturating at
+    // 255). Offline processing uses it to keep only surface seen by several frames: a flake from one
+    // or two frames' noise can carry a high weight, but never many observations.
+    bool count_observations = false;
 };
 
 struct RaycastResult {
@@ -99,7 +104,9 @@ public:
     // Visits every allocated brick (offline meshing). `sdf` is normalised to [-1, 1] of the
     // truncation distance, voxel (x, y, z) at index (z * 8 + y) * 8 + x, centre at
     // ((coord * 8 + xyz) + 0.5) * voxel_mm.
-    using BrickVisitor = std::function<void(const BrickCoord&, std::span<const float> sdf, std::span<const float> weight)>;
+    // `observations` is empty unless TsdfParams::count_observations.
+    using BrickVisitor = std::function<void(const BrickCoord&, std::span<const float> sdf, std::span<const float> weight,
+                                            std::span<const std::uint8_t> observations)>;
     virtual void for_each_brick(const BrickVisitor& fn) const = 0;
 
     [[nodiscard]] virtual std::size_t brick_count() const = 0;

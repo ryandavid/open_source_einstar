@@ -55,6 +55,8 @@
 #include <string_view>
 #include <vector>
 
+#include <Eigen/Eigenvalues>
+
 #include "einstar/calib/device_calibration.hpp"
 #include "einstar/calib/rectify.hpp"
 #include "einstar/calibrate/board.hpp"
@@ -98,7 +100,7 @@ int usage() {
                  "       calib-solve <captures dir> [--reference <calibration>] [--save <file>] [--no-distortion | --distortion-from <calibration>] |\n"
                  "       fixture-pack --out DIR [--mustang <Project1.ir_E10_prj>] [--stl mesh.stl] [--board <dir>] |\n"
                  "       track-fixture <project.ir_E10_prj> [--start N] [--count N] [--skip K] [--stl ref.stl] [--cpu] [--mode geometry|hybrid|markers] [--global-markers] [--marker-confirm N] [--record out.estr] [--quiet] |\n"
-                 "       process <session.estr> [-o mesh.stl|ply|obj] [--voxel MM] [--no-optimize] [--smooth N] [--stl reference.stl] [--reference-poses file] |\n"
+                 "       process <session.estr> [-o mesh.stl|ply|obj] [--voxel MM] [--no-optimize] [--smooth N] [--stl reference.stl] [--reference-poses file] [--render out.pgm [--render-frame view.txt]] [--no-edge-filter | --edge-radius N --rim-radius N --min-region PX] [--no-grazing-weight] [--no-grazing-filter | --max-view-angle DEG --steep-rim PX --steep-rim-angle DEG] [--min-weight W] [--min-observations N] [--min-component F] |\n"
                  "       track-session <session.estr> [--fake-time] [--count N] [--cpu] |\n"
                  "       inspect <session.estr> [--dump-blob out.bin] [--detail] [--dump-depth out.pgm [--frame N]]");
     return 2;
@@ -2362,6 +2364,89 @@ int inspect_cmd(const char* path, std::span<char*> args) {
     return 0;
 }
 
+ImageU8 render_mesh_in_frame(const recon::TriangleMesh& mesh, int width, const Vec3& mean, const Mat3& R, const Vec3& lo, const Vec3& hi);
+
+// Shaded orthographic view of a mesh (software z-buffer) along its thinnest principal axis, for
+// comparing processing results by eye. `width` pixels across the mesh's widest extent.
+ImageU8 render_mesh_view(const recon::TriangleMesh& mesh, int width, bool flip = false, const char* frame_file = nullptr) {
+    if (mesh.vertices.empty()) return ImageU8(width, width, 0);
+    // A frame file keeps the view identical across runs: loaded if it exists, else written.
+    if (frame_file && std::filesystem::exists(frame_file)) {
+        std::ifstream f(frame_file);
+        Vec3 mean, lo, hi;
+        Mat3 R;
+        for (int i = 0; i < 3; ++i) f >> mean(i);
+        for (int i = 0; i < 9; ++i) f >> R(i / 3, i % 3);
+        for (int i = 0; i < 3; ++i) f >> lo(i);
+        for (int i = 0; i < 3; ++i) f >> hi(i);
+        if (flip) R.row(1) = -R.row(1), R.row(2) = -R.row(2), std::swap(lo.y(), hi.y()), lo.y() = -lo.y(), hi.y() = -hi.y();
+        return render_mesh_in_frame(mesh, width, mean, R, lo, hi);
+    }
+    Vec3 mean = Vec3::Zero();
+    for (const auto& v : mesh.vertices) mean += v.cast<double>();
+    mean /= static_cast<double>(mesh.vertices.size());
+    Mat3 cov = Mat3::Zero();
+    for (const auto& v : mesh.vertices) {
+        const Vec3 d = v.cast<double>() - mean;
+        cov += d * d.transpose();
+    }
+    Eigen::SelfAdjointEigenSolver<Mat3> es(cov);  // ascending eigenvalues
+    Mat3 R;
+    R.row(0) = es.eigenvectors().col(2).transpose();
+    R.row(1) = es.eigenvectors().col(1).transpose();
+    R.row(2) = es.eigenvectors().col(0).transpose();
+    if (flip) R.row(1) = -R.row(1), R.row(2) = -R.row(2);
+    std::vector<Vec3> p(mesh.vertices.size());
+    Vec3 lo = Vec3::Constant(1e18), hi = Vec3::Constant(-1e18);
+    for (std::size_t i = 0; i < p.size(); ++i) {
+        p[i] = R * (mesh.vertices[i].cast<double>() - mean);
+        lo = lo.cwiseMin(p[i]), hi = hi.cwiseMax(p[i]);
+    }
+    if (frame_file && !flip) {
+        std::ofstream f(frame_file);
+        for (int i = 0; i < 3; ++i) f << std::format("{:.9g} ", mean(i));
+        for (int i = 0; i < 9; ++i) f << std::format("{:.9g} ", R(i / 3, i % 3));
+        for (int i = 0; i < 3; ++i) f << std::format("{:.9g} ", lo(i));
+        for (int i = 0; i < 3; ++i) f << std::format("{:.9g} ", hi(i));
+    }
+    return render_mesh_in_frame(mesh, width, mean, R, lo, hi);
+}
+
+ImageU8 render_mesh_in_frame(const recon::TriangleMesh& mesh, int width, const Vec3& mean, const Mat3& R, const Vec3& lo, const Vec3& hi) {
+    std::vector<Vec3> p(mesh.vertices.size());
+    for (std::size_t i = 0; i < p.size(); ++i) p[i] = R * (mesh.vertices[i].cast<double>() - mean);
+    const double scale = (width - 20) / std::max(1e-6, hi.x() - lo.x());
+    const int height = std::max(20, static_cast<int>((hi.y() - lo.y()) * scale) + 20);
+    ImageU8 img(width, height, 24);
+    std::vector<double> zbuf(static_cast<std::size_t>(width) * height, 1e18);
+    auto px = [&](const Vec3& q) { return Vec2((q.x() - lo.x()) * scale + 10, (q.y() - lo.y()) * scale + 10); };
+    for (const auto& t : mesh.triangles) {
+        const Vec3 &a = p[t[0]], &b = p[t[1]], &c = p[t[2]];
+        Vec3 n = (b - a).cross(c - a);
+        if (n.norm() <= 0) continue;
+        n.normalize();
+        const auto shade = static_cast<std::uint8_t>(std::clamp(40.0 + 215.0 * std::abs(n.z()), 0.0, 255.0));
+        const Vec2 A = px(a), B = px(b), C = px(c);
+        const int x0 = std::max(0, static_cast<int>(std::floor(std::min({A.x(), B.x(), C.x()}))));
+        const int x1 = std::min(width - 1, static_cast<int>(std::ceil(std::max({A.x(), B.x(), C.x()}))));
+        const int y0 = std::max(0, static_cast<int>(std::floor(std::min({A.y(), B.y(), C.y()}))));
+        const int y1 = std::min(height - 1, static_cast<int>(std::ceil(std::max({A.y(), B.y(), C.y()}))));
+        const double area = (B.x() - A.x()) * (C.y() - A.y()) - (B.y() - A.y()) * (C.x() - A.x());
+        if (std::abs(area) < 1e-12) continue;
+        for (int y = y0; y <= y1; ++y)
+            for (int x = x0; x <= x1; ++x) {
+                const double w0 = ((B.x() - x) * (C.y() - y) - (B.y() - y) * (C.x() - x)) / area;
+                const double w1 = ((C.x() - x) * (A.y() - y) - (C.y() - y) * (A.x() - x)) / area;
+                const double w2 = 1 - w0 - w1;
+                if (w0 < 0 || w1 < 0 || w2 < 0) continue;
+                const double z = w0 * a.z() + w1 * b.z() + w2 * c.z();
+                auto& zb = zbuf[static_cast<std::size_t>(y) * width + x];
+                if (z < zb) zb = z, img(x, y) = shade;
+            }
+    }
+    return img;
+}
+
 int process_cmd(const char* path, std::span<char*> args) {
     auto s = session::SessionReader::open(path);
     if (!s) {
@@ -2387,6 +2472,23 @@ int process_cmd(const char* path, std::span<char*> args) {
     pp.simplify_params.max_error_mm = arg_double(args, "--simplify-error", pp.simplify_params.max_error_mm);
     pp.simplify_params.target_ratio = arg_double(args, "--simplify-ratio", pp.simplify_params.target_ratio);
     pp.marker_sigma_mm = arg_double(args, "--marker-sigma", pp.marker_sigma_mm);
+    // Edge noise: depth-edge filter radii (0 0 or --no-edge-filter: off), grazing weights, extraction and cleanup thresholds.
+    if (has_flag(args, "--no-edge-filter")) pp.edge_filter.reset();
+    if (pp.edge_filter) {
+        pp.edge_filter->radius_px = static_cast<int>(arg_int(args, "--edge-radius", pp.edge_filter->radius_px));
+        pp.edge_filter->radius_rim_px = static_cast<int>(arg_int(args, "--rim-radius", pp.edge_filter->radius_rim_px));
+        pp.edge_filter->min_region_px = static_cast<int>(arg_int(args, "--min-region", pp.edge_filter->min_region_px));
+    }
+    pp.grazing_weight = !has_flag(args, "--no-grazing-weight");
+    if (has_flag(args, "--no-grazing-filter")) pp.grazing_filter.reset();
+    if (pp.grazing_filter) {
+        pp.grazing_filter->max_view_angle_deg = arg_double(args, "--max-view-angle", pp.grazing_filter->max_view_angle_deg);
+        pp.grazing_filter->rim_px = static_cast<int>(arg_int(args, "--steep-rim", pp.grazing_filter->rim_px));
+        pp.grazing_filter->rim_angle_deg = arg_double(args, "--steep-rim-angle", pp.grazing_filter->rim_angle_deg);
+    }
+    pp.extract.min_weight = static_cast<float>(arg_double(args, "--min-weight", pp.extract.min_weight));
+    pp.extract.min_observations = static_cast<int>(arg_int(args, "--min-observations", pp.extract.min_observations));
+    pp.cleanup.min_component_fraction = arg_double(args, "--min-component", pp.cleanup.min_component_fraction);
     std::string last_stage;
     pp.progress = [&](const std::string& stage, double) {
         if (stage != last_stage) {
@@ -2456,6 +2558,13 @@ int process_cmd(const char* path, std::span<char*> args) {
                      "completeness {:.1f}% of the reference within 0.5 mm, {:.1f}% within 1 mm",
                      c.accuracy_mm.median, c.accuracy_p90_mm, c.accuracy_mm.p95, 100 * c.beyond_fraction, 100 * c.completeness_05,
                      100 * c.completeness_1);
+    }
+    if (const char* img = arg_str(args, "--render")) {  // shaded views (top and underside) for comparisons by eye
+        const char* frame = arg_str(args, "--render-frame");
+        write_pgm(img, render_mesh_view(r->mesh, static_cast<int>(arg_int(args, "--render-width", 1400)), false, frame));
+        const std::string under = std::string(img).substr(0, std::string(img).rfind('.')) + "_under.pgm";
+        write_pgm(under, render_mesh_view(r->mesh, static_cast<int>(arg_int(args, "--render-width", 1400)), true, frame));
+        std::println("rendered {} and {}", img, under);
     }
     if (const char* outp = arg_str(args, "-o")) {
         if (auto w = recon::save_mesh(r->mesh, outp); !w) {

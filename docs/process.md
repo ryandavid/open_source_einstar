@@ -76,6 +76,27 @@ and resuming a scan continues the same file.
      on good fitness, rms and conditioning.
 4. **Re-fusion** of every tracked frame at its optimised pose (Metal TSDF, 0.5 mm voxels by default;
    0.3 mm in the app's fine mode). Frames the tracker flagged as degenerate count half.
+   - **Edge noise.** Stereo depth is least reliable along object outlines (the foreground's disparity
+     smeared over the silhouette, pixels straddling a depth step), which fused into a fringe of flakes
+     around objects. Settings follow EXStar's E10 range-image processing (BuildSetting.ini
+     `[ProcessDataSection]`: maxCameraAngle 70, boundaryWidth 2 with boundaryAngleOnly, minPatchSize
+     100) and its realtime fusion, whose voxels record the frames that saw them:
+     - per frame (`track::filter_depth_edges`, `track::filter_grazing`): depth within 2 px of a depth
+       step removed; connected regions under 100 px dropped; surface seen more obliquely than 70
+       degrees dropped (also pixels too steep to have a normal); the 2 px border of a depth region
+       dropped where the surface there is steeper than 45 degrees (a face-on border stays);
+     - fusion weight = stereo confidence x cos(viewing angle);
+     - extraction: surface only where at least 5 frames observed it (`TsdfParams::count_observations`,
+       `ExtractParams::min_observations`; the scanner gives ~40 frames per second).
+     On a real scan (display + glossy bucket, 2026-10-01) the display's outline went from a ragged
+     fringe to a clean edge and the floating debris went; the glossy bucket lost some sparse coverage.
+     Tried and rejected: eroding the border of every depth region (the depth is sparse, so every hole
+     has a border; it cost surface and changed registration) and a 10-frame minimum (it fragmented
+     glossy surface, so the small-piece cleanup, relative to the largest piece, kept a stray flap).
+     `einstar-cli process` switches: `--no-edge-filter`, `--edge-radius`, `--rim-radius`, `--min-region`,
+     `--no-grazing-filter`, `--max-view-angle`, `--steep-rim`, `--steep-rim-angle`, `--no-grazing-weight`,
+     `--min-observations`, `--min-weight`, and `--render out.pgm [--render-frame view.txt]` (a shaded
+     view, identical across runs) to compare.
 5. **Mesh.** Surface nets on the zero level: one vertex per surface cell, placed by one Newton step
    onto the trilinear zero level, with quads split along the diagonal that agrees with the SDF
    normals. Pieces smaller than 2% of the largest are removed. Optional Taubin smoothing.

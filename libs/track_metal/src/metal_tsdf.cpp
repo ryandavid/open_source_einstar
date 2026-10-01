@@ -24,6 +24,7 @@ struct VolumeArgs {
     std::uint32_t extend_only;
     float min_weight;
     std::uint32_t since_frame;
+    std::uint32_t count_observations;
 };
 
 struct CameraArgs {
@@ -79,6 +80,7 @@ struct MetalTsdfVolume::Impl {
     Ref<MTL::ComputePipelineState> init_voxels, allocate, integrate, raycast, extract, extract_render;
     mutable std::size_t render_capacity = 0;
     Ref<MTL::Buffer> keys, values, coords, brick_count, stamps, visible_count, visible, voxels, last_update, occupancy;
+    Ref<MTL::Buffer> observations;  // one byte per voxel when counted, else a placeholder
     // per-frame inputs
     Ref<MTL::Buffer> points, weights;
     std::size_t frame_pixels = 0;
@@ -97,6 +99,7 @@ struct MetalTsdfVolume::Impl {
         a.brick_capacity = opt.brick_capacity;
         a.frame = frame;
         a.weight_scale = 1.0f;
+        a.count_observations = p.count_observations ? 1u : 0u;
         return a;
     }
 
@@ -167,6 +170,7 @@ Result<std::unique_ptr<MetalTsdfVolume>> MetalTsdfVolume::create(std::shared_ptr
     im->visible_count = im->ctx->mirrored_buffer(4);
     im->visible = im->ctx->gpu_buffer(cap * 4);
     im->voxels = im->ctx->gpu_buffer(cap * 512 * 4);
+    im->observations = im->ctx->gpu_buffer(params.count_observations ? cap * 512 : 16);
     im->last_update = im->ctx->gpu_buffer(cap * 4);
     im->occupancy = im->ctx->gpu_buffer((256ull * 256 * 128) / 8);  // see occupancy_index in the kernels
     im->ext_count = im->ctx->mirrored_buffer(4);
@@ -184,6 +188,7 @@ void MetalTsdfVolume::clear() {
     im.ctx->fill(im.stamps.get(), 0);
     im.ctx->fill(im.last_update.get(), 0);
     im.ctx->fill(im.occupancy.get(), 0);
+    im.ctx->fill(im.observations.get(), 0);
     *static_cast<std::uint32_t*>(im.brick_count->contents()) = 0;
     gpu::Context::cpu_modified(im.brick_count.get());
     im.run("tsdf/init_voxels", [&](MTL::ComputeCommandEncoder* enc) {
@@ -199,9 +204,12 @@ std::size_t MetalTsdfVolume::brick_count() const { return impl_->count(); }
 void MetalTsdfVolume::for_each_brick(const BrickVisitor& fn) const {
     // The pool: half sdf, half weight per voxel (read in place on unified memory).
     const auto& im = *impl_;
-    std::vector<std::byte> coords_copy, vox_copy;
+    std::vector<std::byte> coords_copy, vox_copy, obs_copy;
     const auto* coords = static_cast<const std::int32_t*>(im.host_view(im.coords.get(), im.count() * 16ull, coords_copy));
     const auto* vox = static_cast<const _Float16*>(im.host_view(im.voxels.get(), im.count() * 512ull * 4, vox_copy));
+    const auto* obs = params_.count_observations
+                          ? static_cast<const std::uint8_t*>(im.host_view(im.observations.get(), im.count() * 512ull, obs_copy))
+                          : nullptr;
     std::array<float, track::kBrickVoxels> sdf{}, weight{};
     for (std::uint32_t b = 0; b < im.count(); ++b) {
         const track::BrickCoord c{coords[4 * b], coords[4 * b + 1], coords[4 * b + 2]};
@@ -210,7 +218,8 @@ void MetalTsdfVolume::for_each_brick(const BrickVisitor& fn) const {
             sdf[static_cast<std::size_t>(i)] = static_cast<float>(v[2 * i]);
             weight[static_cast<std::size_t>(i)] = static_cast<float>(v[2 * i + 1]);
         }
-        fn(c, sdf, weight);
+        fn(c, sdf, weight, obs ? std::span<const std::uint8_t>(obs + static_cast<std::size_t>(b) * track::kBrickVoxels, track::kBrickVoxels)
+                              : std::span<const std::uint8_t>{});
     }
 }
 
@@ -286,6 +295,7 @@ void MetalTsdfVolume::integrate(const track::DepthFrame& frame, const SE3& T_wor
         enc->setBuffer(im.last_update.get(), 0, 5);
         enc->setBytes(&a, sizeof(a), 6);
         enc->setBytes(&cam, sizeof(cam), 7);
+        enc->setBuffer(im.observations.get(), 0, 8);
         enc->dispatchThreadgroups(MTL::Size(visible, 1, 1), MTL::Size(8, 8, 8));
     });
 }

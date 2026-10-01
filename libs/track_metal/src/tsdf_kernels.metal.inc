@@ -21,6 +21,7 @@ struct VolumeArgs {
     uint extend_only;
     float min_weight;   // extraction
     uint since_frame;   // extraction
+    uint count_observations;
 };
 
 struct CameraArgs {
@@ -209,6 +210,7 @@ kernel void integrate(device const float4* points [[buffer(0)]], device const fl
                       device const int4* coords [[buffer(2)]], device const uint* visible [[buffer(3)]],
                       device half2* voxels [[buffer(4)]], device uint* last_update [[buffer(5)]],
                       constant VolumeArgs& a [[buffer(6)]], constant CameraArgs& cam [[buffer(7)]],
+                      device uchar* observations [[buffer(8)]],
                       uint3 tg3 [[threadgroup_position_in_grid]], uint3 lid [[thread_position_in_threadgroup]]) {
     const uint brick = visible[tg3.x];
     const int3 b = coords[brick].xyz;
@@ -232,6 +234,8 @@ kernel void integrate(device const float4* points [[buffer(0)]], device const fl
     if (a.extend_only && w_old > 0.0f) return;
     const float s_new = (float(old.x) * w_old + tsdf * w_new) / (w_old + w_new);
     voxels[vi] = half2(half(s_new), half(min(w_old + w_new, a.max_weight)));
+    // Frames that saw a surface here (one thread per voxel: no race).
+    if (a.count_observations != 0u && abs(sdf) < a.trunc && observations[vi] < 255) observations[vi] = uchar(observations[vi] + 1);
     last_update[brick] = a.frame;
 }
 

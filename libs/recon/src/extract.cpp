@@ -20,6 +20,8 @@ inline int local_index(int x, int y, int z) { return (z * kBrickSize + y) * kBri
 struct Grid {
     std::vector<BrickCoord> coords;
     std::vector<std::array<float, kBrickVoxels>> sdf, weight;
+    std::vector<std::array<std::uint8_t, kBrickVoxels>> observations;  // empty: not counted
+    int min_observations = 0;
     std::unordered_map<BrickCoord, int, track::BrickCoordHash> index;
 
     [[nodiscard]] int brick(const BrickCoord& c) const {
@@ -33,6 +35,7 @@ struct Grid {
         if (b < 0) return false;
         const int i = local_index(gx - c.x * kBrickSize, gy - c.y * kBrickSize, gz - c.z * kBrickSize);
         if (weight[static_cast<std::size_t>(b)][static_cast<std::size_t>(i)] < min_weight) return false;
+        if (!observations.empty() && observations[static_cast<std::size_t>(b)][static_cast<std::size_t>(i)] < min_observations) return false;
         s = sdf[static_cast<std::size_t>(b)][static_cast<std::size_t>(i)];
         return true;
     }
@@ -62,7 +65,10 @@ float trilinear(const std::array<float, 8>& s, const Vec3f& u, Vec3f& grad) {
 
 TriangleMesh extract_mesh(const track::Volume& volume, const ExtractParams& params) {
     Grid g;
-    volume.for_each_brick([&](const BrickCoord& c, std::span<const float> sdf, std::span<const float> weight) {
+    const bool use_obs = params.min_observations > 0;
+    g.min_observations = params.min_observations;
+    volume.for_each_brick([&](const BrickCoord& c, std::span<const float> sdf, std::span<const float> weight,
+                              std::span<const std::uint8_t> observations) {
         // Skip bricks that were allocated but never observed.
         if (std::ranges::none_of(weight, [&](float w) { return w >= params.min_weight; })) return;
         g.index[c] = static_cast<int>(g.coords.size());
@@ -71,7 +77,9 @@ TriangleMesh extract_mesh(const track::Volume& volume, const ExtractParams& para
         auto& w = g.weight.emplace_back();
         std::ranges::copy(sdf, s.begin());
         std::ranges::copy(weight, w.begin());
+        if (use_obs && observations.size() == kBrickVoxels) std::ranges::copy(observations, g.observations.emplace_back().begin());
     });
+    if (g.observations.size() != g.coords.size()) g.observations.clear();  // not counted by this volume: no filter
     const float voxel = volume.params().voxel_mm;
     const float mw = params.min_weight;
     const std::size_t nb = g.coords.size();

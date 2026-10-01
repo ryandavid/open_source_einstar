@@ -15,6 +15,7 @@
 #include <atomic>
 #include <functional>
 #include <map>
+#include <optional>
 #include <string>
 
 #include "einstar/core/error.hpp"
@@ -64,11 +65,21 @@ struct ProcessParams {
     bool use_markers = true;
     double marker_sigma_mm = 0.08;
     double marker_consistency_mm = 3.0;     // observations this far from their landmark are dropped
+    // Depth edges (silhouettes, steps) removed from every frame before it is used: the fringe of
+    // flying / edge-fattened stereo pixels along object outlines (track::filter_depth_edges).
+    std::optional<track::DepthEdgeFilter> edge_filter = track::DepthEdgeFilter{};
+    // Fusion weight = stereo confidence x cos(viewing angle): grazing views count less.
+    bool grazing_weight = true;
+    // EXStar's range-image settings (E10 BuildSetting.ini): no points seen beyond 70 degrees, a 2 px
+    // border dropped where the surface is steep (track::filter_grazing).
+    std::optional<track::GrazingFilter> grazing_filter = track::GrazingFilter{};
     // Fusion and meshing
     track::TsdfParams tsdf;                 // voxel size etc. of the final model
     bool use_gpu = true;
     float degenerate_weight = 0.5f;
-    ExtractParams extract;
+    // Surface only where at least 5 frames observed it (the scanner gives ~40 per second, so real
+    // surface is seen by dozens; stray flakes by a few). 10 cost real surface on glossy parts.
+    ExtractParams extract{.min_observations = 5};
     CleanupParams cleanup;
     int smooth_iterations = 0;
     bool simplify = true;          // error-bounded decimation: flat areas lose triangles, detail stays

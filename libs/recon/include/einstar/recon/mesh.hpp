@@ -29,6 +29,9 @@ struct ExtractParams {
     // A sign change between two voxels only counts as surface when both lie within this fraction of
     // the truncation band (a +1 / -1 pair is the edge of the band, e.g. behind a thin wall).
     float max_crossing_jump = 0.6f;
+    // Surface only where both voxels of a crossing were observed by at least this many frames
+    // (needs TsdfParams::count_observations; 0 = off).
+    int min_observations = 0;
 };
 
 // Surface nets on the TSDF zero level: one vertex per cell that straddles the surface (the mean of

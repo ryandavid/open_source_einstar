@@ -59,4 +59,38 @@ struct DepthFrame {
 // Builds points/normals/weights from a Z-depth image (e.g. EXStar fixture frames).
 [[nodiscard]] DepthFrame make_depth_frame(const ImageF32& depth, const Intrinsics& k, double max_normal_jump_mm = 3.0);
 
+// Depth at object edges is the least reliable: stereo smears the foreground's disparity across the
+// silhouette ("edge fattening") and pixels straddling a depth step land between the surfaces ("flying
+// pixels"). Both leave a fringe of fused surface along outlines. This removes depth within `radius_px`
+// of a depth step (neighbours further apart than max(min_jump_mm, jump_ratio x depth)) and, optionally,
+// of the edge of the valid region (radius_rim_px: off by default; the scanner's depth is sparse, so
+// every hole has a rim, and eroding them costs real surface and changes registration).
+// Defaults chosen on a real scan (display + glossy bucket, 2026-10-01), with filter_grazing, the
+// grazing weight in fusion and a 5-frame observation minimum (recon::ProcessParams).
+struct DepthEdgeFilter {
+    int radius_px = 2;
+    int radius_rim_px = 0;
+    float min_jump_mm = 4.0f;
+    float jump_ratio = 0.01f;
+    // Speckle filter: connected regions (neighbours within the jump threshold) smaller than this are
+    // removed: isolated stereo mismatches, which fuse into floating flakes. 0 = off. (Pixels of the
+    // recorded 640 x 512 depth; EXStar's minPatchSize is 100.)
+    int min_region_px = 100;
+};
+void filter_depth_edges(ImageF32& depth, const DepthEdgeFilter& params);
+
+// Viewing-angle filters on a frame with normals, after EXStar's range-image processing (its E10
+// BuildSetting.ini [ProcessDataSection]: maxCameraAngle 70, boundaryWidth 2, boundaryAngleOnly 1):
+// points whose surface is seen more obliquely than `max_view_angle_deg` are dropped, and the
+// `rim_px`-wide border of the valid region is dropped where the surface there is steeper than
+// `rim_angle_deg` (a border on a face-on surface stays). Inside the valid region, a pixel without a
+// normal (its neighbours too far apart: a step, or too steep to measure) counts as too oblique.
+// 0 disables either.
+struct GrazingFilter {
+    double max_view_angle_deg = 70.0;
+    int rim_px = 2;
+    double rim_angle_deg = 45.0;
+};
+void filter_grazing(DepthFrame& frame, const GrazingFilter& params);
+
 }  // namespace einstar::track

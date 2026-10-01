@@ -17,6 +17,21 @@
 namespace einstar::recon {
 namespace {
 
+// A recorded frame as used for registration and fusion: depth edges removed, weights as configured.
+track::DepthFrame frame_of(session::FrameRecord& rec, const track::Intrinsics& k, const ProcessParams& params) {
+    if (params.edge_filter) track::filter_depth_edges(rec.depth, *params.edge_filter);
+    auto f = rec.depth_frame(k);
+    if (params.grazing_filter) track::filter_grazing(f, *params.grazing_filter);
+    if (params.grazing_weight)
+        for (int y = 0; y < f.points.height(); ++y)
+            for (int x = 0; x < f.points.width(); ++x) {
+                const Vec3f& n = f.normals(x, y);
+                if (n.squaredNorm() > 0) f.weights(x, y) *= std::max(0.05f, -n.dot(f.points(x, y).normalized()));
+            }
+    return f;
+}
+
+
 struct Fragment {
     std::vector<std::size_t> frames;  // session indices
     std::size_t anchor = 0;           // the middle frame: registrations constrain its pose
@@ -153,7 +168,7 @@ Result<ProcessResult> process_session(const session::SessionReader& s, const Pro
                         for (int x = 0; x < fr.anchor_depth.width(); ++x) fr.anchor_depth(x, y) = rec->depth(2 * x, 2 * y);
                     fr.anchor_k = k.scaled(0.5);
                 }
-                auto c = frame_cloud(rec->depth_frame(k), T_anchor_world * out.frame_poses.at(i), params.cloud_stride_px);
+                auto c = frame_cloud(frame_of(*rec, k, params), T_anchor_world * out.frame_poses.at(i), params.cloud_stride_px);
                 acc.points.insert(acc.points.end(), c.points.begin(), c.points.end());
                 acc.normals.insert(acc.normals.end(), c.normals.begin(), c.normals.end());
                 if (!collect_markers) continue;
@@ -500,7 +515,7 @@ Result<ProcessResult> process_session(const session::SessionReader& s, const Pro
             auto try_frame = [&](std::size_t i, const SE3& guess) -> bool {
                 auto rec = s.read(i);
                 if (!rec) return false;
-                const auto cloud = voxel_downsample(frame_cloud(rec->depth_frame(k), SE3::Identity(), params.recover_stride_px), params.cloud_voxel_mm);
+                const auto cloud = voxel_downsample(frame_cloud(frame_of(*rec, k, params), SE3::Identity(), params.recover_stride_px), params.cloud_voxel_mm);
                 if (cloud.size() < 200) return false;
                 const auto r = register_point_to_plane(cloud, model_index, guess, rp);
                 const SE3 d = guess.inverse() * r.T_target_source;
@@ -537,10 +552,12 @@ Result<ProcessResult> process_session(const session::SessionReader& s, const Pro
     // ---- 3. Re-fusion ---------------------------------------------------------------------------
     sw.reset();
     std::unique_ptr<track::Volume> volume;
+    track::TsdfParams tsdf_params = params.tsdf;
+    tsdf_params.count_observations = tsdf_params.count_observations || params.extract.min_observations > 0;
     if (params.use_gpu)
         if (auto ctx = gpu::Context::create())
-            if (auto v = track_metal::MetalTsdfVolume::create(*ctx, params.tsdf)) volume = std::move(*v);
-    if (!volume) volume = std::make_unique<track::TsdfVolume>(params.tsdf);
+            if (auto v = track_metal::MetalTsdfVolume::create(*ctx, tsdf_params)) volume = std::move(*v);
+    if (!volume) volume = std::make_unique<track::TsdfVolume>(tsdf_params);
     {
         // Decoding (zstd, points, normals) runs in parallel batches; integration stays in order.
         const std::vector<std::pair<std::size_t, SE3>> todo(out.frame_poses.begin(), out.frame_poses.end());
@@ -557,7 +574,7 @@ Result<ProcessResult> process_session(const session::SessionReader& s, const Pro
                     errors[j] = rec.error().message;
                     return;
                 }
-                batch[j] = rec->depth_frame(k);
+                batch[j] = frame_of(*rec, k, params);
                 weight[j] = (rec->flags & session::frame_degenerate) ? params.degenerate_weight : 1.0f;
             });
             for (std::size_t j = 0; j < n; ++j) {
