@@ -64,6 +64,12 @@ Result<FlashReport> flash_firmware(const FirmwarePackage& package, const FlashOp
     dev = reconnect(o, report.serial, "after the reboot");
     if (!dev) return std::unexpected(dev.error());
 
+    // The update's first command (00/06) is sent once, without retries (a repeat would land in the update
+    // as page data), so check the bulk channel first with a read-only command that can be retried.
+    if (auto r = (*dev)->read_flash(0, 4096); !r)
+        return make_error(r.error().code, std::format("the scanner's bulk channel does not answer after the reboot ({}); nothing was written. "
+                                                      "Unplug and replug it, then try again",
+                                                      r.error().message));
     say(std::format("writing {} pages into the inactive slot", package.pages));
     if (auto r = (*dev)->write_firmware(package, o.progress, o.page_pause); !r) return std::unexpected(r.error());
     dev->reset();
