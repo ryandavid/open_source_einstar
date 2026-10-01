@@ -66,6 +66,15 @@
   triples. Fix: recalibrate (EXStar's calibration, which rewrites the flash; or a host-side calibration
   with `EinstarCalibration.app`, which writes it into the scanner like EXStar; docs/calibration.md §8). Raw captures: `einstar-cli hw-capture` (local,
   fixtures-data/).
+- **First live scans (2026-10-01, after recalibrating with `EinstarCalibration.app`)**: the calibration
+  read back from the scanner is the one solved, and it aligns rows to 0.2-0.4 px on saved scan frames, but
+  ICP failed on ~99% of frames. Causes, found by replaying the recordings (`einstar-cli track-session`):
+  the scanner's first frames after the lights switch on have no depth, and the tracker started its model
+  on one, so nothing could ever align (also marker capture starting without markers: nothing registered);
+  and the stream header's timestamp is a constant, so motion prediction never ran. Now a scan starts on a
+  frame with depth over 5% of the view (or 3 markers; marker capture needs the markers), restarts itself
+  if it loses track within its first 15 frames, and frame times come from the trigger schedule. Replayed
+  with these, one recording went from 1 to 764 of 955 frames tracked.
 - 10/62 DISTANCE 0/1/2 turns the top LED red / green / blue (idle and scanning). Button codes (`einstar-cli
   hw-ui`): 1 single, 2 double, 3 long on start/pause, each cleared once read; the brightness buttons report
   a double click as two singles and a long press as 3 then, 1-2 s later, 2.

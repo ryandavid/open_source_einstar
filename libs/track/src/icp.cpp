@@ -189,6 +189,9 @@ IcpResult icp_point_to_plane(const DepthFrame& frame, const RaycastResult& model
             if (sys.n < 50 && p.markers.size() < 3) {
                 res.converged = false;
                 res.correspondences = sys.n;
+                res.candidates = sys.considered;  // (at this level: why it gave up)
+                res.coverage = sys.considered ? static_cast<double>(sys.on_model) / sys.considered : 0.0;
+                res.inlier_ratio = sys.on_model ? static_cast<double>(sys.n) / sys.on_model : 0.0;
                 return res;
             }
             // Joint marker terms: r = T p - q, J = [I, -hat(Tp - c)] (twist about the centroid).

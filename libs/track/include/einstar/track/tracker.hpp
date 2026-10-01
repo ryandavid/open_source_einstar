@@ -39,6 +39,13 @@ struct TrackerParams {
     double min_inlier_ratio = 0.7;      // of source points that land on the model (good frames: 0.8-0.9)
     double min_coverage = 0.15;         // of the frame that must overlap the model
     int min_correspondences = 800;
+    // A scan starts on a frame with depth over at least this fraction of the image (or usable markers):
+    // the scanner's first frames after the light sources switch on carry no depth, and a model started
+    // on one (or on a sliver at the edge of the range) stays too small to align anything to.
+    double min_start_fraction = 0.05;
+    // A surface scan that loses track within this many accepted frames starts over (nothing worth
+    // keeping yet; staying lost against a tiny model never recovers). The result says `restarted`.
+    int restart_if_lost_within = 15;
     double max_rms_mm = 0.45;
     double max_speed_mm_s = 800.0;      // generous hand-motion limits, scaled by elapsed time
     double max_rot_speed_deg_s = 240.0;
@@ -91,6 +98,7 @@ struct TrackResult {
     int markers_matched = 0;    // associated with the map at the final pose
     bool marker_pose = false;   // the pose was seeded/verified by markers
     std::vector<std::pair<int, int>> marker_ids;  // (frame marker index, map id) at the final pose
+    bool restarted = false;  // the tracker started over (lost right after the start): a new world frame
     std::string reason;  // why a frame was rejected
     double ms = 0;
     double wait_ms = 0;  // part of `ms` spent waiting for the relocalisation worker (deterministic mode)
@@ -165,6 +173,7 @@ private:
     std::size_t feature_model_bricks_ = 0;      // model size at the last descriptor snapshot
     std::int64_t feature_model_frame_ = 0;      // frame of the last descriptor snapshot
     std::int64_t frame_no_ = 0;                 // frames processed (the relocaliser's clock)
+    int accepted_since_start_ = 0;
     std::uint32_t reloc_seed_ = 1;
     SE3 lost_pose_ = SE3::Identity();  // last trusted pose before the loss
 };

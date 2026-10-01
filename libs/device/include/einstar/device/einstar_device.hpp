@@ -105,6 +105,9 @@ struct ConnectOptions {
 
 class EinstarDevice {
 public:
+    // Groups carry extended (non-wrapping) ids. Their `timestamp` is microseconds on the trigger
+    // schedule: group id x (trigger period / IR triggers per cycle), accumulated across period changes.
+    // The scanner's own header field is a constant (docs/protocol-transport.md 3.6), so it is replaced.
     using GroupSink = std::function<void(usb::FrameGroup&&)>;
     using ButtonSink = std::function<void(int button, ButtonAction action)>;
 
@@ -245,6 +248,11 @@ private:
     std::atomic<std::thread::id> heartbeat_id_{};  // the heartbeat's own commands pass while offline
     std::string foreign_serial_;                   // another scanner found while reconnecting (heartbeat only)
     std::atomic<int> rgb_triggers_{0};  // (also set by the heartbeat when it replays the trigger)
+    std::atomic<int> mono_triggers_{1};
+    std::atomic<std::uint32_t> trigger_period_us_{68000};
+    [[nodiscard]] std::uint64_t group_interval_us() const {
+        return trigger_period_us_.load() / static_cast<std::uint32_t>(std::max(1, mono_triggers_.load()));
+    }
     std::mutex settings_mutex_;
     Settings settings_;
 

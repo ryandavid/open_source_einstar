@@ -99,7 +99,8 @@ int usage() {
                  "       fixture-pack --out DIR [--mustang <Project1.ir_E10_prj>] [--stl mesh.stl] [--board <dir>] |\n"
                  "       track-fixture <project.ir_E10_prj> [--start N] [--count N] [--skip K] [--stl ref.stl] [--cpu] [--mode geometry|hybrid|markers] [--global-markers] [--marker-confirm N] [--record out.estr] [--quiet] |\n"
                  "       process <session.estr> [-o mesh.stl|ply|obj] [--voxel MM] [--no-optimize] [--smooth N] [--stl reference.stl] [--reference-poses file] |\n"
-                 "       inspect <session.estr>");
+                 "       track-session <session.estr> [--fake-time] [--count N] [--cpu] |\n"
+                 "       inspect <session.estr> [--dump-blob out.bin] [--detail] [--dump-depth out.pgm [--frame N]]");
     return 2;
 }
 
@@ -2210,7 +2211,51 @@ int track_fixture(const char* path, std::span<char*> args) {
 }
 
 // What a session file holds: the scanner, frames and their extras, drops, raw IR (first frame decoded).
-int inspect_cmd(const char* path) {
+// Replays a recorded session's depth frames through the live tracker (Metal volume and ICP, as the app),
+// printing what ICP did per frame. --fake-time spaces the frames 22.7 ms apart instead of using the
+// recorded timestamps; --count N limits the frames; --cpu uses the CPU solvers.
+int track_session(const char* path, std::span<char*> args) {
+    auto r = session::SessionReader::open(path);
+    if (!r) {
+        std::println(stderr, "{}", r.error().message);
+        return 1;
+    }
+    const auto& s = **r;
+    std::unique_ptr<track::Volume> volume;
+    std::unique_ptr<track_metal::MetalIcp> gpu_icp;
+    if (!has_flag(args, "--cpu"))
+        if (auto ctx = gpu::Context::create()) {
+            if (auto v = track_metal::MetalTsdfVolume::create(*ctx)) volume = std::move(*v);
+            if (auto g = track_metal::MetalIcp::create(*ctx)) gpu_icp = std::move(*g);
+        }
+    track::TrackerParams tp;
+    tp.deterministic_relocalisation = true;
+    track::Tracker tracker(tp, std::move(volume));
+    if (gpu_icp) tracker.set_icp_solver(gpu_icp->as_function());
+    const bool fake_time = has_flag(args, "--fake-time");
+    const auto n = std::min<std::size_t>(s.frame_count(), static_cast<std::size_t>(arg_int(args, "--count", 200)));
+    std::map<std::string, int> why;
+    int accepted = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        auto rec = s.read(i);
+        if (!rec) continue;
+        auto f = rec->depth_frame(s.header().depth_intrinsics);
+        if (fake_time) f.timestamp_s = static_cast<double>(i) * 0.0227;
+        const auto t = tracker.process(f);
+        accepted += t.accepted;
+        ++why[t.accepted ? "accepted" : t.reason];
+        const long from = arg_int(args, "--show-from", -1), upto = arg_int(args, "--show-to", -1);
+        if (from >= 0 ? (static_cast<long>(i) >= from && static_cast<long>(i) <= upto) : (i < 25 || (!t.accepted && i % 25 == 0)))
+            std::println("{:4} t {:8.3f} {:9} conv {} corr {:6} cand {:6} cov {:4.2f} inl {:4.2f} rms {:5.2f} mm eig {:.1e} markers {} {}", i, f.timestamp_s,
+                         t.accepted ? "accepted" : "rejected", t.icp.converged ? 1 : 0, t.icp.correspondences, t.icp.candidates, t.icp.coverage,
+                         t.icp.inlier_ratio, t.icp.rms_mm, t.icp.min_eigenvalue_ratio, t.markers_seen, t.reason);
+    }
+    std::println("{} of {} frames accepted", accepted, n);
+    for (const auto& [k, v] : why) std::println("  {:5}  {}", v, k);
+    return 0;
+}
+
+int inspect_cmd(const char* path, std::span<char*> args) {
     auto r = session::SessionReader::open(path);
     if (!r) {
         std::println(stderr, "{}", r.error().message);
@@ -2225,6 +2270,12 @@ int inspect_cmd(const char* path) {
                      d->firmware, d->calibration_blob.size(), d->rig.left.fx);
     else
         std::println("scanner: not recorded");
+    if (const char* out = arg_str(args, "--dump-blob"); out && s.device()) {  // the scanner's calibration blob as recorded
+        std::ofstream f(out, std::ios::binary);
+        const auto& b = s.device()->calibration_blob;
+        f.write(reinterpret_cast<const char*>(b.data()), static_cast<std::streamsize>(b.size()));
+        std::println("calibration blob written to {}", out);
+    }
     std::size_t accepted = 0, with_extras = 0;
     std::uint32_t exp_lo = ~0u, exp_hi = 0;
     for (std::size_t i = 0; i < s.frame_count(); ++i) {
@@ -2238,6 +2289,56 @@ int inspect_cmd(const char* path) {
     const double span_s = s.frame_count() > 1 ? s.meta(s.frame_count() - 1).timestamp_s - s.meta(0).timestamp_s : 0.0;
     std::println("frames: {} ({} accepted) over {:.1f} s; {} with capture settings / tracking diagnostics{}", s.frame_count(), accepted, span_s,
                  with_extras, with_extras ? std::format(" (exposure {}..{})", exp_lo, exp_hi) : std::string{});
+    if (has_flag(args, "--detail")) {  // why frames were rejected, markers, depth density (every 10th frame)
+        std::map<std::string, int> why;
+        double markers = 0, matched = 0, valid = 0, conf = 0;
+        int sampled = 0;
+        for (std::size_t i = 0; i < s.frame_count(); ++i) {
+            const auto& m = s.meta(i);
+            if (m.extras) ++why[m.extras->tracking.reason.empty() ? (m.accepted() ? "accepted" : "(no reason)") : m.extras->tracking.reason];
+            markers += static_cast<double>(m.markers.size());
+            if (m.extras) matched += m.extras->tracking.markers_seen;
+            if (i % 10 != 0) continue;
+            auto f = s.read(i);
+            if (!f || f->depth.empty()) continue;
+            std::size_t n = 0;
+            double c = 0;
+            for (int y = 0; y < f->depth.height(); ++y)
+                for (int x = 0; x < f->depth.width(); ++x)
+                    if (f->depth(x, y) > 0) {
+                        ++n;
+                        if (!f->confidence.empty()) c += f->confidence(x, y);
+                    }
+            valid += static_cast<double>(n) / static_cast<double>(f->depth.width() * f->depth.height());
+            conf += n ? c / static_cast<double>(n) : 0;
+            ++sampled;
+        }
+        const double nf = std::max<double>(1, static_cast<double>(s.frame_count()));
+        std::println("per frame: {:.1f} markers recorded, {:.1f} seen by the tracker; valid depth {:.1f}% (mean confidence {:.2f}) over {} sampled frames",
+                     markers / nf, matched / nf, sampled ? 100 * valid / sampled : 0.0, sampled ? conf / sampled : 0.0, sampled);
+        for (const auto& [reason, count] : why) std::println("  {:5}  {}", count, reason);
+    }
+    if (const char* out = arg_str(args, "--dump-depth")) {  // frame --frame N (default: middle) as an 8-bit image, 0..800 mm
+        const auto i = static_cast<std::size_t>(arg_int(args, "--frame", static_cast<long>(s.frame_count() / 2)));
+        auto f = s.read(std::min(i, s.frame_count() - 1));
+        if (!f) {
+            std::println(stderr, "{}", f.error().message);
+            return 1;
+        }
+        ImageU8 img(f->depth.width(), f->depth.height(), 0);
+        std::vector<float> z;
+        for (int y = 0; y < img.height(); ++y)
+            for (int x = 0; x < img.width(); ++x)
+                if (const float d = f->depth(x, y); d > 0) {
+                    img(x, y) = static_cast<std::uint8_t>(std::clamp(255.0f - d * 255.0f / 800.0f, 1.0f, 255.0f));
+                    z.push_back(d);
+                }
+        std::ranges::sort(z);
+        auto pct = [&](double q) { return z.empty() ? 0.0f : z[static_cast<std::size_t>(q * static_cast<double>(z.size() - 1))]; };
+        std::println("frame {}: {} valid, depth 5/50/95% {:.0f} / {:.0f} / {:.0f} mm, {} markers{}", f->index, z.size(), pct(0.05), pct(0.5), pct(0.95),
+                     f->markers.size(), f->extras ? " (" + f->extras->tracking.reason + ")" : "");
+        write_pgm(out, img);
+    }
     std::map<std::string, int> reasons;
     for (const auto& d : s.dropped()) ++reasons[d.reason];
     std::print("not processed: {}", s.dropped().size());
@@ -2388,7 +2489,8 @@ int main(int argc, char** argv) {
     if (cmd == "board-poses") return board_poses(rest);
     if (cmd == "calib-solve") return calib_solve(rest);
     if (cmd == "track-fixture" && argc >= 3) return track_fixture(argv[2], rest);
-    if (cmd == "inspect" && argc >= 3) return inspect_cmd(argv[2]);
+    if (cmd == "track-session" && argc >= 3) return track_session(argv[2], rest);
+    if (cmd == "inspect" && argc >= 3) return inspect_cmd(argv[2], std::span<char*>(argv + 3, static_cast<std::size_t>(argc - 3)));
     if (cmd == "process" && argc >= 3) return process_cmd(argv[2], std::span<char*>(argv + 3, static_cast<std::size_t>(argc - 3)));
     return usage();
 }

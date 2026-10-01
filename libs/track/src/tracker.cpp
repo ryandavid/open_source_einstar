@@ -147,8 +147,29 @@ bool Tracker::start(const DepthFrame& frame, const FrameMarkers& fm, TrackResult
             return false;
         }
         start = p->T_world_camera;
+    } else if (!fm.usable) {
+        // Start only on something the next frames can be aligned to: enough surface (when building one)
+        // or the markers. Otherwise the model or the marker map stays empty and nothing ever registers.
+        if (!params_.fuse_surface) {
+            out.state = state_;
+            out.reason = "waiting for 3 markers to start on";
+            return false;
+        }
+        if (params_.min_start_fraction > 0) {
+            frame.ensure_cpu();
+            int valid = 0;
+            for (int y = 0; y < frame.points.height(); ++y)
+                for (int x = 0; x < frame.points.width(); ++x) valid += frame.points(x, y).z() > 0;
+            const double fraction = static_cast<double>(valid) / std::max(1, frame.points.width() * frame.points.height());
+            if (fraction < params_.min_start_fraction) {
+                out.state = state_;
+                out.reason = std::format("waiting for depth to start on ({:.0f}% of the view)", 100 * fraction);
+                return false;
+            }
+        }
     }
     last_pose_ = prev_pose_ = start;
+    accepted_since_start_ = 0;
     if (params_.fuse_surface) volume_->integrate(frame, last_pose_);
     if (fm.usable) {
         map_.update(fm.positions, fm.diameters, last_pose_, {});
@@ -352,6 +373,15 @@ TrackResult Tracker::process(const DepthFrame& frame) {
     const FrameMarkers fm = usable_markers(frame);
     out.markers_seen = static_cast<int>(frame.markers.size());
     auto finish = [&] {
+        if (out.accepted) ++accepted_since_start_;
+        // Lost right after the start (e.g. it started while the scanner was still moving in): start over
+        // rather than stay lost against a model too small to recover on.
+        if (!out.accepted && state_ == TrackState::lost && params_.fuse_surface && accepted_since_start_ < params_.restart_if_lost_within) {
+            reset(true);
+            out.state = state_;
+            out.restarted = true;
+            out.reason += "; starting over";
+        }
         out.ms = sw.elapsed_ms();
         return out;
     };

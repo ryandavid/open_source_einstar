@@ -582,6 +582,14 @@ void ScanPipeline::process(usb::FrameGroup&& group) {
     marker_times_.add(depth->marker_ms);
 
     const auto r = tracker_.process(depth->frame);
+    if (r.restarted) {
+        // The tracker started over in a new world frame (unless a global marker map fixes it): the
+        // frames recorded so far belong to the abandoned one, so they go in their own file.
+        const bool fixed = std::ranges::any_of(tracker_.marker_map().markers(), [](const auto& m) { return m.fixed; });
+        if (!fixed) restart_recording(false);
+        std::lock_guard lock(trajectory_mutex_);
+        trajectory_.clear();
+    }
     if (phase_ == ScanPhase::global_markers) collect_keyframe(r, depth->frame);
     record(r, *depth);
     track_times_.add(r.ms);

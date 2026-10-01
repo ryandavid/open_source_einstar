@@ -411,6 +411,7 @@ Result<void> EinstarDevice::set_trigger(int mono, int rgb) {
     if (!r) return std::unexpected(r.error());
     remember([&](Settings& s) { s.trigger = std::pair{mono, rgb}; });
     rgb_triggers_ = rgb;
+    mono_triggers_ = mono;
     std::lock_guard lock(stream_mutex_);
     if (groups_) groups_->set_expected_mask(rgb > 0 ? 0b111u : 0b011u);
     return {};
@@ -424,6 +425,7 @@ Result<void> EinstarDevice::set_trigger_period_us(std::uint32_t period) {
     auto r = send<op::kSetTriggerPeriod>(p);
     if (!r) return std::unexpected(r.error());
     remember([&](Settings& s) { s.trigger_period = period; });
+    trigger_period_us_ = period;
     return {};
 }
 
@@ -506,10 +508,17 @@ Result<void> EinstarDevice::start_stream(GroupSink sink) {
         // The scanner's group id counts modulo 256 (measured; the header field is 32 bits wide): extend
         // it so ids keep increasing for the whole stream (recordings use them as frame indices).
         groups_ = std::make_unique<usb::GroupAssembler>(
-            [sink = std::move(sink), base = std::uint32_t{0}, last = std::optional<std::uint32_t>{}](usb::FrameGroup&& g) mutable {
+            [this, sink = std::move(sink), base = std::uint32_t{0}, last = std::optional<std::uint32_t>{},
+             previous = std::optional<std::uint32_t>{}, time_us = std::uint64_t{0}](usb::FrameGroup&& g) mutable {
                 if (last && g.frame_id < *last && *last <= 0xFFu) base += 256;
                 last = g.frame_id;
                 g.frame_id += base;
+                // Time from the trigger schedule (the header's timestamp field is a constant on the scanner).
+                const std::uint64_t interval = group_interval_us();
+                time_us = previous && g.frame_id > *previous ? time_us + (g.frame_id - *previous) * interval
+                                                             : previous ? time_us + interval : (g.frame_id + 1ull) * interval;
+                previous = g.frame_id;
+                g.timestamp = time_us;
                 for (auto& s : g.sensors)
                     if (s) s->frame_id = g.frame_id;
                 sink(std::move(g));
