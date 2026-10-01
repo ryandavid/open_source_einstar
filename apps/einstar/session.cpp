@@ -50,15 +50,18 @@ Session::~Session() {
     if (pipeline_) pipeline_->stop();
 }
 
-Result<std::unique_ptr<Session>> Session::open(bool force_emulator, UpdateSink updates, ButtonSink buttons) {
+Result<std::unique_ptr<Session>> Session::open(bool emulator, UpdateSink updates, ButtonSink buttons) {
     auto s = std::unique_ptr<Session>(new Session());
     std::unique_ptr<usb::Transport> transport;
     std::shared_ptr<EmulatorScene> emu;
     // The scanner reboots or restarts its USB side on its own (docs/firmware.md 5): reopen it and replay.
     device::ConnectOptions opts;
 
-    if (!force_emulator) {
-        if (auto devices = usb::enumerate_devices(); devices && !devices->empty()) {
+    if (!emulator) {
+        auto devices = usb::enumerate_devices();
+        if (!devices || devices->empty())
+            return make_error(Errc::not_found, "No Einstar found on USB. Check the cable and that EXStar is closed.");
+        {
             const usb::UsbDeviceInfo info = devices->front();
             auto t = usb::open_libusb(info);
             if (!t) return std::unexpected(t.error());
@@ -147,6 +150,7 @@ Result<std::unique_ptr<Session>> Session::open(bool force_emulator, UpdateSink u
     else if (const char* home = std::getenv("HOME")) s->pipeline_->set_recording_directory(std::string(home) + "/Documents/Einstar/Scans");
     s->pipeline_->start();
 
+    s->calibration_ = calibration_source;
     s->description_ = std::format("{} {} (serial {}, firmware {}); calibration: {}", s->emulated_ ? "Emulated" : "Scanner", info.product_name,
                                   info.serial, info.firmware, calibration_source);
     return s;

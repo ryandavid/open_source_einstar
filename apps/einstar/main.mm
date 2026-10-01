@@ -30,6 +30,7 @@
 #include "imgui_impl_metal.h"
 
 #include "app_state.hpp"
+#include "workflow.hpp"
 #include "einstar/core/log.hpp"
 #include "einstar/core/timing.hpp"
 #include "einstar/gpu/context.hpp"
@@ -123,6 +124,8 @@ int main(int argc, char** argv) {
     double snapshot_seconds = 8.0;
     bool snapshot_process = false;
     bool snapshot_raw = false;
+    bool snapshot_markers = false;
+    bool snapshot_idle = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string_view(argv[i]) == "--snapshot" && i + 1 < argc) {
             snapshot_path = argv[i + 1];
@@ -130,6 +133,8 @@ int main(int argc, char** argv) {
         }
         if (std::string_view(argv[i]) == "--process") snapshot_process = true;
         if (std::string_view(argv[i]) == "--raw") snapshot_raw = true;
+        if (std::string_view(argv[i]) == "--markers") snapshot_markers = true;  // snapshot the marker-capture step
+        if (std::string_view(argv[i]) == "--idle") snapshot_idle = true;        // snapshot the start screen (not connected)
     }
     bool snapshot_processing = false;
     if (!glfwInit()) {
@@ -175,15 +180,7 @@ int main(int argc, char** argv) {
     PreviewTexture preview_left, preview_right;
     gpu::Ref<MTL::Texture> preview_left_ref, preview_right_ref;
     std::vector<pipeline::LiveUpdate::PreviewMarker> preview_markers;
-    int align_mode = 1;  // hybrid
-    int voxel_choice = 1;  // 0.3 / 0.5 / 1.0 mm
-    bool optimise_poses = true;
-    int smooth_iterations = 0;
-    bool simplify_mesh = true;
-    char export_path[512] = {};
-    if (const char* home = std::getenv("HOME")) std::snprintf(export_path, sizeof export_path, "%s/Documents/Einstar/scan.stl", home);
-    char marker_path[512] = {};
-    if (const char* home = std::getenv("HOME")) std::snprintf(marker_path, sizeof marker_path, "%s/Documents/einstar_global_markers.txt", home);
+    app::WorkflowUi workflow;
     id<MTLTexture> depth_tex = nil;
     MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor new];
     pass.colorAttachments[0].clearColor = MTLClearColorMake(0.11, 0.12, 0.14, 1.0);
@@ -201,13 +198,20 @@ int main(int argc, char** argv) {
         std::atomic<int> frames{0};
     };
     auto view_gpu = std::make_shared<ViewGpuTime>();
-    if (snapshot_path) {
+    if (snapshot_path && !snapshot_idle) {
         // Headless runs record into a temporary directory, never the user's scans.
         const auto tmp = std::filesystem::temp_directory_path() / "einstar_snapshot_scans";
         setenv("EINSTAR_SCAN_DIR", tmp.c_str(), 1);
         state.connect(true);
         state.follow_scanner = true;
         state.set_record_raw_ir(snapshot_raw);
+        if (snapshot_markers) {
+            workflow.type = app::WorkflowUi::ScanType::global_markers;
+            workflow.step = app::WorkflowUi::Step::markers;
+            state.set_phase(pipeline::ScanPhase::global_markers);
+        } else {
+            workflow.step = app::WorkflowUi::Step::scan;
+        }
         state.start_scan();
     }
     while (!glfwWindowShouldClose(window)) {
@@ -304,125 +308,44 @@ int main(int argc, char** argv) {
             ImGui_ImplGlfw_NewFrame();
             ImGui::NewFrame();
 
-            // ---- Control panel ----
+            // ---- Workflow panel: connect, scan type, (markers), scan, process ----
             ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
-            ImGui::SetNextWindowSize(ImVec2(340, 620), ImGuiCond_FirstUseEver);
-            ImGui::Begin("Scan");
-            ImGui::TextWrapped("%s", state.status().c_str());
-            if (!state.scanning()) {
-                if (ImGui::Button("Connect scanner")) state.connect(false);
-                ImGui::SameLine();
-                if (ImGui::Button("Use emulator")) state.connect(true);
-            }
+            ImGui::SetNextWindowSize(ImVec2(360, 720), ImGuiCond_FirstUseEver);
+            ImGui::Begin("Einstar");
+            app::draw_workflow(state, workflow, settings);
             ImGui::Separator();
-            ImGui::BeginDisabled(!state.connected());
-            if (!state.scanning()) {
-                if (ImGui::Button(state.hud().frames > 0 ? "Resume scan" : "Start scan", ImVec2(-1, 0))) state.start_scan();
-            } else {
-                if (ImGui::Button("Pause scan", ImVec2(-1, 0))) state.stop_scan();
-            }
-            if (ImGui::Button("Clear model", ImVec2(-1, 0))) state.clear_model();
-            {
+            if (ImGui::CollapsingHeader("Scanner settings")) {
+                ImGui::BeginDisabled(!state.connected());
+                int level = state.settings.brightness + 1;  // shown 1..21 like the scanner's buttons step it
+                if (ImGui::SliderInt("Brightness", &level, 1, device::kBrightnessLevels)) state.set_brightness(level - 1);
                 bool raw = state.record_raw_ir();
                 if (ImGui::Checkbox("Keep raw IR images (~25 MB/s)", &raw)) state.set_record_raw_ir(raw);
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("Records the cameras' raw images too, so future depth and marker algorithms can re-run "
                                       "on this scan. Needs a lot of disk space.");
-            }
-            ImGui::EndDisabled();
-            ImGui::Separator();
-            ImGui::TextUnformatted("Alignment");
-            if (ImGui::Combo("##align", &align_mode, "Geometry\0Hybrid (surface + markers)\0Markers\0"))
-                state.set_align_mode(align_mode == 0 ? track::AlignMode::geometry : align_mode == 2 ? track::AlignMode::markers : track::AlignMode::hybrid);
-            {
-                const auto hud_now = state.hud();
-                ImGui::BeginDisabled(!state.connected());
-                if (ImGui::CollapsingHeader("Global markers", ImGuiTreeNodeFlags_DefaultOpen)) {
-                    const bool capturing = hud_now.phase == pipeline::ScanPhase::global_markers;
-                    ImGui::TextWrapped(capturing ? "Capturing the marker constellation (no surface is recorded). Sweep over every marker, "
-                                                   "then optimise."
-                                                 : "Scan markers first for a drift-free frame for the whole object.");
-                    if (!capturing) {
-                        if (ImGui::Button("Capture markers", ImVec2(-1, 0))) state.set_phase(pipeline::ScanPhase::global_markers);
-                    } else {
-                        ImGui::Text("Keyframes %d, markers %d", hud_now.keyframes, hud_now.map_markers);
-                        if (ImGui::Button("Optimise and use", ImVec2(-1, 0))) {
-                            state.optimize_global_markers();
-                            state.set_phase(pipeline::ScanPhase::surface);
-                        }
-                        if (ImGui::Button("Back to surface scan", ImVec2(-1, 0))) state.set_phase(pipeline::ScanPhase::surface);
-                    }
-                    if (hud_now.global_markers > 0) {
-                        ImGui::TextColored(ImVec4(1, 0.75f, 0.1f, 1), "%d global markers in use", hud_now.global_markers);
-                        if (ImGui::Button("Discard global markers", ImVec2(-1, 0))) state.clear_global_markers();
-                    }
-                    ImGui::InputText("##path", marker_path, sizeof marker_path);
-                    if (ImGui::Button("Save")) (void)state.save_global_markers(marker_path);
-                    ImGui::SameLine();
-                    if (ImGui::Button("Load")) (void)state.load_global_markers(marker_path);
-                    if (const auto st = state.global_marker_status(); !st.empty()) ImGui::TextWrapped("%s", st.c_str());
+                if (ImGui::TreeNode("Advanced")) {
+                    bool changed = false;
+                    changed |= ImGui::SliderInt("Exposure", &state.settings.exposure, 500, 12000);
+                    changed |= ImGui::SliderInt("Gain", &state.settings.gain, 16, 400);
+                    changed |= ImGui::SliderInt("Laser %", &state.settings.laser_percent, 0, 100);
+                    changed |= ImGui::SliderInt("Strobe", &state.settings.strobe, 0, 9000);
+                    if (changed) state.apply_settings();
+                    ImGui::TreePop();
                 }
                 ImGui::EndDisabled();
             }
-            // ---- Process: optimise poses, re-fuse, mesh, export ----
-            {
-                const auto ps = state.process_status();
-                if (ImGui::CollapsingHeader("Process", ImGuiTreeNodeFlags_DefaultOpen)) {
-                    ImGui::BeginDisabled(ps.running || state.scanning() || !state.connected());
-                    ImGui::Combo("Resolution", &voxel_choice, "0.3 mm (fine)\0" "0.5 mm\0" "1.0 mm (fast)\0");
-                    ImGui::Checkbox("Optimise poses (loop closure)", &optimise_poses);
-                    ImGui::SliderInt("Smoothing", &smooth_iterations, 0, 10);
-                    ImGui::Checkbox("Simplify (within 0.02 mm)", &simplify_mesh);
-                    if (ImGui::Button("Process scan", ImVec2(-1, 0))) {
-                        recon::ProcessParams pp;
-                        pp.tsdf.voxel_mm = voxel_choice == 0 ? 0.3f : voxel_choice == 2 ? 1.0f : 0.5f;
-                        pp.tsdf.truncation_mm = 5.0f * pp.tsdf.voxel_mm;
-                        pp.optimize_poses = optimise_poses;
-                        pp.smooth_iterations = smooth_iterations;
-                        pp.simplify = simplify_mesh;
-                        state.process_scan(pp);
-                    }
-                    ImGui::EndDisabled();
-                    if (ps.running) {
-                        ImGui::ProgressBar(static_cast<float>(ps.fraction), ImVec2(-1, 0), ps.stage.c_str());
-                        if (ImGui::Button("Cancel")) state.cancel_processing();
-                    }
-                    if (!ps.summary.empty()) ImGui::TextWrapped("%s", ps.summary.c_str());
-                    if (ps.done) {
-                        ImGui::Checkbox("Show mesh", &settings.show_mesh);
-                        ImGui::SameLine();
-                        ImGui::Checkbox("Show points", &settings.show_points);
-                        ImGui::InputText("##export", export_path, sizeof export_path);
-                        if (ImGui::Button("Export (.stl / .ply / .obj)", ImVec2(-1, 0))) (void)state.export_mesh(export_path);
-                    }
-                }
+            if (ImGui::CollapsingHeader("View")) {
+                ImGui::Checkbox("Follow scanner", &state.follow_scanner);
+                ImGui::SliderFloat("Point size (mm)", &settings.point_size_mm, 0.1f, 3.0f);
+                ImGui::Checkbox("Lighting", &settings.lighting);
+                ImGui::TextDisabled("Left-drag: orbit  Right-drag: pan  Wheel: zoom");
             }
-            ImGui::Separator();
-            ImGui::TextUnformatted("Scanner settings");
-            {
-                int level = state.settings.brightness + 1;  // shown 1..21 like the scanner's buttons step it
-                if (ImGui::SliderInt("Brightness", &level, 1, device::kBrightnessLevels)) state.set_brightness(level - 1);
-            }
-            if (ImGui::TreeNode("Advanced")) {
-                bool changed = false;
-                changed |= ImGui::SliderInt("Exposure", &state.settings.exposure, 500, 12000);
-                changed |= ImGui::SliderInt("Gain", &state.settings.gain, 16, 400);
-                changed |= ImGui::SliderInt("Laser %", &state.settings.laser_percent, 0, 100);
-                changed |= ImGui::SliderInt("Strobe", &state.settings.strobe, 0, 9000);
-                if (changed) state.apply_settings();
-                ImGui::TreePop();
-            }
-            ImGui::Separator();
-            ImGui::Checkbox("Follow scanner", &state.follow_scanner);
-            ImGui::SliderFloat("Point size (mm)", &settings.point_size_mm, 0.1f, 3.0f);
-            ImGui::Checkbox("Lighting", &settings.lighting);
-            ImGui::Separator();
-            ImGui::TextUnformatted("Left-drag: orbit  Right-drag: pan  Wheel: zoom");
-            ImGui::TextUnformatted("Scanner buttons: start / pause, brightness - / +");
             ImGui::End();
+            app::draw_status_banner(state, workflow);
 
             // ---- HUD ----
             const auto hud = state.hud();
+            if (state.connected()) {
             ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 250, 10), ImGuiCond_Always);
             ImGui::SetNextWindowBgAlpha(0.6f);
             ImGui::Begin("HUD", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove);
@@ -454,6 +377,7 @@ int main(int argc, char** argv) {
             ImGui::Text("Distance %s", hud.distance_mm > 0 ? std::format("{:.0f} mm", hud.distance_mm).c_str() : "--");
             draw_distance_bar(hud.distance_step, 10);
             ImGui::End();
+            }
 
             // ---- Camera previews ----
             if (preview_left.texture) {
@@ -501,6 +425,7 @@ int main(int argc, char** argv) {
             if (snapshot_path && snapshot_process && snapshot_clock.elapsed_ms() > snapshot_seconds * 1000.0) {
                 if (!snapshot_processing) {
                     state.stop_scan();
+                    workflow.step = app::WorkflowUi::Step::process;
                     state.follow_scanner = false;
                     recon::ProcessParams pp;
                     state.process_scan(pp);

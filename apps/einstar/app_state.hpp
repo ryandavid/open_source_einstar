@@ -74,14 +74,30 @@ struct ProcessStatus {
     std::string summary;       // report of the last run (or its error)
 };
 
+// What the scanner connection is, for the UI.
+struct Connection {
+    enum class Kind { none, scanner, emulator } kind = Kind::none;
+    bool online = false;         // false while a real scanner is off the bus (it is reopened automatically)
+    std::string device;          // product, serial, firmware
+    std::string calibration;     // where the calibration came from
+    std::string error;           // why the last connection attempt failed
+};
+
 class AppState {
 public:
     AppState();
     ~AppState();
 
-    void connect(bool emulator);
+    // The real scanner (an error if none is attached) or the emulator. Nothing connects by itself.
+    bool connect(bool emulator);
+    void disconnect();
     [[nodiscard]] bool connected() const { return session_ != nullptr; }
+    [[nodiscard]] Connection connection() const;
     [[nodiscard]] std::string status() const;
+    // The scan file being recorded ("" until the first frame of a scan).
+    [[nodiscard]] std::string recording_path() const;
+    // Starts a new scan (new recording and world frame). `discard` deletes the current recording.
+    void new_scan(bool discard);
 
     void start_scan();
     void stop_scan();
@@ -115,6 +131,9 @@ public:
 
     ScanSettings settings;
     bool follow_scanner = false;
+    // Whether the scanner's start / pause button starts and pauses the scanner (the UI enables it only
+    // in the steps where that is the next action).
+    std::atomic<bool> scanner_button_enabled{true};
 
 private:
     void on_live_update(pipeline::LiveUpdate&& u);

@@ -17,7 +17,7 @@ constexpr render::Rgba8 kTrailColor{255, 200, 60, 255};
 
 }  // namespace
 
-AppState::AppState() { connect(false); }
+AppState::AppState() = default;
 
 AppState::~AppState() {
     cancel_processing();
@@ -104,7 +104,8 @@ bool AppState::export_mesh(const std::string& path) {
     return r.has_value();
 }
 
-void AppState::connect(bool emulator) {
+bool AppState::connect(bool emulator) {
+    if (scanning()) stop_scan();
     session_.reset();
     trail_.clear();
     auto s = Session::open(
@@ -121,11 +122,49 @@ void AppState::connect(bool emulator) {
     if (!s) {
         error_ = s.error().message;
         log::error("connect failed: {}", error_);
-        return;
+        return false;
     }
     error_.clear();
     session_ = std::move(*s);
     log::info("{}", session_->description());
+    return true;
+}
+
+void AppState::disconnect() {
+    cancel_processing();
+    if (process_thread_.joinable()) process_thread_.join();
+    if (scanning()) stop_scan();
+    session_.reset();
+    std::lock_guard lock(mutex_);
+    trail_.clear();
+    hud_ = {};
+}
+
+Connection AppState::connection() const {
+    Connection c;
+    c.error = error_;
+    if (!session_) return c;
+    c.kind = session_->emulated() ? Connection::Kind::emulator : Connection::Kind::scanner;
+    c.online = session_->online();
+    const auto& i = session_->info();
+    c.device = std::format("{}{}, serial {}, firmware {}", i.product_name, session_->emulated() ? " (emulated)" : "", i.serial, i.firmware);
+    c.calibration = session_->calibration();
+    return c;
+}
+
+std::string AppState::recording_path() const { return session_ ? session_->pipeline().recording_path() : std::string{}; }
+
+void AppState::new_scan(bool discard) {
+    if (!session_) return;
+    if (scanning()) stop_scan();
+    session_->reset_model(discard);
+    std::lock_guard lock(mutex_);
+    trail_.clear();
+    if (!pending_) pending_.emplace();
+    pending_->model = std::vector<render::PointVertex>{};
+    pending_->mesh = std::pair<std::vector<render::MeshVertex>, std::vector<std::uint32_t>>{};
+    mesh_.reset();
+    process_ = {};
 }
 
 std::string AppState::status() const {
@@ -222,7 +261,14 @@ bool AppState::save_global_markers(const std::string& path) {
 
 bool AppState::load_global_markers(const std::string& path) {
     if (!session_) return false;
-    auto map = markers::load_markers(path);
+    // A markers file, or the global markers recorded in an earlier scan.
+    std::optional<std::vector<markers::MapMarker>> map;
+    if (path.ends_with(".estr")) {
+        if (auto reader = session::SessionReader::open(path); reader && !(*reader)->global_markers().empty())
+            map = (*reader)->global_markers();
+    } else if (auto m = markers::load_markers(path)) {
+        map = std::move(*m);
+    }
     std::lock_guard lock(mutex_);
     if (!map || map->empty()) {
         global_status_ = "Could not read a marker map from " + path;
@@ -239,7 +285,7 @@ std::string AppState::global_marker_status() const {
 }
 
 void AppState::update() {
-    if (toggle_requested_.exchange(false)) toggle_scan();
+    if (toggle_requested_.exchange(false) && scanner_button_enabled) toggle_scan();
     if (const int steps = brightness_steps_.exchange(0); steps != 0) {
         set_brightness(settings.brightness + steps);
         std::lock_guard lock(mutex_);

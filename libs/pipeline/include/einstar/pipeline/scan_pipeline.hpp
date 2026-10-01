@@ -140,7 +140,9 @@ public:
 
     void start();
     void stop();
-    void reset_model();
+    // Clears the model and starts a new recording (and world frame) with the next frame. `discard`
+    // deletes the current recording; otherwise it is closed and kept.
+    void reset_model(bool discard = true);
 
     // Global markers. Commands run on the worker between frames (thread-safe to call from the UI).
     void set_phase(ScanPhase phase);
@@ -158,6 +160,8 @@ public:
     void set_recording_directory(std::string directory);
     // Waits until everything recorded so far is on disk; returns the current session file ("" if none).
     [[nodiscard]] std::string flush_recording();
+    // The session file being written ("" before the first recorded frame of a scan).
+    [[nodiscard]] std::string recording_path() const;
     [[nodiscard]] std::vector<markers::MapMarker> global_markers() const;
 
     // Scanner identity and calibration, written at the start of every session file.
@@ -226,6 +230,7 @@ private:
     std::deque<usb::FrameGroup> queue_;
     std::atomic<std::uint64_t> frames_in_{0}, dropped_{0};
     std::atomic<bool> reset_requested_{false};
+    std::atomic<bool> discard_on_reset_{true};
     bool order_detected_ = false;
 
     LiveStats stats_;

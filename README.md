@@ -14,7 +14,11 @@ prebuilt packages for several of these; build the missing ones with `brew instal
 Older Command Line Tools keep `std::jthread` experimental; CMake detects that and adds `-fexperimental-library`.
 
 ## Run
-- `build/default/apps/Einstar.app` — GUI; uses the scanner if attached, otherwise the built-in emulator.
+- `build/default/apps/Einstar.app` — GUI, a guided workflow: connect the scanner (or the emulator), choose the
+  scan type (surface + markers, surface only, or global markers first), capture the markers if chosen, scan,
+  then process and export. A banner over the 3D view always shows what the scanner is doing. Every scan is
+  recorded to `~/Documents/Einstar/Scans/*.estr`, including the global markers it used; a later scan can reuse
+  them ("Use global markers from an earlier scan").
 - `build/default/apps/EinstarCalibration.app` — guided calibration of the IR pair from the calibration board
   (EXStar's 25 views: live guidance, auto-capture, solve, comparison with the scanner's stored calibration,
   and "Write to scanner…", which stores the result in the scanner as EXStar's calibration does, after a

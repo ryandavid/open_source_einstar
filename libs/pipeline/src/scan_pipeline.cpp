@@ -117,7 +117,15 @@ void ScanPipeline::stop() {
     space_cv_.notify_all();
 }
 
-void ScanPipeline::reset_model() { reset_requested_ = true; }
+void ScanPipeline::reset_model(bool discard) {
+    discard_on_reset_ = discard;
+    reset_requested_ = true;
+}
+
+std::string ScanPipeline::recording_path() const {
+    std::lock_guard lock(recorder_mutex_);
+    return recorder_ ? recorder_->path() : std::string{};
+}
 
 void ScanPipeline::post(std::function<void()> cmd) {
     {
@@ -559,7 +567,7 @@ void ScanPipeline::process(usb::FrameGroup&& group) {
     if (reset_requested_.exchange(false)) {
         // Clearing the model keeps an optimised global-marker map (it describes the scene, not the scan).
         tracker_.reset(true);
-        restart_recording(true);
+        restart_recording(discard_on_reset_.load());
         if (phase_ == ScanPhase::global_markers) {
             bundle_ = {};
             bundle_.geometry = frontend_->rectification().geometry;

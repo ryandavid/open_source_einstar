@@ -27,19 +27,22 @@ public:
     using UpdateSink = std::function<void(pipeline::LiveUpdate&&)>;
     using ButtonSink = std::function<void(int, device::ButtonAction)>;
 
-    // Opens the first attached scanner, or the emulator if `force_emulator` or none is found.
-    static Result<std::unique_ptr<Session>> open(bool force_emulator, UpdateSink updates, ButtonSink buttons);
+    // Opens the first attached scanner (an error if there is none), or the emulator.
+    static Result<std::unique_ptr<Session>> open(bool emulator, UpdateSink updates, ButtonSink buttons);
     ~Session();
 
     [[nodiscard]] const std::string& description() const { return description_; }
     [[nodiscard]] bool emulated() const { return emulated_; }
     [[nodiscard]] const device::DeviceInfo& info() const { return device_->info(); }
     [[nodiscard]] bool scanning() const { return scanning_; }
+    // False while the scanner is off the bus (it is reopened and its settings replayed automatically).
+    [[nodiscard]] bool online() const { return device_->online(); }
+    [[nodiscard]] const std::string& calibration() const { return calibration_; }
 
     Result<void> start_scan(const ScanSettings& s);
     void stop_scan();
     Result<void> apply(const ScanSettings& s);
-    void reset_model() { pipeline_->reset_model(); }
+    void reset_model(bool discard = true) { pipeline_->reset_model(discard); }
     [[nodiscard]] pipeline::ScanPipeline& pipeline() { return *pipeline_; }
     Result<double> temperature() { return device_->temperature_c(); }
     void set_distance_indication(float mean_depth_mm);
@@ -50,6 +53,7 @@ private:
     std::unique_ptr<device::EinstarDevice> device_;
     std::unique_ptr<pipeline::ScanPipeline> pipeline_;
     std::string description_;
+    std::string calibration_;  // where the calibration came from (flash and its date)
     bool emulated_ = false;
     bool scanning_ = false;
     int last_zone_ = -1;

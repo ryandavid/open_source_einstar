@@ -2,7 +2,8 @@ if(EINSTAR_BUILD_APP)
 add_executable(einstar-app MACOSX_BUNDLE
   einstar/main.mm
   einstar/app_state.cpp
-  einstar/session.cpp)
+  einstar/session.cpp
+  einstar/workflow.mm)
 set_target_properties(einstar-app PROPERTIES OUTPUT_NAME Einstar)
 target_include_directories(einstar-app PRIVATE einstar)
 target_link_libraries(einstar-app PRIVATE einstar::render einstar::pipeline einstar::recon einstar::session einstar::device einstar::sim einstar::calib einstar::synth imgui glfw TBB::tbb
