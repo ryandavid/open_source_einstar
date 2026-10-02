@@ -25,6 +25,10 @@ variants on discrete GPUs.
 - **Live scanning:** stereo depth from the IR pair on the GPU, tracking on geometry and markers with
   relocalisation after a loss, a live fused model, camera previews with marker detections, and the scanner's
   pose and path.
+- **3D view:** surface seen from behind (the inside of the object) is drawn in a muted red-brown, for the live
+  points as for the processed mesh. Left-drag orbits freely, right-drag pans, the wheel zooms, a double-click
+  resets the view. "Follow scanner" (View) keeps the camera behind the scanner, looking where it points;
+  orbiting or panning leaves it.
 - **Scanner controls:** the start / pause and brightness buttons, the top LED as a distance indicator, and
   exposure, gain, projector and strobe settings.
 - **Recording:** every scan is saved to `~/Documents/Einstar/Scans/*.estr`: depth, poses, markers, the

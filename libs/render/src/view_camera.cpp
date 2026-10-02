@@ -27,19 +27,17 @@ Mat4f perspective(float fov_y, float aspect, float n, float f) {
     return m;
 }
 
-Vec3f ViewCamera::eye() const {
-    // Spherical offset from target; yaw=pitch=0 puts the eye at target - z*distance.
-    const Vec3f dir(std::sin(yaw) * std::cos(pitch), std::sin(pitch), -std::cos(yaw) * std::cos(pitch));
-    return target + distance * dir;
-}
+Vec3f ViewCamera::forward() const { return orientation * Vec3f::UnitZ(); }
 
-Mat4f ViewCamera::view() const { return look_at(eye(), target, Vec3f(0, -1, 0)); }
+Vec3f ViewCamera::eye() const { return target - distance * forward(); }
+
+Mat4f ViewCamera::view() const { return look_at(eye(), target, orientation * Vec3f(0, -1, 0)); }
 
 Mat4f ViewCamera::projection(float aspect) const { return perspective(fov_y, aspect, near_plane, far_plane); }
 
 void ViewCamera::orbit(float dx, float dy) {
-    yaw += dx;
-    pitch = std::clamp(pitch + dy, -1.5f, 1.5f);
+    // Local axes: about the camera's y (down) by -dx swings the eye to the right, about its x by dy swings it down.
+    orientation = (orientation * Eigen::AngleAxisf(-dx, Vec3f::UnitY()) * Eigen::AngleAxisf(dy, Vec3f::UnitX())).normalized();
 }
 
 void ViewCamera::pan(float dx_px, float dy_px, float viewport_h) {
@@ -51,5 +49,19 @@ void ViewCamera::pan(float dx_px, float dy_px, float viewport_h) {
 }
 
 void ViewCamera::zoom(float factor) { distance = std::clamp(distance * factor, 10.0f, 20000.0f); }
+
+void ViewCamera::follow(const Mat4f& T_world_scanner, float blend) {
+    const Eigen::Matrix3f R = T_world_scanner.block<3, 3>(0, 0);
+    const Vec3f aim = (T_world_scanner * Eigen::Vector4f(0, 0, kFollowAimMm, 1)).head<3>();
+    orientation = orientation.slerp(blend, Quatf(R)).normalized();
+    target += blend * (aim - target);
+}
+
+void ViewCamera::reset() {
+    const ViewCamera defaults;
+    target = defaults.target;
+    distance = defaults.distance;
+    orientation = defaults.orientation;
+}
 
 }  // namespace einstar::render

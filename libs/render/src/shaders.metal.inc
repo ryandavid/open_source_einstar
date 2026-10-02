@@ -37,7 +37,12 @@ struct SplatOut {
 
 constant float2 kCorners[4] = { float2(-1, -1), float2(1, -1), float2(-1, 1), float2(1, 1) };
 
-// Camera-facing disc splats, sized in world units with a pixel floor, headlight shading.
+// Surface seen from behind (the inside of the object, points and mesh alike): normals point out of
+// the surface towards where it was seen from, so a negative facing marks the back.
+constant float3 kBackColor = float3(0.55, 0.42, 0.40);
+
+// Camera-facing disc splats, sized in world units with a pixel floor, headlight shading; points seen
+// from behind take kBackColor.
 vertex SplatOut splat_vs(uint vid [[vertex_id]], uint iid [[instance_id]],
                          const device PointVertex* pts [[buffer(0)]],
                          constant Uniforms& u [[buffer(1)]]) {
@@ -53,9 +58,11 @@ vertex SplatOut splat_vs(uint vid [[vertex_id]], uint iid [[instance_id]],
 
     float4 base = float4(p.color) / 255.0;
     float shade = 1.0;
-    if (u.lighting > 0.5 && length(float3(p.normal)) > 0.1) {
-        float3 l = normalize(-view_pos.xyz);  // headlight
-        shade = 0.25 + 0.75 * abs(dot(n_view, l));
+    if (length(float3(p.normal)) > 0.1) {
+        float3 l = normalize(-view_pos.xyz);  // towards the eye (the headlight)
+        float facing = dot(n_view, l);
+        if (facing < 0.0) base.rgb = kBackColor;
+        if (u.lighting > 0.5) shade = 0.25 + 0.75 * abs(facing);
     }
     SplatOut o;
     o.position = clip;
@@ -144,7 +151,7 @@ fragment float4 mesh_fs(MeshOut in [[stage_in]]) {
     const float3 l = normalize(-in.view_pos);
     const float d = dot(n, l);
     // Front faces light grey, back faces (inside of the surface) tinted so holes are recognisable.
-    const float3 base = d >= 0 ? float3(0.82, 0.83, 0.86) : float3(0.55, 0.42, 0.40);
+    const float3 base = d >= 0 ? float3(0.82, 0.83, 0.86) : kBackColor;
     const float shade = 0.2 + 0.8 * abs(d);
     const float3 h = normalize(l + l);
     const float spec = pow(max(abs(dot(n, h)), 0.0), 40.0) * 0.25;

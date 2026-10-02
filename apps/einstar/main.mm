@@ -15,6 +15,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <optional>
 #include <thread>
 #include <cstdlib>
 #include <cstring>
@@ -182,6 +183,8 @@ int main(int argc, char** argv) {
 
     app::AppState state;
     render::ViewCamera camera;
+    std::optional<Eigen::Matrix4f> scanner_pose;  // latest, for "Follow scanner"
+    auto last_view_frame = std::chrono::steady_clock::now();
     render::RenderSettings settings;
     MouseState mouse;
     PreviewTexture preview_left, preview_right;
@@ -263,9 +266,7 @@ int main(int argc, char** argv) {
                     settings.show_points = upd->mesh->second.empty();
                 }
                 preview_right.upload(device, upd->ir_right);
-                if (state.follow_scanner && upd->scanner_pose) {
-                    camera.target = (*upd->scanner_pose * Eigen::Vector4f(0, 0, 300, 1)).head<3>();
-                }
+                if (upd->scanner_pose) scanner_pose = upd->scanner_pose;
             }
 
             ImGuiIO& io = ImGui::GetIO();
@@ -276,8 +277,20 @@ int main(int argc, char** argv) {
                 const bool l = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
                 const bool r = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS ||
                                glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_MIDDLE) == GLFW_PRESS;
-                if (l && mouse.rotating) camera.orbit(float(mx - mouse.last_x) * 0.008f, float(my - mouse.last_y) * 0.008f);
-                if (r && mouse.panning) camera.pan(float(mx - mouse.last_x), float(my - mouse.last_y), float(fb_h) / io.DisplayFramebufferScale.y);
+                const bool moved = mx != mouse.last_x || my != mouse.last_y;
+                // Turning or moving the view by hand leaves "Follow scanner"; zooming keeps it.
+                if (l && mouse.rotating && moved) {
+                    camera.orbit(float(mx - mouse.last_x) * 0.008f, float(my - mouse.last_y) * 0.008f);
+                    state.follow_scanner = false;
+                }
+                if (r && mouse.panning && moved) {
+                    camera.pan(float(mx - mouse.last_x), float(my - mouse.last_y), float(fb_h) / io.DisplayFramebufferScale.y);
+                    state.follow_scanner = false;
+                }
+                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                    camera.reset();
+                    state.follow_scanner = false;
+                }
                 mouse.rotating = l;
                 mouse.panning = r;
                 if (io.MouseWheel != 0.0f) camera.zoom(std::pow(0.9f, io.MouseWheel));
@@ -286,6 +299,14 @@ int main(int argc, char** argv) {
             }
             mouse.last_x = mx;
             mouse.last_y = my;
+
+            // Follow: ease towards the view from behind the scanner (poses arrive at the scan rate, the
+            // view redraws faster; ~80 ms time constant whatever the display rate).
+            const auto now = std::chrono::steady_clock::now();
+            const double dt_s = std::chrono::duration<double>(now - last_view_frame).count();
+            last_view_frame = now;
+            if (state.follow_scanner && scanner_pose)
+                camera.follow(*scanner_pose, static_cast<float>(1.0 - std::exp(-dt_s / 0.08)));
 
             id<CAMetalDrawable> drawable = nil;
             if (snapshot_path) {
@@ -344,7 +365,8 @@ int main(int argc, char** argv) {
                 ImGui::Checkbox("Follow scanner", &state.follow_scanner);
                 ImGui::SliderFloat("Point size (mm)", &settings.point_size_mm, 0.1f, 3.0f);
                 ImGui::Checkbox("Lighting", &settings.lighting);
-                ImGui::TextDisabled("Left-drag: orbit  Right-drag: pan  Wheel: zoom");
+                ImGui::TextDisabled("Left-drag: orbit  Right-drag: pan  Wheel: zoom  Double-click: reset view");
+                ImGui::TextDisabled("Follow: the view from behind the scanner; orbiting or panning leaves it");
             }
             ImGui::End();
             app::draw_status_banner(state, workflow);
