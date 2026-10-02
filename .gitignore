@@ -2,7 +2,6 @@
 build/
 out/
 CMakeUserPresets.json
-compile_commands.json
 .cache/
 
 # Reverse-engineering scratch: extracted vendor material, decrypted config dumps.
@@ -36,4 +35,3 @@ __pycache__/
 firmware/sdk/
 firmware/fpga/
 firmware/reference/
-firmware/build*/

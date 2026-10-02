@@ -1,9 +1,10 @@
 # Einstar FX3 firmware (open build). Reconstructed application built with the Arm GNU Toolchain against
 # the Cypress FX3 SDK. Not byte-identical to the vendor's image; verified behaviourally equivalent to it
 # with the differential emulator (tools/fx3emu in the repository):
-#   python -m fx3emu diff        # (uses build/EN/einstar_fx3.elf)
+#   python -m fx3emu diff        # (uses build/firmware/EN/einstar_fx3.elf)
 #
-#   cmake -S . -B build -G Ninja && cmake --build build     # -> build/EN/einstar_fx3.{elf,img} + package
+# Built from the top-level project, which drives this one as an external project (cmake/Firmware.cmake):
+#   cmake -B build -DEINSTAR_BUILD_FIRMWARE=ON && cmake --build build   # -> build/firmware/EN/einstar_fx3.{elf,img} + package
 #   ./check.sh                                              # build + differential vs the vendor image
 #
 # Everything the build needs is in this tree (sdk/, fpga/) except the toolchain (cmake/fx3-toolchain.cmake).

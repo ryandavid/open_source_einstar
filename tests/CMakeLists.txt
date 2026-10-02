@@ -31,7 +31,7 @@ target_link_libraries(test_usb PRIVATE einstar::usb)
 
 einstar_add_test(test_device device/test_device_sim.cpp device/test_firmware.cpp)
 target_link_libraries(test_device PRIVATE einstar::device einstar::sim)
-target_compile_definitions(test_device PRIVATE EINSTAR_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+target_compile_definitions(test_device PRIVATE EINSTAR_SOURCE_DIR="${PROJECT_SOURCE_DIR}" EINSTAR_BINARY_DIR="${PROJECT_BINARY_DIR}")
 
 einstar_add_test(test_fixtures fixtures/test_packaging.cpp fixtures/test_exstar_project.cpp fixtures/test_fixture_tracking.cpp fixtures/test_global_registration.cpp fixtures/test_symmetry_probe.cpp)
 target_link_libraries(test_fixtures PRIVATE einstar::fixtures einstar::track)

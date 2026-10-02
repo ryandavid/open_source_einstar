@@ -137,7 +137,7 @@ TEST_CASE("damaged update packages are refused before anything is sent") {
 
 TEST_CASE("the real update packages parse: EXStar's and our build's") {
     const std::string exstar = "/Applications/EXStar.app/Contents/MacOS/fabu_UPDATE/Configure/EinScan10_01_SC130_FX3_V2.10_FPGA_V3.7_EN_IAP.img";
-    const std::string ours = std::string(EINSTAR_SOURCE_DIR) + "/firmware/build/EN/EinScan10_01_SC130_OPN_V2.10_FPGA_V3.7_EN_IAP.img";
+    const std::string ours = std::string(EINSTAR_BINARY_DIR) + "/firmware/EN/EinScan10_01_SC130_OPN_V2.10_FPGA_V3.7_EN_IAP.img";
     int found = 0;
     for (const auto& path : {exstar, ours}) {
         if (!std::filesystem::exists(path)) continue;

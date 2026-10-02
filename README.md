@@ -15,7 +15,7 @@ variants on discrete GPUs.
 
 ![Einstar scanning app](docs/images/einstar-app.png)
 
-`build/default/apps/Einstar.app`
+`build/apps/Einstar.app`
 - **Guided workflow:** connect the scanner → choose the scan type → (capture global markers) → scan → process
   and export. A banner over the 3D view always shows the state: not connected, offline, capturing markers,
   scanning or tracking lost, paused, processing.
@@ -41,7 +41,7 @@ variants on discrete GPUs.
 
 ![Einstar calibration app](docs/images/einstar-calibration.png)
 
-`build/default/apps/EinstarCalibration.app`
+`build/apps/EinstarCalibration.app`
 - **25-view plan:** five board orientations (face-on, and each edge tilted towards the scanner), each at
   five distances from 200 to 600 mm.
 - **Live guidance:**
@@ -63,7 +63,7 @@ variants on discrete GPUs.
 
 ### einstar-cli: command-line tools
 
-`build/default/apps/einstar-cli <command>`. Calibrations are given as a directory of
+`build/apps/einstar-cli <command>`. Calibrations are given as a directory of
 `LeftCCF.txt / RightCCF.txt / TexCCF.txt`, a flash dump (`.bin`), `factory:<dump.bin>` or a calibration file
 written by the calibration app.
 
@@ -91,7 +91,7 @@ written by the calibration app.
 
 ### einstar-firmware: the scanner's firmware
 
-`build/default/apps/einstar-firmware <command>`
+`build/apps/einstar-firmware <command>`
 
 | Command | What it does |
 |---|---|
@@ -101,7 +101,7 @@ written by the calibration app.
 
 ### einstar-bench: performance
 
-`build/default/tools/einstar-bench [pipeline]`: timings of the depth stages (rectification, matching,
+`build/tools/einstar-bench [pipeline]`: timings of the depth stages (rectification, matching,
 points), or with `pipeline` the whole live pipeline on emulated frames.
 
 ## Scanner firmware
@@ -130,18 +130,22 @@ interrupted update leaves the current firmware booting. Flash with `einstar-firm
 ## Building
 
 ```
-cmake --preset default && cmake --build --preset default && ctest --preset default
+cmake -B build && cmake --build build -j && ctest --test-dir build --output-on-failure
 ```
 
-- **Requirements:** the Xcode Command Line Tools and Homebrew `ninja libusb eigen ceres-solver tbb zstd
+- **Requirements:** the Xcode Command Line Tools and Homebrew `libusb eigen ceres-solver tbb zstd
   nlohmann-json`. CMake fetches GLFW, Dear ImGui, Catch2, metal-cpp and nanoflann.
 - **Intel Macs:** Homebrew has no prebuilt packages for several of these; build the missing ones with
   `brew install --build-from-source`. Older Command Line Tools keep `std::jthread` experimental; CMake detects
   that and adds `-fexperimental-library`.
-- **Outputs:** `build/default/apps/` (Einstar.app, EinstarCalibration.app, einstar-cli, einstar-firmware) and
-  `build/default/tools/einstar-bench`. A `debug` preset builds with debug information.
+- **Outputs:** `build/apps/` (Einstar.app, EinstarCalibration.app, einstar-cli, einstar-firmware) and
+  `build/tools/einstar-bench`. The default build type is RelWithDebInfo. For a debug build with the
+  sanitizers, use a separate directory:
+  `cmake -B build-debug -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"`.
 - **Tests:** some use recorded scans and calibration captures from `tests/fixtures`.
-- **Firmware:** builds separately, see `firmware/README.md`.
+- **Firmware:** off by default, since it needs the Arm GNU Toolchain and a user-supplied FX3 SDK. Configure with
+  `-DEINSTAR_BUILD_FIRMWARE=ON` to build it with everything else, into `firmware/` in the build directory. See
+  `firmware/README.md`.
 
 ## Safety
 

@@ -12,7 +12,6 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_OBJCXX_STANDARD 23)
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Older Apple libc++ (e.g. CLT 16 / Apple clang 17) keeps std::jthread and
 # std::stop_token behind -fexperimental-library.
@@ -34,6 +33,7 @@ unset(CMAKE_REQUIRED_FLAGS)
 option(EINSTAR_BUILD_TESTS "Build unit tests" ON)
 option(EINSTAR_BUILD_APP "Build the GUI application (GLFW + Dear ImGui + Metal)" ON)
 option(EINSTAR_WITH_RERUN "Enable Rerun debug visualisation" OFF)
+option(EINSTAR_BUILD_FIRMWARE "Build the scanner's FX3 firmware (needs the Arm GNU Toolchain and the user-supplied FX3 SDK, see firmware/README.md)" OFF)
 
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 include(EinstarWarnings)
@@ -42,6 +42,10 @@ include(Dependencies)
 add_subdirectory(libs)
 add_subdirectory(tools)
 add_subdirectory(apps)
+
+if(EINSTAR_BUILD_FIRMWARE)
+  include(Firmware)
+endif()
 
 if(EINSTAR_BUILD_TESTS)
   enable_testing()

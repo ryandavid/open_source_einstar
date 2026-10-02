@@ -8,8 +8,10 @@ third-party proprietary inputs (`sdk/`, `fpga/`, `reference/`) are gitignored an
 Not byte-identical to the vendor image, but **verified behaviourally equivalent** to it with the
 differential emulator (`tools/fx3emu`) across every scenario, plus the correctness fixes below.
 ```
-cmake -S . -B build -G Ninja && cmake --build build   # -> build/EN/einstar_fx3.{elf,img} + update package
-./check.sh            # build + differential vs the vendor image (FUZZ=n, default 16)
+# from the repository root: the firmware is an opt-in part of the main build
+cmake -B build -DEINSTAR_BUILD_FIRMWARE=ON
+cmake --build build --target firmware   # -> build/firmware/EN/einstar_fx3.{elf,img} + update package
+./check.sh            # build + differential vs the vendor image (FUZZ=n, default 16; BUILD_DIR, default build/)
 ./check.sh O2         # same, forcing an optimisation level (verified equivalent at -O0/-Os/-O2)
 ```
 The default optimisation is **-O0**, matching the vendor's own shipping build (closest codegen/timing
@@ -83,6 +85,12 @@ Building the ELF alone does not need it; only the packaged `..._IAP.img` output 
   its path. Without it you can still build the firmware, just not run the differential check.
 
 ## Build
+The top-level CMake project builds the firmware when configured with `-DEINSTAR_BUILD_FIRMWARE=ON` (off by
+default, as it needs the inputs above). Configuring then checks the toolchain and inputs are present, and every
+`cmake --build` also builds the firmware. It cross-compiles, so `cmake/Firmware.cmake` drives this directory
+as its own CMake project (an external project) in `<build dir>/firmware/`; `FX3_ARMGNU_GCC`,
+`FX3_HOST_CC`, `FX3_OPT` and `FW_LANGUAGES` set on the top-level configure are passed through to it.
+
 Apart from those inputs and the toolchain the tree is self-contained. The FX3 SDK subset lives in
 `sdk/` (see `sdk/README.md`); the FPGA bitstream in `fpga/`. Toolchain in `cmake/fx3-toolchain.cmake`
 (overridable):
@@ -96,10 +104,10 @@ the Arm GNU Toolchain gcc (`FX3_ARMGNU_GCC`) and a host C compiler for `elf2img`
 ## Flashing
 The host tool `einstar-firmware` (built with the main project, `apps/einstar-firmware`):
 ```
-build/default/apps/einstar-firmware version                    # what the scanner runs (00/05), serial
-build/default/apps/einstar-firmware inspect firmware/build/EN/EinScan10_01_SC130_OPN_V2.10_FPGA_V3.7_EN_IAP.img
-build/default/apps/einstar-firmware flash   firmware/build/EN/EinScan10_01_SC130_OPN_V2.10_FPGA_V3.7_EN_IAP.img
-build/default/apps/einstar-firmware flash   <EXStar.app>/Contents/MacOS/fabu_UPDATE/Configure/..._EN_IAP.img   # back to the vendor's
+build/apps/einstar-firmware version                    # what the scanner runs (00/05), serial
+build/apps/einstar-firmware inspect build/firmware/EN/EinScan10_01_SC130_OPN_V2.10_FPGA_V3.7_EN_IAP.img
+build/apps/einstar-firmware flash   build/firmware/EN/EinScan10_01_SC130_OPN_V2.10_FPGA_V3.7_EN_IAP.img
+build/apps/einstar-firmware flash   <EXStar.app>/Contents/MacOS/fabu_UPDATE/Configure/..._EN_IAP.img   # back to the vendor's
 ```
 `flash` checks the package, reboots the scanner (clearing any abandoned update, see the retry bug
 below), writes the inactive slot exactly as EXStar does, and reconnects to read the version; `--emulator`

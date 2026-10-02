@@ -1,6 +1,6 @@
 // einstar-firmware: report the scanner's firmware version, check an update package, and flash one.
 //
-// The package is what firmware/ builds (firmware/build/EN/*_IAP.img) or EXStar ships
+// The package is what firmware/ builds (<build dir>/firmware/EN/*_IAP.img, with EINSTAR_BUILD_FIRMWARE) or EXStar ships
 // (EXStar.app/Contents/MacOS/fabu_UPDATE/Configure/*_IAP.img). Flashing follows docs/firmware.md 4 and
 // libs/device/include/einstar/device/firmware_update.hpp.
 
@@ -35,7 +35,7 @@ int usage() {
                  "  --emulator  run against the built-in emulated scanner instead of the USB device\n"
                  "  --yes       do not ask for confirmation\n"
                  "\n"
-                 "Our build's package: firmware/build/EN/EinScan10_01_SC130_OPN_V2.10_FPGA_V3.7_EN_IAP.img\n"
+                 "Our build's package: <build dir>/firmware/EN/EinScan10_01_SC130_OPN_V2.10_FPGA_V3.7_EN_IAP.img\n"
                  "EXStar's (to go back): /Applications/EXStar.app/Contents/MacOS/fabu_UPDATE/Configure/*_EN_IAP.img");
     return 2;
 }

@@ -23,8 +23,9 @@ VENDOR_PACKAGE = os.path.join(EXSTAR_FW_DIR, "EinScan10_01_SC130_FX3_V2.10_FPGA_
 # ELF identical to the vendor image, used only to name the vendor image's addresses (firmware/reference)
 VENDOR_NAMES_ELF = os.environ.get("FX3_VENDOR_NAMES", os.path.join(FIRMWARE, "reference", "vendor-names.elf"))
 
-# the candidate build to test (the modern build's output)
-MODERN_ELF = os.environ.get("FX3_MODERN_ELF", os.path.join(FIRMWARE, "build", "EN", "einstar_fx3.elf"))
+# the candidate build to test: the top-level build's firmware output (EINSTAR_BUILD_FIRMWARE), in build/
+# unless FX3_MODERN_ELF points elsewhere (firmware/check.sh sets it from its build directory)
+MODERN_ELF = os.environ.get("FX3_MODERN_ELF", os.path.join(REPO, "build", "firmware", "EN", "einstar_fx3.elf"))
 
 CACHE = os.environ.get("FX3EMU_CACHE", os.path.join(RE, "cache", "fx3emu"))
 
