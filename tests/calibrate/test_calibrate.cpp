@@ -51,7 +51,7 @@ TEST_CASE("plan targets measure back as themselves") {
     REQUIRE(!g.ok());
     REQUIRE(g.hints.size() == 2);
     CHECK(g.hints[0].starts_with("Move closer"));
-    CHECK(g.hints[1].find("left edge") != std::string::npos);
+    CHECK(g.hints[1].find("bottom edge") != std::string::npos);  // +tilt_y: the view's top edge is too near
 }
 
 TEST_CASE("steadiness gate waits for a still board") {

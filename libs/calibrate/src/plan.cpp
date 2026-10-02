@@ -61,10 +61,10 @@ std::vector<PoseTarget> default_plan() {
     // board does not fit the view at 200 mm).
     const std::array<Group, 5> groups = {{
         {"face-on", 0, 0, {200, 280, 360, 440, 520}},
-        {"right edge near", 0, 30, {300, 360, 420, 500, 580}},
-        {"left edge near", 0, -30, {300, 360, 420, 500, 580}},
-        {"bottom edge near", 30, 0, {280, 340, 420, 500, 580}},
-        {"top edge near", -30, 0, {280, 340, 420, 500, 580}},
+        {"top edge near", 0, 30, {300, 360, 420, 500, 580}},
+        {"bottom edge near", 0, -30, {300, 360, 420, 500, 580}},
+        {"right edge near", 30, 0, {280, 340, 420, 500, 580}},
+        {"left edge near", -30, 0, {280, 340, 420, 500, 580}},
     }};
     std::vector<PoseTarget> plan;
     for (int g = 0; g < 5; ++g)
@@ -133,7 +133,7 @@ Guidance guide(const BoardMeasure& m, const PoseTarget& t) {
     g.tilt_ok = g.tilt_error_deg.norm() <= t.tilt_tol_deg;
     g.offset_ok = g.offset_mm.norm() <= t.offset_tol_mm;
     g.roll_ok = std::abs(g.roll_error_deg) <= t.roll_tol_deg;
-    // Hints in the camera view's terms (image right = scanner +x, image down = +y), largest error first.
+    // Hints in the view's terms (view up = scanner +x, view right = +y), largest error first.
     struct Hint {
         double weight;
         std::string text;
@@ -143,18 +143,18 @@ Guidance guide(const BoardMeasure& m, const PoseTarget& t) {
         hints.push_back({std::abs(g.distance_error_mm) / t.distance_tol_mm,
                          std::format("{} {:.0f} mm", g.distance_error_mm > 0 ? "Move closer" : "Move back", std::abs(g.distance_error_mm))});
     if (!g.tilt_ok) {
-        // +tilt_x: the board's lower edge (in the view) is nearer; +tilt_y: its right edge is.
+        // +tilt_x: the board's right edge (in the view) is nearer; +tilt_y: its top edge is.
         const double ex = g.tilt_error_deg.x(), ey = g.tilt_error_deg.y();
         if (std::abs(ex) >= std::abs(ey))
             hints.push_back({g.tilt_error_deg.norm() / t.tilt_tol_deg,
-                             std::format("Tilt: bring the board's {} edge closer ({:.0f} deg)", ex > 0 ? "top" : "bottom", std::abs(ex))});
+                             std::format("Tilt: bring the board's {} edge closer ({:.0f} deg)", ex > 0 ? "left" : "right", std::abs(ex))});
         else
             hints.push_back({g.tilt_error_deg.norm() / t.tilt_tol_deg,
-                             std::format("Tilt: bring the board's {} edge closer ({:.0f} deg)", ey > 0 ? "left" : "right", std::abs(ey))});
+                             std::format("Tilt: bring the board's {} edge closer ({:.0f} deg)", ey > 0 ? "bottom" : "top", std::abs(ey))});
     }
     if (!g.offset_ok) {
         const Vec2 o = g.offset_mm;
-        const char* dir = std::abs(o.x()) >= std::abs(o.y()) ? (o.x() > 0 ? "right" : "left") : (o.y() > 0 ? "down" : "up");
+        const char* dir = std::abs(o.x()) >= std::abs(o.y()) ? (o.x() > 0 ? "up" : "down") : (o.y() > 0 ? "right" : "left");
         hints.push_back({o.norm() / t.offset_tol_mm, std::format("Centre the board: aim the scanner {} ({:.0f} mm)", dir, o.norm())});
     }
     if (!g.roll_ok) {
@@ -162,7 +162,7 @@ Guidance guide(const BoardMeasure& m, const PoseTarget& t) {
         // lowering its roll. Far off (the board sideways or upside down): say how the board should lie.
         const double e = g.roll_error_deg;
         hints.push_back({std::abs(e) / t.roll_tol_deg,
-                         std::abs(e) > 60 ? std::format("Turn the scanner {} {:.0f} deg: the board's long side should run up the view",
+                         std::abs(e) > 60 ? std::format("Turn the scanner {} {:.0f} deg: the board's long side should run across the view",
                                                         e > 0 ? "clockwise" : "anticlockwise", std::abs(e))
                                           : std::format("Turn the scanner {} ({:.0f} deg)", e > 0 ? "clockwise" : "anticlockwise", std::abs(e))});
     }

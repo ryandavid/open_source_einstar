@@ -50,8 +50,10 @@ variants on discrete GPUs.
   five distances from 200 to 600 mm.
 - **Live guidance:**
   - board detection in both cameras;
-  - a 3D view of the target poses;
-  - the board's outline now and where the next view wants it;
+  - a 3D view of the target poses and a low-poly model of the scanner;
+  - the camera image upright, as you see it with the scanner held upright (the camera's x axis runs along
+    the scanner), with the board's outline now and where the next view wants it; edges and directions in
+    the hints are as that view shows them;
   - distance and tilt gauges;
   - the scanner's LED shows too near / in range / too far.
 - **Capturing:** automatic once the board is in position and held still, or with the scanner's button. A

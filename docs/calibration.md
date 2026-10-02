@@ -451,18 +451,23 @@ in the repo.
   fix the grid (every choice of four large candidates is tried when there are more), a homography
   associates the grid dots within 0.3 pitch, and a planar PnP gives the board pose.
 * **Plan and guidance** (`calibrate/plan.hpp`): EXStar's 25 views (§5.1). Poses are measured in the scanner
-  frame (midway between the IR cameras, z along the bisector of their axes). The board's roll is held at
-  90° ± 20° (its long side up the view), as in all 25 of EXStar's captures (76–107°): the tilted groups are
-  named in the image's terms ("right edge near"), so with the roll fixed each group is one direction from
-  the board. Seen from the board, the plan is then five lines from its centre (the normal, and four 30° off
+  frame (midway between the IR cameras, z along the bisector of their axes). The baseline runs along the
+  scanner's length: held upright (the EINSTAR logo reading), the right IR camera is at the top with the
+  texture camera just below it, and the left IR camera at the bottom, so the camera's +x is up. The app
+  shows the images that way (the view: the image turned 90° anticlockwise, view up = image +x, view right
+  = image +y), and group names and hints use the view's terms. The board's roll is held at 90° ± 20° in
+  the image (its long side across the view; the app shows roll in the view's terms, 0°), as in all 25 of
+  EXStar's captures (76–107°): with the roll fixed each tilted group ("top edge near", +tilt about the
+  image's y) is one direction from the board. Seen from the board, the plan is then five lines from its centre (the normal, and four 30° off
   it), with the five distances as points along each (`board_from_scanner`).
   **The Live tab is a 3D view centred on the board** (`apps/einstar-calibrate/board_view.cpp`): the board with
   its dot grid, the five lines and their dots (grey: to do, pulsing cyan: next with its acceptance disc and
   distance band, amber: in position -- hold still, with the hold-still ring, green: captured), each
-  captured view's camera baseline, and the scanner's live pose (from the board pose) with its field of
-  view and aim line on the board (green on the centre), greyed at its last pose while the board is out of
-  view. It opens on an operator view (from the image-bottom side of a face-on scanner, above the board,
-  the board's normal up); drag orbits, scroll zooms, double-click resets. The live left image, with the
+  captured view's camera baseline, and the scanner's live pose (from the board pose, a low-poly model: the
+  220 × 46 × 55 mm bar with its lenses, projector and LEDs, edged in the state colour) with its field of
+  view and aim line on the board (green on the centre), see-through at its last pose while the board is out
+  of view. It opens on an operator view (behind the bottom end of a face-on scanner held upright and
+  tipped down at the board, above the board, the board's normal up); drag orbits, scroll zooms, double-click resets. The live left image, with the
   detection and the board's outline now and at the target, is an inset. The target is any uncaptured view
   within 1.5 tolerances of the scanner's distance and tilt, else the active group's nearest step (the side
   panel keeps a distance ladder per group, a distance gauge and a tilt target). A view is captured once the

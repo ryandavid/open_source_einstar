@@ -11,10 +11,15 @@
 // Poses are measured in the scanner frame: origin midway between the two IR cameras, z along the
 // bisector of their optical axes, x towards the right camera, y = z x x.
 //
-// Roll (the board's in-plane rotation in the view) is held at 90 +- 20 degrees: the board's long axis runs
-// along the image's vertical, as in all of EXStar's 25 captures (76..107 degrees). The tilted groups are
-// defined in the image's terms ("right edge near"), so a fixed roll makes each group one direction from
-// the board: seen from the board, the plan is five lines from its centre with five distances on each.
+// The view: the left camera's image the way the operator sees it with the scanner held upright -- its top
+// (the right camera) up, as the EINSTAR logo reads. The camera's x axis runs along the scanner, so the view
+// is the image turned 90 degrees anticlockwise: view up = image right (+x), view right = image down (+y).
+// Group names and hints are in the view's terms, and the app shows the images that way.
+//
+// Roll (the board's in-plane rotation in the image) is held at 90 +- 20 degrees: the board's long axis runs
+// along the image's vertical, across the view, as in all of EXStar's 25 captures (76..107 degrees). With
+// the roll fixed each tilted group ("top edge near") is one direction from the board: seen from the board,
+// the plan is five lines from its centre with five distances on each.
 
 #include <string>
 #include <vector>
@@ -30,8 +35,8 @@ namespace einstar::calibrate {
 struct BoardMeasure {
     double distance_mm = 0;    // board centre along the scanner's z axis
     Vec2 offset_mm{0, 0};      // board centre off the scanner's axis (x, y)
-    double tilt_x_deg = 0;     // about the scanner's x axis (bottom edge nearer, image down being +y: +)
-    double tilt_y_deg = 0;     // about the y axis (right edge nearer: +)
+    double tilt_x_deg = 0;     // about the scanner's x axis (+: the image's +y edge nearer, the view's right)
+    double tilt_y_deg = 0;     // about the y axis (+: the image's +x edge nearer, the view's top)
     double roll_deg = 0;       // board's in-plane rotation: board x from the scanner's x towards its y
 };
 // T_left_board: board -> left camera (board_pose).

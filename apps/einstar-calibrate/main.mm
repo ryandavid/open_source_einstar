@@ -71,13 +71,25 @@ constexpr ImU32 kCyan = IM_COL32(70, 200, 255, 255);
 constexpr ImU32 kGrey = IM_COL32(90, 90, 96, 255);
 constexpr ImU32 kGroupColours[5] = {IM_COL32(90, 200, 255, 255), IM_COL32(255, 140, 90, 255), IM_COL32(200, 120, 255, 255),
                                     IM_COL32(120, 230, 120, 255), IM_COL32(255, 220, 80, 255)};
-const char* kGroupShort[5] = {"Face-on", "Right near", "Left near", "Bottom near", "Top near"};
+const char* kGroupShort[5] = {"Face-on", "Top near", "Bottom near", "Right near", "Left near"};
 
-// Image-space drawing: image pixel -> screen.
+// Image-space drawing, the image shown as the view (calibrate/plan.hpp): turned 90 degrees anticlockwise, so
+// its +x runs up the screen and its +y to the right. `origin` is the drawn image's top left.
 struct ImageFrame {
     ImVec2 origin;
-    float scale = 1;
-    [[nodiscard]] ImVec2 at(const Vec2& px) const { return {origin.x + static_cast<float>(px.x()) * scale, origin.y + static_cast<float>(px.y()) * scale}; }
+    float scale = 1;           // screen px per image px
+    float image_width = 1280;  // image px (its x extent, the drawn height)
+    [[nodiscard]] ImVec2 at(const Vec2& px) const {
+        return {origin.x + static_cast<float>(px.y()) * scale, origin.y + (image_width - static_cast<float>(px.x())) * scale};
+    }
+    // The drawn size of an image_width x image_height image.
+    [[nodiscard]] ImVec2 size(float image_height) const { return {image_height * scale, image_width * scale}; }
+    // The image texture, turned to match at().
+    void draw_image(ImDrawList* dl, ImTextureID tex, float image_height) const {
+        const ImVec2 s = size(image_height);
+        dl->AddImageQuad(tex, origin, ImVec2(origin.x + s.x, origin.y), ImVec2(origin.x + s.x, origin.y + s.y), ImVec2(origin.x, origin.y + s.y),
+                         ImVec2(1, 0), ImVec2(1, 1), ImVec2(0, 1), ImVec2(0, 0));
+    }
 };
 
 void dashed_line(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 col, float thickness, float dash = 10) {
@@ -118,7 +130,8 @@ void draw_detection(ImDrawList* dl, const ImageFrame& f, const calibrate::BoardD
     for (const auto& px : d.large) dl->AddCircle(f.at(px), 7.0f, kAmber, 12, 2.0f);
 }
 
-// Tilt target: board normal as a point (tilt about y horizontally, about x vertically), +-45 deg.
+// Tilt target: board normal as a point in the view's terms (right edge near to the right: +tilt_x; top edge
+// near up: +tilt_y), +-45 deg.
 void draw_tilt_gauge(const calibrate::PoseTarget* t, const calibrate::BoardMeasure* m, float size) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 p0 = ImGui::GetCursorScreenPos();
@@ -129,14 +142,14 @@ void draw_tilt_gauge(const calibrate::PoseTarget* t, const calibrate::BoardMeasu
     dl->AddLine(ImVec2(c.x, p0.y + 4), ImVec2(c.x, p0.y + size - 4), kGrey);
     for (const float r : {15.0f, 30.0f}) dl->AddCircle(c, r * k, IM_COL32(60, 60, 66, 255), 48);
     if (t) {
-        const ImVec2 tc(c.x + static_cast<float>(t->tilt_y_deg) * k, c.y + static_cast<float>(t->tilt_x_deg) * k);
+        const ImVec2 tc(c.x + static_cast<float>(t->tilt_x_deg) * k, c.y - static_cast<float>(t->tilt_y_deg) * k);
         dl->AddCircleFilled(tc, static_cast<float>(t->tilt_tol_deg) * k, IM_COL32(70, 200, 255, 60), 32);
         dl->AddCircle(tc, static_cast<float>(t->tilt_tol_deg) * k, kCyan, 32, 1.5f);
     }
     if (m) {
-        const float x = std::clamp(static_cast<float>(m->tilt_y_deg), -45.f, 45.f), y = std::clamp(static_cast<float>(m->tilt_x_deg), -45.f, 45.f);
+        const float x = std::clamp(static_cast<float>(m->tilt_x_deg), -45.f, 45.f), y = std::clamp(static_cast<float>(m->tilt_y_deg), -45.f, 45.f);
         const bool ok = t && std::hypot(m->tilt_y_deg - t->tilt_y_deg, m->tilt_x_deg - t->tilt_x_deg) <= t->tilt_tol_deg;
-        dl->AddCircleFilled(ImVec2(c.x + x * k, c.y + y * k), 6, ok ? kGreen : kAmber, 16);
+        dl->AddCircleFilled(ImVec2(c.x + x * k, c.y - y * k), 6, ok ? kGreen : kAmber, 16);
     }
     dl->AddText(ImVec2(p0.x + 4, p0.y + 2), IM_COL32(150, 150, 150, 255), "top near");
     dl->AddText(ImVec2(p0.x + 4, p0.y + size - 16), IM_COL32(150, 150, 150, 255), "bottom near");
@@ -214,10 +227,10 @@ int draw_ladders(const app::CalibrationController& c, const std::vector<std::opt
         const ImVec2 q[4] = {{gc.x - r, gc.y - r * 0.6f}, {gc.x + r, gc.y - r * 0.6f}, {gc.x + r, gc.y + r * 0.6f}, {gc.x - r, gc.y + r * 0.6f}};
         ImVec2 w[4] = {q[0], q[1], q[2], q[3]};
         const float e = 2.5f;
-        if (g == 1) w[1].y -= e, w[2].y += e;  // right edge near: drawn larger
-        if (g == 2) w[0].y -= e, w[3].y += e;
-        if (g == 3) w[2].x += e, w[3].x -= e;
-        if (g == 4) w[0].x -= e, w[1].x += e;
+        if (g == 1) w[0].x -= e, w[1].x += e;  // top edge near: drawn larger
+        if (g == 2) w[2].x += e, w[3].x -= e;
+        if (g == 3) w[1].y -= e, w[2].y += e;
+        if (g == 4) w[0].y -= e, w[3].y += e;
         dl->AddQuad(w[0], w[1], w[2], w[3], kGroupColours[g], 1.5f);
         ImGui::SetCursorScreenPos(ImVec2(x0 - 5, p0.y));
         ImGui::InvisibleButton(std::format("##group{}", g).c_str(), ImVec2(boxw + 10, top + 5 * (boxh + gap) + 34));
@@ -427,13 +440,15 @@ void results_tab(app::CalibrationController& c, const app::SolveState& st) {
 
 // Every captured dot over the two image frames: where the calibration has data.
 void coverage_tab(const app::CalibrationController& c, const std::vector<std::optional<app::CaptureRecord>>& caps, const app::LiveState& live) {
+    // Each camera's image as the view shows it (upright: 1024 wide, 1280 tall).
     const float avail = ImGui::GetContentRegionAvail().x;
-    const float w = (avail - 20) * 0.5f, h = w * 1024.0f / 1280.0f;
-    const float k = w / 1280.0f;
+    const float h = (avail - 20) * 0.5f * 1024.0f / 1280.0f;
+    const float k = h / 1280.0f, w = 1024.0f * k;
     ImDrawList* dl = ImGui::GetWindowDrawList();
     for (int cam = 0; cam < 2; ++cam) {
         if (cam == 1) ImGui::SameLine(0, 20);
         const ImVec2 p0 = ImGui::GetCursorScreenPos();
+        const ImageFrame f{p0, k, 1280.0f};
         dl->AddRectFilled(p0, ImVec2(p0.x + w, p0.y + h), IM_COL32(22, 23, 26, 255));
         dl->AddRect(p0, ImVec2(p0.x + w, p0.y + h), kGrey);
         // Coverage grid: 8 x 6 cells, shaded by the number of dots seen there.
@@ -444,21 +459,21 @@ void coverage_tab(const app::CalibrationController& c, const std::vector<std::op
                     const int cx = std::clamp(static_cast<int>(px.x() / 160.0), 0, 7), cy = std::clamp(static_cast<int>(px.y() / (1024.0 / 6)), 0, 5);
                     ++cells[cy][cx];
                 }
-        const float cell_w = 160.0f * k, cell_h = (1024.0f / 6) * k;
         for (int y = 0; y < 6; ++y)
             for (int x = 0; x < 8; ++x) {
                 const int n = cells[y][x];
                 const ImU32 col = n == 0 ? IM_COL32(120, 40, 40, 70) : n < 8 ? IM_COL32(160, 130, 40, 70) : IM_COL32(40, 140, 70, 60);
-                const float x0 = p0.x + static_cast<float>(x) * cell_w, y0 = p0.y + static_cast<float>(y) * cell_h;
-                dl->AddRectFilled(ImVec2(x0 + 1, y0 + 1), ImVec2(x0 + cell_w - 1, y0 + cell_h - 1), col);
+                // The cell's image corners, drawn turned: min / max of the two on screen.
+                const ImVec2 a = f.at(Vec2(160.0 * x, 1024.0 / 6 * y)), b = f.at(Vec2(160.0 * (x + 1), 1024.0 / 6 * (y + 1)));
+                dl->AddRectFilled(ImVec2(std::min(a.x, b.x) + 1, std::min(a.y, b.y) + 1), ImVec2(std::max(a.x, b.x) - 1, std::max(a.y, b.y) - 1), col);
             }
         for (std::size_t i = 0; i < caps.size(); ++i)
             if (caps[i])
                 for (const auto& px : (cam == 0 ? caps[i]->capture.left : caps[i]->capture.right).pixels)
-                    dl->AddCircleFilled(ImVec2(p0.x + static_cast<float>(px.x()) * k, p0.y + static_cast<float>(px.y()) * k), 2.0f, kGroupColours[c.plan()[i].group], 6);
+                    dl->AddCircleFilled(f.at(px), 2.0f, kGroupColours[c.plan()[i].group], 6);
         const auto& d = cam == 0 ? live.det_left : live.det_right;
         if (d)
-            for (const auto& px : d->pixels) dl->AddCircle(ImVec2(p0.x + static_cast<float>(px.x()) * k, p0.y + static_cast<float>(px.y()) * k), 4.0f, IM_COL32(255, 255, 255, 200), 8);
+            for (const auto& px : d->pixels) dl->AddCircle(f.at(px), 4.0f, IM_COL32(255, 255, 255, 200), 8);
         dl->AddText(ImVec2(p0.x + 6, p0.y + 4), IM_COL32(200, 200, 200, 255), cam == 0 ? "Left camera" : "Right camera");
         ImGui::Dummy(ImVec2(w, h));
     }
@@ -674,13 +689,14 @@ int main(int argc, char** argv) {
                     }
                     ImDrawList* dl = ImGui::GetWindowDrawList();
                     if (tex_left.texture) {
-                        const float lw = std::min(460.0f, avail.x * 0.32f);
-                        const float s = lw / static_cast<float>(tex_left.width);
-                        const float lh = static_cast<float>(tex_left.height) * s;
+                        // Upright (the view): taller than wide.
+                        const auto iw = static_cast<float>(tex_left.width), ih = static_cast<float>(tex_left.height);
+                        const float s = std::min(std::min(380.0f, avail.x * 0.28f) / ih, avail.y * 0.55f / iw);
+                        const float lw = ih * s, lh = iw * s;
                         const ImVec2 o(view_o.x + avail.x - lw - 12, view_o.y + avail.y - lh - 40);  // bottom right
-                        dl->AddImage((ImTextureID)(__bridge void*)tex_left.texture, o, ImVec2(o.x + lw, o.y + lh));
+                        const ImageFrame f{o, s, iw};
+                        f.draw_image(dl, (ImTextureID)(__bridge void*)tex_left.texture, ih);
                         dl->AddRect(ImVec2(o.x - 1, o.y - 1), ImVec2(o.x + lw + 1, o.y + lh + 1), IM_COL32(120, 120, 128, 255));
-                        const ImageFrame f{o, s};
                         dl->PushClipRect(o, ImVec2(o.x + lw, o.y + lh), true);
                         if (live.det_left) draw_detection(dl, f, *live.det_left);
                         if (target) draw_outline(dl, f, grig.left, calibrate::target_pose(*target, target->roll_deg, grig), kCyan, true, 2.0f);
@@ -697,7 +713,9 @@ int main(int argc, char** argv) {
                         lines.push_back(std::format("Image level {}, saturated {:.1f}%   {:.1f} fps", live.mean_level, live.saturated_permille / 10.0, live.fps));
                         if (meas) {
                             lines.push_back(std::format("Distance {:.0f} mm   off centre {:.0f} mm", meas->distance_mm, meas->offset_mm.norm()));
-                            lines.push_back(std::format("Tilt x / y {:+.1f} / {:+.1f} deg   roll {:+.0f} deg", meas->tilt_x_deg, meas->tilt_y_deg, meas->roll_deg));
+                            // Roll as the view shows it: 0 with the board's long side across the view (the image's 90).
+                            lines.push_back(std::format("Tilt x / y {:+.1f} / {:+.1f} deg   roll {:+.0f} deg", meas->tilt_x_deg, meas->tilt_y_deg,
+                                                        std::remainder(meas->roll_deg - 90.0, 360.0)));
                         }
                         float y = o.y - 6 - static_cast<float>(lines.size()) * (ImGui::GetTextLineHeight() + 1);  // above the inset
                         for (const auto& l : lines) {
