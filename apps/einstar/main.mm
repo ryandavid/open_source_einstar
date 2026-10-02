@@ -36,6 +36,7 @@
 #include "einstar/core/timing.hpp"
 #include "einstar/gpu/context.hpp"
 #include "einstar/render/scene_renderer.hpp"
+#include "upright_image.hpp"
 
 using namespace einstar;
 
@@ -183,7 +184,7 @@ int main(int argc, char** argv) {
 
     app::AppState state;
     render::ViewCamera camera;
-    std::optional<Eigen::Matrix4f> scanner_pose;  // latest, for "Follow scanner"
+    std::optional<Eigen::Matrix4f> scanner_pose;  // latest: the scanner model, "Follow scanner"
     auto last_view_frame = std::chrono::steady_clock::now();
     render::RenderSettings settings;
     MouseState mouse;
@@ -305,8 +306,10 @@ int main(int argc, char** argv) {
             const auto now = std::chrono::steady_clock::now();
             const double dt_s = std::chrono::duration<double>(now - last_view_frame).count();
             last_view_frame = now;
+            if (!state.connected()) scanner_pose.reset();
             if (state.follow_scanner && scanner_pose)
                 camera.follow(*scanner_pose, static_cast<float>(1.0 - std::exp(-dt_s / 0.08)));
+            (*renderer)->set_scanner_pose(scanner_pose);
 
             id<CAMetalDrawable> drawable = nil;
             if (snapshot_path) {
@@ -365,8 +368,9 @@ int main(int argc, char** argv) {
                 ImGui::Checkbox("Follow scanner", &state.follow_scanner);
                 ImGui::SliderFloat("Point size (mm)", &settings.point_size_mm, 0.1f, 3.0f);
                 ImGui::Checkbox("Lighting", &settings.lighting);
+                ImGui::Checkbox("Show scanner", &settings.show_scanner);
                 ImGui::TextDisabled("Left-drag: orbit  Right-drag: pan  Wheel: zoom  Double-click: reset view");
-                ImGui::TextDisabled("Follow: the view from behind the scanner; orbiting or panning leaves it");
+                ImGui::TextDisabled("Follow: the view from behind and above the scanner; orbiting or panning leaves it");
             }
             ImGui::End();
             app::draw_status_banner(state, workflow);
@@ -410,21 +414,30 @@ int main(int argc, char** argv) {
 
             // ---- Camera previews ----
             if (preview_left.texture) {
-                ImGui::SetNextWindowPos(ImVec2(10, io.DisplaySize.y - 230), ImGuiCond_FirstUseEver);
+                ImGui::SetNextWindowPos(ImVec2(10, io.DisplaySize.y - 290), ImGuiCond_FirstUseEver);
                 ImGui::Begin("Cameras", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
-                const float pw = 256.0f, ph = pw * float(preview_left.height) / float(preview_left.width);
-                ImGui::Image((ImTextureID)(__bridge void*)preview_left.texture, ImVec2(pw, ph));
-                {
-                    // Marker detections on the left preview: green = stereo matched, red = left only.
-                    const ImVec2 o = ImGui::GetItemRectMin();
-                    const float k = pw / float(preview_left.width);
-                    auto* dl = ImGui::GetWindowDrawList();
-                    for (const auto& m : preview_markers)
-                        dl->AddCircle(ImVec2(o.x + m.x * k, o.y + m.y * k), std::max(3.0f, m.radius * k + 1.5f),
-                                      m.matched ? IM_COL32(40, 230, 90, 255) : IM_COL32(230, 60, 60, 255), 0, 1.5f);
+                // Upright, as the scanner is held (upright_image.hpp): left and right side by side.
+                constexpr float kPreviewWidth = 205.0f;  // drawn; taller than wide
+                auto* dl = ImGui::GetWindowDrawList();
+                const auto label = [&](const app::ImageFrame& f, const char* s) {
+                    dl->AddText(ImVec2(f.origin.x + 4, f.origin.y + 2), IM_COL32(220, 220, 220, 220), s);
+                };
+                const auto left = app::upright_image_item((ImTextureID)(__bridge void*)preview_left.texture, float(preview_left.width),
+                                                          float(preview_left.height), kPreviewWidth);
+                // Marker detections on the left preview: green = stereo matched, red = left only.
+                for (const auto& m : preview_markers)
+                    dl->AddCircle(left.at(m.x, m.y), std::max(3.0f, m.radius * left.scale + 1.5f),
+                                  m.matched ? IM_COL32(40, 230, 90, 255) : IM_COL32(230, 60, 60, 255), 0, 1.5f);
+                label(left, "Left");
+                if (preview_right.texture) {
+                    ImGui::SameLine();
+                    label(app::upright_image_item((ImTextureID)(__bridge void*)preview_right.texture, float(preview_right.width),
+                                                  float(preview_right.height), kPreviewWidth),
+                          "Right");
                 }
-                ImGui::SameLine();
-                if (preview_right.texture) ImGui::Image((ImTextureID)(__bridge void*)preview_right.texture, ImVec2(pw, ph));
+                // Keep the panel on screen (a saved layout, a smaller window).
+                const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+                if (wp.y + ws.y > io.DisplaySize.y) ImGui::SetWindowPos(ImVec2(wp.x, std::max(0.0f, io.DisplaySize.y - ws.y)));
                 ImGui::End();
             }
 

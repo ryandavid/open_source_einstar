@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -23,6 +24,7 @@ struct RenderSettings {
     bool lighting = true;
     bool show_points = true;      // model / frame splats
     bool show_mesh = true;        // processed mesh, when one is set
+    bool show_scanner = true;     // the scanner model, when it has a pose
 };
 
 class SceneRenderer {
@@ -43,6 +45,8 @@ public:
     // Processed triangle mesh (replaces any previous one; empty clears it).
     void set_mesh(std::span<const MeshVertex> vertices, std::span<const std::uint32_t> indices);
     [[nodiscard]] bool has_mesh() const { return mesh_index_count_ > 0; }
+    // The scanner model (scanner_model.hpp) at this pose; nullopt hides it.
+    void set_scanner_pose(const std::optional<Mat4f>& T_world_scanner) { scanner_pose_ = T_world_scanner; }
 
     [[nodiscard]] std::size_t model_point_count() const { return model_.count; }
 
@@ -62,6 +66,10 @@ private:
     gpu::Ref<MTL::RenderPipelineState> marker_pso_;
     gpu::Ref<MTL::RenderPipelineState> line_pso_;
     gpu::Ref<MTL::RenderPipelineState> mesh_pso_;
+    gpu::Ref<MTL::RenderPipelineState> solid_pso_;
+    gpu::Ref<MTL::Buffer> scanner_vertices_;  // the scanner model's triangles, in its frame
+    std::size_t scanner_vertex_count_ = 0;
+    std::optional<Mat4f> scanner_pose_;
     gpu::Ref<MTL::Buffer> mesh_vertices_, mesh_indices_;
     std::size_t mesh_index_count_ = 0;
     gpu::Ref<MTL::DepthStencilState> depth_state_;

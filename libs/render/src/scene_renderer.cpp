@@ -3,6 +3,9 @@
 #include <algorithm>
 #include <cstring>
 #include <format>
+#include <vector>
+
+#include "einstar/render/scanner_model.hpp"
 
 namespace einstar::render {
 namespace {
@@ -64,6 +67,26 @@ Result<std::unique_ptr<SceneRenderer>> SceneRenderer::create(std::shared_ptr<gpu
     auto mesh = make_pipeline(*r->ctx_, *lib, "mesh_vs", "mesh_fs", color, depth, false);
     if (!mesh) return std::unexpected(mesh.error());
     r->mesh_pso_ = std::move(*mesh);
+    auto solid = make_pipeline(*r->ctx_, *lib, "solid_vs", "solid_fs", color, depth, false);
+    if (!solid) return std::unexpected(solid.error());
+    r->solid_pso_ = std::move(*solid);
+    // The scanner model as triangles (fans over its convex faces), each face's vertices with its normal.
+    {
+        std::vector<PointVertex> tris;
+        const auto& model = scanner_model();
+        for (const auto* faces : {&model.body, &model.front})
+            for (const auto& f : *faces) {
+                const Vec3f n = (f.v[1] - f.v[0]).cross(f.v[2] - f.v[0]).normalized();
+                const auto vertex = [&](const Vec3f& p) { return PointVertex{p.x(), p.y(), p.z(), n.x(), n.y(), n.z(), f.color}; };
+                for (std::size_t i = 1; i + 1 < f.v.size(); ++i)
+                    for (const auto* p : {&f.v[0], &f.v[i], &f.v[i + 1]}) tris.push_back(vertex(*p));
+            }
+        r->scanner_vertices_ = r->ctx_->mirrored_buffer(tris.size() * sizeof(PointVertex));
+        if (!r->scanner_vertices_) return make_error(Errc::io, "scanner model buffer");
+        std::memcpy(r->scanner_vertices_->contents(), tris.data(), tris.size() * sizeof(PointVertex));
+        gpu::Context::cpu_modified(r->scanner_vertices_.get());
+        r->scanner_vertex_count_ = tris.size();
+    }
     if (!splat) return std::unexpected(splat.error());
     if (!marker) return std::unexpected(marker.error());
     if (!line) return std::unexpected(line.error());
@@ -159,6 +182,12 @@ void SceneRenderer::encode(MTL::RenderCommandEncoder* enc, const ViewCamera& cam
     if (s.show_points) {
         draw_splats(model_);
         draw_splats(frame_);
+    }
+    if (s.show_scanner && scanner_pose_ && scanner_vertex_count_ > 0) {
+        enc->setRenderPipelineState(solid_pso_.get());
+        enc->setVertexBuffer(scanner_vertices_.get(), 0, 0);
+        enc->setVertexBytes(scanner_pose_->data(), sizeof(Mat4f), 2);
+        enc->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0), NS::UInteger(scanner_vertex_count_));
     }
 
     if (markers_.count > 0) {

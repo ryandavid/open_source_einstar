@@ -5,6 +5,8 @@
 #include <cmath>
 #include <format>
 
+#include "einstar/render/scanner_model.hpp"
+
 namespace einstar::app {
 namespace {
 
@@ -70,112 +72,55 @@ std::optional<Vec3> on_board_plane(const Vec3& o, const Vec3& d) {
     return o + t * d;
 }
 
-// A low-poly Einstar, in the scanner frame (x towards the right camera, y down the image, z forward; mm;
-// origin midway between the IR cameras on the front face). Held upright, x is up: a 220 x 46 x 55 mm bar,
-// black glass in front with the right IR camera at the top (x +80), the texture camera below it (+43),
-// the projector near the middle and the left IR camera at the bottom (-80); a blue-grey shell whose back
-// narrows towards the middle, where it is held.
-struct ScannerFace {
-    std::vector<Vec3> v;  // convex, counter-clockwise seen from outside
-    ImU32 fill;
-};
-
-const std::vector<ScannerFace>& scanner_mesh() {
-    static const std::vector<ScannerFace> mesh = [] {
-        constexpr ImU32 kGlass = IM_COL32(18, 20, 24, 255), kBezel = IM_COL32(40, 44, 50, 255);
-        constexpr ImU32 kShell = IM_COL32(140, 168, 186, 255), kShellBack = IM_COL32(96, 116, 130, 255);
-        // Cross-section (y, z) at the ends; the back (z) comes forward at the grip. Eight edges: front glass,
-        // front bevels, sides, back bevels, back.
-        struct Station {
-            double x, scale, back;
-        };
-        const std::array<Station, 8> st = {{{-110, 0.8, -46}, {-104, 1, -52}, {-80, 1, -52}, {-40, 1, -40},
-                                            {40, 1, -40}, {80, 1, -52}, {104, 1, -52}, {110, 0.8, -46}}};
-        auto section = [](const Station& s) {
-            const double hw = 23 * s.scale, b = 6 * s.scale, z0 = s.scale < 1 ? -2 : 0;  // the ends round off
-            return std::array<Vec3, 8>{Vec3(s.x, -hw + b, z0), Vec3(s.x, hw - b, z0),   Vec3(s.x, hw, z0 - b),       Vec3(s.x, hw, s.back + b),
-                                       Vec3(s.x, hw - b, s.back), Vec3(s.x, -hw + b, s.back), Vec3(s.x, -hw, s.back + b), Vec3(s.x, -hw, z0 - b)};
-        };
-        const std::array<ImU32, 8> edge_fill = {kGlass, kBezel, kShell, kShellBack, kShellBack, kShellBack, kShell, kBezel};
-        std::vector<ScannerFace> faces;
-        for (std::size_t i = 0; i + 1 < st.size(); ++i) {
-            const auto a = section(st[i]), b = section(st[i + 1]);
-            for (std::size_t e = 0; e < 8; ++e) {
-                const std::size_t n = (e + 1) % 8;
-                faces.push_back({{a[e], b[e], b[n], a[n]}, edge_fill[e]});
-            }
-        }
-        const auto lo = section(st.front()), hi = section(st.back());
-        // The section runs clockwise seen from +x: as is for the bottom cap (facing -x), reversed for the top.
-        faces.push_back({{lo.begin(), lo.end()}, kShell});
-        faces.push_back({{hi.rbegin(), hi.rend()}, kShell});
-        return faces;
-    }();
-    return mesh;
-}
-
+// The scanner: the low-poly Einstar (render/scanner_model.hpp) at its pose, and (live) its field of view on
+// the board and its aim line.
 void draw_scanner(ImDrawList* dl, const ViewCam& c, const SE3& B_S, ImU32 col, bool live, bool aim_ok) {
     auto at = [&](double x, double y, double z) { return B_S * Vec3(x, y, z); };
+    const auto& model = render::scanner_model();
+    auto project = [&](const render::ModelFace& f, std::vector<ImVec2>& pts) {
+        pts.clear();
+        for (const auto& v : f.v) {
+            const auto p = c.project(B_S * v.cast<double>());
+            if (!p.ok) return false;
+            pts.push_back(p.xy);
+        }
+        return true;
+    };
+    auto rgba = [](render::Rgba8 k, double light, int alpha) {
+        const auto ch = [&](std::uint8_t v) { return static_cast<int>(v * light); };
+        return IM_COL32(ch(k.r), ch(k.g), ch(k.b), alpha);
+    };
     // Body: faces turned towards the eye, far ones first, flat-shaded (a light over the eye, a little
     // from above), edged in the state colour. Last seen (not live): see-through.
     struct Drawn {
-        std::array<ImVec2, 8> pts;
-        int n;
+        std::vector<ImVec2> pts;
         double depth;
         ImU32 fill;
     };
     std::vector<Drawn> drawn;
-    for (const auto& f : scanner_mesh()) {
+    for (const auto& f : model.body) {
         Vec3 sum = Vec3::Zero();
-        for (const auto& v : f.v) sum += v;
+        for (const auto& v : f.v) sum += v.cast<double>();
         const Vec3 centre = B_S * (sum / static_cast<double>(f.v.size()));
-        const Vec3 normal = B_S.linear() * (f.v[1] - f.v[0]).cross(f.v[2] - f.v[0]).normalized();
+        const Vec3 normal = B_S.linear() * (f.v[1] - f.v[0]).cross(f.v[2] - f.v[0]).cast<double>().normalized();
         const Vec3 to_eye = (c.eye - centre).normalized();
         if (normal.dot(to_eye) <= 0) continue;
-        Drawn d{{}, static_cast<int>(f.v.size()), (centre - c.eye).dot(c.fwd), 0};
-        bool ok = true;
-        for (std::size_t i = 0; i < f.v.size() && ok; ++i) {
-            const auto p = c.project(B_S * f.v[i]);
-            ok = p.ok;
-            d.pts[i] = p.xy;
-        }
-        if (!ok) continue;
+        Drawn d{{}, (centre - c.eye).dot(c.fwd), 0};
+        if (!project(f, d.pts)) continue;
         const double light = std::clamp(0.35 + 0.5 * normal.dot(to_eye) + 0.25 * normal.dot(c.up), 0.2, 1.0);
-        const auto ch = [&](int shift) { return static_cast<int>(((f.fill >> shift) & 0xFF) * light); };
-        d.fill = IM_COL32(ch(IM_COL32_R_SHIFT), ch(IM_COL32_G_SHIFT), ch(IM_COL32_B_SHIFT), live ? 255 : 110);
-        drawn.push_back(d);
+        d.fill = rgba(f.color, light, live ? 255 : 110);
+        drawn.push_back(std::move(d));
     }
     std::ranges::sort(drawn, [](const Drawn& a, const Drawn& b) { return a.depth > b.depth; });
     for (const auto& d : drawn) {
-        dl->AddConvexPolyFilled(d.pts.data(), d.n, d.fill);
-        dl->AddPolyline(d.pts.data(), d.n, with_alpha(col, live ? 140 : 90), ImDrawFlags_Closed, live ? 1.0f : 0.8f);
+        dl->AddConvexPolyFilled(d.pts.data(), static_cast<int>(d.pts.size()), d.fill);
+        dl->AddPolyline(d.pts.data(), static_cast<int>(d.pts.size()), with_alpha(col, live ? 140 : 90), ImDrawFlags_Closed, live ? 1.0f : 0.8f);
     }
-    // The front's details, when it faces the eye: lenses (IR, texture), the projector, the LEDs.
-    const Vec3 front = B_S.linear().col(2);
-    if (front.dot(c.eye - at(0, 0, 0)) > 0) {
-        const auto lens = [&](double x, double r) {
-            circle3(dl, c, at(x, 0, 0.3), front, r + 2.5, IM_COL32(70, 76, 86, 255), 1.0f, IM_COL32(32, 36, 42, 255));
-            circle3(dl, c, at(x, 0, 0.4), front, r, IM_COL32(110, 120, 135, 255), 1.0f, IM_COL32(8, 10, 14, 255));
-        };
-        lens(80, 8);
-        lens(43, 6);
-        lens(-80, 8);
-        for (const auto& [x, y] : {std::pair{3.0, -6.0}, std::pair{3.0, 6.0}, std::pair{-9.0, 0.0}}) {
-            std::array<ImVec2, 4> q{};
-            bool ok = true;
-            const std::array<Vec2, 4> corner = {Vec2(-2.5, -2.5), Vec2(2.5, -2.5), Vec2(2.5, 2.5), Vec2(-2.5, 2.5)};
-            for (std::size_t i = 0; i < 4 && ok; ++i) {
-                const auto p = c.project(at(x + corner[i].x(), y + corner[i].y(), 0.3));
-                ok = p.ok;
-                q[i] = p.xy;
-            }
-            if (ok) dl->AddQuadFilled(q[0], q[1], q[2], q[3], IM_COL32(60, 52, 48, 255));
-        }
-        for (const double x : {80.0, 43.0, -80.0})
-            for (const double dx : {-11.0, 11.0})
-                for (const double y : {-12.0, 12.0})
-                    if (const auto p = c.project(at(x + dx, y, 0.3)); p.ok)
-                        dl->AddCircleFilled(p.xy, std::max(1.0f, 1.5f * c.scale_at(p.depth)), IM_COL32(150, 155, 165, 255), 8);
+    // The front's details (lenses, projector, LEDs), in order, when the front faces the eye.
+    if (B_S.linear().col(2).dot(c.eye - at(0, 0, 0)) > 0) {
+        std::vector<ImVec2> pts;
+        for (const auto& f : model.front)
+            if (project(f, pts)) dl->AddConvexPolyFilled(pts.data(), static_cast<int>(pts.size()), rgba(f.color, 1.0, live ? 255 : 110));
     }
     if (!live) return;
     // Field of view of the left camera (about 58 x 48 degrees) where it meets the board plane.

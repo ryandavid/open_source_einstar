@@ -146,6 +146,33 @@ vertex MeshOut mesh_vs(uint vid [[vertex_id]], const device MeshVertex* vs [[buf
     return o;
 }
 
+// Solid model in its own frame (the scanner), placed by `model`: per-vertex colour, flat faces, lit like
+// the calibration app's board view (a light over the eye, a little from above).
+struct SolidOut {
+    float4 position [[position]];
+    float3 view_pos;
+    float3 view_normal;
+    float4 color;
+};
+
+vertex SolidOut solid_vs(uint vid [[vertex_id]], const device PointVertex* vs [[buffer(0)]], constant Uniforms& u [[buffer(1)]],
+                         constant float4x4& model [[buffer(2)]]) {
+    const PointVertex v = vs[vid];
+    const float4 vp = u.view * (model * float4(float3(v.pos), 1.0));
+    SolidOut o;
+    o.position = u.proj * vp;
+    o.view_pos = vp.xyz;
+    o.view_normal = (u.view * (model * float4(float3(v.normal), 0.0))).xyz;
+    o.color = float4(v.color) / 255.0;
+    return o;
+}
+
+fragment float4 solid_fs(SolidOut in [[stage_in]]) {
+    const float3 n = normalize(in.view_normal);
+    const float light = clamp(0.35 + 0.5 * dot(n, normalize(-in.view_pos)) + 0.25 * n.y, 0.2, 1.0);
+    return float4(in.color.rgb * light, 1.0);
+}
+
 fragment float4 mesh_fs(MeshOut in [[stage_in]]) {
     const float3 n = normalize(in.view_normal);
     const float3 l = normalize(-in.view_pos);

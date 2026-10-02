@@ -23,12 +23,13 @@ variants on discrete GPUs.
   constellation captured and bundle-adjusted before the surface scan, so the whole object shares one
   drift-free frame. The map is stored in every scan and can be reused from an earlier one.
 - **Live scanning:** stereo depth from the IR pair on the GPU, tracking on geometry and markers with
-  relocalisation after a loss, a live fused model, camera previews with marker detections, and the scanner's
-  pose and path.
+  relocalisation after a loss, a live fused model, camera previews with marker detections (upright, as the
+  scanner is held: the cameras sit along its length), and the scanner's pose and path.
 - **3D view:** surface seen from behind (the inside of the object) is drawn in a muted red-brown, for the live
   points as for the processed mesh. Left-drag orbits freely, right-drag pans, the wheel zooms, a double-click
-  resets the view. "Follow scanner" (View) keeps the camera behind the scanner, looking where it points;
-  orbiting or panning leaves it.
+  resets the view. The scanner is shown as a low-poly model at its live pose. "Follow scanner" (View) keeps
+  the camera behind and above the scanner, upright as it is held, looking where it points over its top (so
+  the scanner stays low in the view, clear of the scan); orbiting or panning leaves it.
 - **Scanner controls:** the start / pause and brightness buttons, the top LED as a distance indicator, and
   exposure, gain, projector and strobe settings.
 - **Recording:** every scan is saved to `~/Documents/Einstar/Scans/*.estr`: depth, poses, markers, the

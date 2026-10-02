@@ -53,7 +53,9 @@ void ViewCamera::zoom(float factor) { distance = std::clamp(distance * factor, 1
 void ViewCamera::follow(const Mat4f& T_world_scanner, float blend) {
     const Eigen::Matrix3f R = T_world_scanner.block<3, 3>(0, 0);
     const Vec3f aim = (T_world_scanner * Eigen::Vector4f(0, 0, kFollowAimMm, 1)).head<3>();
-    orientation = orientation.slerp(blend, Quatf(R)).normalized();
+    // Upright, then the eye swung up the screen (towards the scanner's top) about the view's x axis.
+    const Quatf goal = Quatf(R) * scanner_upright() * Quatf(Eigen::AngleAxisf(-kFollowRaiseRad, Vec3f::UnitX()));
+    orientation = orientation.slerp(blend, goal).normalized();
     target += blend * (aim - target);
 }
 

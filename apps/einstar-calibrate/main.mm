@@ -37,9 +37,11 @@
 #include "board_view.hpp"
 #include "calibration_controller.hpp"
 #include "einstar/core/timing.hpp"
+#include "upright_image.hpp"
 
 using namespace einstar;
 using calibrate::BoardSpec;
+using app::ImageFrame;
 
 namespace {
 
@@ -72,25 +74,6 @@ constexpr ImU32 kGrey = IM_COL32(90, 90, 96, 255);
 constexpr ImU32 kGroupColours[5] = {IM_COL32(90, 200, 255, 255), IM_COL32(255, 140, 90, 255), IM_COL32(200, 120, 255, 255),
                                     IM_COL32(120, 230, 120, 255), IM_COL32(255, 220, 80, 255)};
 const char* kGroupShort[5] = {"Face-on", "Top near", "Bottom near", "Right near", "Left near"};
-
-// Image-space drawing, the image shown as the view (calibrate/plan.hpp): turned 90 degrees anticlockwise, so
-// its +x runs up the screen and its +y to the right. `origin` is the drawn image's top left.
-struct ImageFrame {
-    ImVec2 origin;
-    float scale = 1;           // screen px per image px
-    float image_width = 1280;  // image px (its x extent, the drawn height)
-    [[nodiscard]] ImVec2 at(const Vec2& px) const {
-        return {origin.x + static_cast<float>(px.y()) * scale, origin.y + (image_width - static_cast<float>(px.x())) * scale};
-    }
-    // The drawn size of an image_width x image_height image.
-    [[nodiscard]] ImVec2 size(float image_height) const { return {image_height * scale, image_width * scale}; }
-    // The image texture, turned to match at().
-    void draw_image(ImDrawList* dl, ImTextureID tex, float image_height) const {
-        const ImVec2 s = size(image_height);
-        dl->AddImageQuad(tex, origin, ImVec2(origin.x + s.x, origin.y), ImVec2(origin.x + s.x, origin.y + s.y), ImVec2(origin.x, origin.y + s.y),
-                         ImVec2(1, 0), ImVec2(1, 1), ImVec2(0, 1), ImVec2(0, 0));
-    }
-};
 
 void dashed_line(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 col, float thickness, float dash = 10) {
     const float dx = b.x - a.x, dy = b.y - a.y, len = std::sqrt(dx * dx + dy * dy);

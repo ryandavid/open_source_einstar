@@ -23,7 +23,7 @@ target_link_libraries(test_depth PRIVATE einstar::depth_metal einstar::synth ein
 einstar_add_test(test_calib calib/test_rectify.cpp calib/test_device_calibration.cpp)
 target_link_libraries(test_calib PRIVATE einstar::calib)
 
-einstar_add_test(test_render render/test_scene_renderer.cpp render/test_view_camera.cpp)
+einstar_add_test(test_render render/test_scene_renderer.cpp render/test_view_camera.cpp render/test_scanner_model.cpp)
 target_link_libraries(test_render PRIVATE einstar::render)
 
 einstar_add_test(test_usb usb/test_codec.cpp)

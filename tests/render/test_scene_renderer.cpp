@@ -123,3 +123,29 @@ TEST_CASE("points seen from behind take the back colour") {
     CHECK(back[centre + 0] > 85);
     CHECK(back[centre + 0] < 120);
 }
+
+TEST_CASE("the scanner model draws at its pose and hides without one") {
+    auto ctx = gpu::Context::create();
+    REQUIRE(ctx.has_value());
+    auto renderer = render::SceneRenderer::create(*ctx, MTL::PixelFormatBGRA8Unorm, MTL::PixelFormatDepth32Float);
+    if (!renderer) FAIL(renderer.error().message);
+
+    // The scanner 300 mm ahead, turned so its +y side (the blue-grey shell) faces the camera.
+    Eigen::Matrix4f T = Eigen::Matrix4f::Identity();
+    T.block<3, 3>(0, 0) = Eigen::AngleAxisf(-std::numbers::pi_v<float> / 2, Eigen::Vector3f::UnitX()).toRotationMatrix();
+    T.block<3, 1>(0, 3) = Eigen::Vector3f(0, 0, 300);
+    render::ViewCamera cam;
+    cam.target = {0, 0, 300};
+    cam.distance = 300;
+    auto shell_pixels = [&] {
+        const auto px = render_offscreen(**ctx, **renderer, cam);
+        int n = 0;
+        for (std::size_t i = 0; i < px.size(); i += 4)  // BGRA; the shell is (140, 168, 186) shaded
+            if (px[i] > 120 && px[i + 1] > 110 && px[i + 2] > 90 && px[i] > px[i + 2] + 20) ++n;
+        return n;
+    };
+    (*renderer)->set_scanner_pose(T);
+    CHECK(shell_pixels() > 2000);
+    (*renderer)->set_scanner_pose(std::nullopt);
+    CHECK(shell_pixels() == 0);
+}

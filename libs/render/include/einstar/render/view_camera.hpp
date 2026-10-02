@@ -11,17 +11,25 @@ using Quatf = Eigen::Quaternionf;
 
 // Orbit camera for inspecting the scan, plus a "follow" mode that sits behind the scanner.
 struct ViewCamera {
-    // The camera looks along its own +z with +y down, as the scanner's optical frame does; `orientation`
-    // takes camera axes to world axes, so the identity looks along world +z (the scan's first view).
+    // The camera looks along its own +z with +y down the screen; `orientation` takes camera axes to world
+    // axes. The world is the scan's first scanner frame (x towards the right camera, y down its images, z
+    // forward), and views are upright as the scanner is held: its top (+x) up the screen, +y to the right
+    // (as the app's camera previews show them).
+    static Quatf scanner_upright() { return Quatf(Eigen::AngleAxisf(1.5707963f, Vec3f::UnitZ())); }
+
     Vec3f target{0, 0, 300};
-    float distance = 600.0f;  // mm, eye to target
-    Quatf orientation = Quatf::Identity();
+    float distance = 800.0f;  // mm, eye to target (following: the scanner small in the view, the scan large)
+    Quatf orientation = scanner_upright();  // from behind the first scanner pose, along its line of sight
     float fov_y = 0.8f;  // rad
     float near_plane = 5.0f;
     float far_plane = 5000.0f;
 
-    // Follow mode looks at the point this far in front of the scanner (its working distance).
+    // Follow mode looks at the point this far in front of the scanner (its working distance), from over
+    // its top: the line of sight is raised this much from the boresight towards the scanner's top (+x), so
+    // it crosses the front face 300 mm x tan(25 deg) = 140 mm above the axis, clear of the scanner's top at
+    // 110 mm whatever the zoom -- the scanner sits low in the view instead of in front of the scan.
     static constexpr float kFollowAimMm = 300.0f;
+    static constexpr float kFollowRaiseRad = 0.4363323f;  // 25 deg
 
     [[nodiscard]] Vec3f eye() const;
     [[nodiscard]] Vec3f forward() const;
@@ -33,8 +41,8 @@ struct ViewCamera {
     void orbit(float dx_rad, float dy_rad);
     void pan(float dx_px, float dy_px, float viewport_height_px);
     void zoom(float factor);
-    // Moves a fraction `blend` (0..1) of the way to the view from behind the scanner along its line of
-    // sight: same orientation as T_world_scanner, looking at the point kFollowAimMm in front of it.
+    // Moves a fraction `blend` (0..1) of the way to the view from behind and above the scanner, upright as it
+    // is held, looking at the point kFollowAimMm in front of it (see kFollowRaiseRad).
     void follow(const Mat4f& T_world_scanner, float blend);
     // The default view: from behind the scan's first scanner position, along its line of sight.
     void reset();
