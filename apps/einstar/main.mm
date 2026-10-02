@@ -95,13 +95,20 @@ void draw_distance_bar(int step, int steps) {
 
 }  // namespace
 
-// Writes a BGRA8 texture to PNG (used by --snapshot).
-static bool write_png(id<MTLTexture> tex, const char* path) {
+// Writes a BGRA8 texture to PNG (used by --snapshot). The texture is GPU-private; a blit on `queue`, after the
+// frames already queued, copies it into a shared buffer the CPU can read on any GPU.
+static bool write_png(id<MTLCommandQueue> queue, id<MTLTexture> tex, const char* path) {
     const NSUInteger w = tex.width, h = tex.height;
-    std::vector<std::uint8_t> px(w * h * 4);
-    [tex getBytes:px.data() bytesPerRow:w * 4 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+    id<MTLBuffer> px = [queue.device newBufferWithLength:w * h * 4 options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> cmd = [queue commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+    [blit copyFromTexture:tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
+                 toBuffer:px destinationOffset:0 destinationBytesPerRow:w * 4 destinationBytesPerImage:w * h * 4];
+    [blit endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    CGContextRef ctx = CGBitmapContextCreate(px.data(), w, h, 8, w * 4, cs,
+    CGContextRef ctx = CGBitmapContextCreate(px.contents, w, h, 8, w * 4, cs,
                                              static_cast<CGBitmapInfo>(kCGImageAlphaPremultipliedFirst) | static_cast<CGBitmapInfo>(kCGBitmapByteOrder32Little));
     CGImageRef img = CGBitmapContextCreateImage(ctx);
     CFURLRef url = CFURLCreateFromFileSystemRepresentation(nullptr, reinterpret_cast<const UInt8*>(path), static_cast<CFIndex>(std::strlen(path)), false);
@@ -288,8 +295,7 @@ int main(int argc, char** argv) {
                                                                                                height:NSUInteger(fb_h)
                                                                                             mipmapped:NO];
                     d.usage = MTLTextureUsageRenderTarget;
-                    // Shared textures need unified memory; a discrete GPU reads back through a managed copy.
-                    d.storageMode = device.hasUnifiedMemory ? MTLStorageModeShared : MTLStorageModeManaged;
+                    d.storageMode = MTLStorageModePrivate;  // read back by write_png
                     offscreen = [device newTextureWithDescriptor:d];
                 }
                 pass.colorAttachments[0].texture = offscreen;
@@ -403,11 +409,6 @@ int main(int argc, char** argv) {
             ImGui::Render();
             ImGui_ImplMetal_RenderDrawData(ImGui::GetDrawData(), cmd, enc);
             [enc endEncoding];
-            if (offscreen && !drawable && offscreen.storageMode == MTLStorageModeManaged) {
-                id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
-                [blit synchronizeResource:offscreen];
-                [blit endEncoding];
-            }
             if (drawable) [cmd presentDrawable:drawable];
             if (snapshot_path) {
                 // GPU time of the view (reported with the snapshot: it shares the GPU with the scan).
@@ -452,7 +453,7 @@ int main(int argc, char** argv) {
                              "{} frames, queue {}, {} dropped",
                              view_gpu->frames.load() ? static_cast<double>(view_gpu->ns.load()) * 1e-6 / view_gpu->frames.load() : 0.0,
                              view_gpu->frames.load(), st.fps, st.depth_ms, st.track_ms, st.frames, st.queue_depth, st.dropped);
-                std::println("snapshot: {}", write_png(offscreen, snapshot_path) ? snapshot_path : "FAILED");
+                std::println("snapshot: {}", write_png(queue, offscreen, snapshot_path) ? snapshot_path : "FAILED");
                 break;
             }
         }

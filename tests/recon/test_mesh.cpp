@@ -213,5 +213,5 @@ TEST_CASE("surface seen by too few frames is dropped when observations are requi
     ep.min_observations = 3;
     const auto seen_thrice = recon::extract_mesh(vol, ep);
     CHECK(near_b(seen_thrice) == 0);
-    CHECK(near_a(seen_thrice) > 0.8 * static_cast<double>(near_a(all)));
+    CHECK(static_cast<double>(near_a(seen_thrice)) > 0.8 * static_cast<double>(near_a(all)));
 }

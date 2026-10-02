@@ -87,28 +87,6 @@ float subpixel_offset(float cm, float c0, float cp) {
     return std::clamp(0.5f * (cm - cp) / denom, -0.5f, 0.5f);
 }
 
-float zncc(ImageView<const std::uint8_t> a, ImageView<const std::uint8_t> b, int xa, int xb, int y, int r) {
-    double sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
-    const int n = (2 * r + 1) * (2 * r + 1);
-    for (int v = -r; v <= r; ++v) {
-        const std::uint8_t* ra = a.row(y + v);
-        const std::uint8_t* rb = b.row(y + v);
-        for (int u = -r; u <= r; ++u) {
-            const double ia = ra[xa + u];
-            const double ib = rb[xb + u];
-            sa += ia;
-            sb += ib;
-            saa += ia * ia;
-            sbb += ib * ib;
-            sab += ia * ib;
-        }
-    }
-    const double va = saa - sa * sa / n;
-    const double vb = sbb - sb * sb / n;
-    if (va < 1e-6 || vb < 1e-6) return -1.0f;
-    return static_cast<float>((sab - sa * sb / n) / std::sqrt(va * vb));
-}
-
 // ZNCC between a square window in `a` and a window in `b` warped by a disparity plane
 // d(u, v) = d + gx*u + gy*v (bilinear sampling in `b`). Slanted windows are essential for the
 // Einstar's wide, toed-in baseline, where inclined surfaces are strongly foreshortened.
@@ -197,7 +175,7 @@ void refine_level(ImageView<const std::uint8_t> left, ImageView<const std::uint8
             float gx, gy;
             slope(cx, cy, gx, gy);
             const float center = 2.0f * d0;
-            const int nd = std::min(127, static_cast<int>(2 * p.search_radius / kStep) + 1);
+            const int nd = std::min(127, static_cast<int>(static_cast<float>(2 * p.search_radius) / kStep) + 1);
             const float lo = center - static_cast<float>(p.search_radius);
             float best = -2.0f;
             int best_k = -1;

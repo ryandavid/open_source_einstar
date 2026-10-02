@@ -74,7 +74,7 @@ TEST_CASE("live recording keeps every frame that reaches the host") {
         CHECK(m.extras->capture.strobe == 6000);
         CHECK(m.extras->capture.temperature_c == 37.5f);
         CHECK(m.extras->left_sensor >= 0);
-        CHECK(m.extras->tracking.stereo_ms > 0);
+        CHECK(m.extras->tracking.stereo_ms > 0.0f);
     }
     REQUIRE((*r)->dropped().size() == 5);
     for (const auto& d : (*r)->dropped()) {

@@ -177,12 +177,12 @@ int draw_ladders(const app::CalibrationController& c, const std::vector<std::opt
     const float pulse = 0.5f + 0.5f * std::sin(static_cast<float>(ImGui::GetTime()) * 6.0f);
     int clicked = -1;
     for (int g = 0; g < 5; ++g) {
-        const float x0 = p0.x + g * colw + 7;
+        const float x0 = p0.x + static_cast<float>(g) * colw + 7;
         const bool active = g == c.active_group();
         if (active) dl->AddRectFilled(ImVec2(x0 - 5, p0.y), ImVec2(x0 + boxw + 5, p0.y + top + 5 * (boxh + gap) + 34), IM_COL32(50, 60, 75, 255), 6);
         for (int s = 0; s < 5; ++s) {
             const int idx = g * 5 + s;
-            const float y = p0.y + top + (4 - s) * (boxh + gap);
+            const float y = p0.y + top + static_cast<float>(4 - s) * (boxh + gap);
             const ImVec2 a(x0, y), b(x0 + boxw, y + boxh);
             if (caps[static_cast<std::size_t>(idx)]) {
                 dl->AddRectFilled(a, b, IM_COL32(40, 150, 70, 255), 3);
@@ -259,12 +259,20 @@ std::string choose_file() {
     return {};
 }
 
-bool write_png(id<MTLTexture> tex, const char* path) {
+// Writes a BGRA8 texture to PNG (used by --snapshot). The texture is GPU-private; a blit on `queue`, after the
+// frames already queued, copies it into a shared buffer the CPU can read on any GPU.
+bool write_png(id<MTLCommandQueue> queue, id<MTLTexture> tex, const char* path) {
     const NSUInteger w = tex.width, h = tex.height;
-    std::vector<std::uint8_t> px(w * h * 4);
-    [tex getBytes:px.data() bytesPerRow:w * 4 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+    id<MTLBuffer> px = [queue.device newBufferWithLength:w * h * 4 options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> cmd = [queue commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+    [blit copyFromTexture:tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
+                 toBuffer:px destinationOffset:0 destinationBytesPerRow:w * 4 destinationBytesPerImage:w * h * 4];
+    [blit endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    CGContextRef ctx = CGBitmapContextCreate(px.data(), w, h, 8, w * 4, cs,
+    CGContextRef ctx = CGBitmapContextCreate(px.contents, w, h, 8, w * 4, cs,
                                              static_cast<CGBitmapInfo>(kCGImageAlphaPremultipliedFirst) | static_cast<CGBitmapInfo>(kCGBitmapByteOrder32Little));
     CGImageRef img = CGBitmapContextCreateImage(ctx);
     CFURLRef url = CFURLCreateFromFileSystemRepresentation(nullptr, reinterpret_cast<const UInt8*>(path), static_cast<CFIndex>(std::strlen(path)), false);
@@ -436,11 +444,13 @@ void coverage_tab(const app::CalibrationController& c, const std::vector<std::op
                     const int cx = std::clamp(static_cast<int>(px.x() / 160.0), 0, 7), cy = std::clamp(static_cast<int>(px.y() / (1024.0 / 6)), 0, 5);
                     ++cells[cy][cx];
                 }
+        const float cell_w = 160.0f * k, cell_h = (1024.0f / 6) * k;
         for (int y = 0; y < 6; ++y)
             for (int x = 0; x < 8; ++x) {
                 const int n = cells[y][x];
                 const ImU32 col = n == 0 ? IM_COL32(120, 40, 40, 70) : n < 8 ? IM_COL32(160, 130, 40, 70) : IM_COL32(40, 140, 70, 60);
-                dl->AddRectFilled(ImVec2(p0.x + x * 160 * k + 1, p0.y + y * (1024.0f / 6) * k + 1), ImVec2(p0.x + (x + 1) * 160 * k - 1, p0.y + (y + 1) * (1024.0f / 6) * k - 1), col);
+                const float x0 = p0.x + static_cast<float>(x) * cell_w, y0 = p0.y + static_cast<float>(y) * cell_h;
+                dl->AddRectFilled(ImVec2(x0 + 1, y0 + 1), ImVec2(x0 + cell_w - 1, y0 + cell_h - 1), col);
             }
         for (std::size_t i = 0; i < caps.size(); ++i)
             if (caps[i])
@@ -583,7 +593,7 @@ int main(int argc, char** argv) {
                 if (!offscreen || int(offscreen.width) != fb_w || int(offscreen.height) != fb_h) {
                     MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:NSUInteger(fb_w) height:NSUInteger(fb_h) mipmapped:NO];
                     d.usage = MTLTextureUsageRenderTarget;
-                    d.storageMode = device.hasUnifiedMemory ? MTLStorageModeShared : MTLStorageModeManaged;
+                    d.storageMode = MTLStorageModePrivate;  // read back by write_png
                     offscreen = [device newTextureWithDescriptor:d];
                 }
                 pass.colorAttachments[0].texture = offscreen;
@@ -892,11 +902,6 @@ int main(int argc, char** argv) {
             ImGui::Render();
             ImGui_ImplMetal_RenderDrawData(ImGui::GetDrawData(), cmd, enc);
             [enc endEncoding];
-            if (offscreen && !drawable && offscreen.storageMode == MTLStorageModeManaged) {
-                id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
-                [blit synchronizeResource:offscreen];
-                [blit endEncoding];
-            }
             if (drawable) [cmd presentDrawable:drawable];
             [cmd commit];
 
@@ -940,7 +945,7 @@ int main(int argc, char** argv) {
                     if (st.vs_flash)
                         std::println("ours - flash: rig rotation {:.3f} deg, right cy {:+.2f} fx {:+.2f}", st.vs_flash->rotation_deg.norm(), st.vs_flash->right.dcy,
                                      st.vs_flash->right.dfx);
-                    std::println("captured {} in {:.1f} s; snapshot: {}", captured, clock.elapsed_ms() / 1000.0, write_png(offscreen, snapshot_path) ? snapshot_path : "FAILED");
+                    std::println("captured {} in {:.1f} s; snapshot: {}", captured, clock.elapsed_ms() / 1000.0, write_png(queue, offscreen, snapshot_path) ? snapshot_path : "FAILED");
                     break;
                 }
             }
