@@ -30,6 +30,7 @@ void app_start(void)
     case CY_U3P_SUPER_SPEED:
         size = 1024;
         break;
+    case CY_U3P_NOT_CONNECTED:
     default:
         CyU3PDebugPrint(4, "Error! Invalid USB speed.\n");
         break;
@@ -204,6 +205,7 @@ void app_stop(void)
 /* Accept every U1/U2 (link power management) request. */
 CyBool_t usb_lpm_request_cb(CyU3PUsbLinkPowerMode link_mode)
 {
+    (void)link_mode;
     return CyTrue;
 }
 
@@ -301,6 +303,21 @@ void usb_event_cb(CyU3PUsbEventType_t evtype, uint16_t evdata)
             CyU3PDebugPrint(4, "USB Connect failed, Error code = %d\n", status);
         }
         break;
+    case CY_U3P_USB_EVENT_EP_UNDERRUN:
+    case CY_U3P_USB_EVENT_EP0_STAT_CPLT:
+    case CY_U3P_USB_EVENT_HOST_CONNECT:
+    case CY_U3P_USB_EVENT_HOST_DISCONNECT:
+    case CY_U3P_USB_EVENT_LMP_EXCH_FAIL:
+    case CY_U3P_USB_EVENT_LNK_RECOVERY:
+    case CY_U3P_USB_EVENT_OTG_CHANGE:
+    case CY_U3P_USB_EVENT_OTG_SRP:
+    case CY_U3P_USB_EVENT_OTG_VBUS_CHG:
+    case CY_U3P_USB_EVENT_RESERVED_1:
+    case CY_U3P_USB_EVENT_RESUME:
+    case CY_U3P_USB_EVENT_SETINTF:
+    case CY_U3P_USB_EVENT_SOF_ITP:
+    case CY_U3P_USB_EVENT_SS_COMP_ENTRY:
+    case CY_U3P_USB_EVENT_SS_COMP_EXIT:
     default:
         CyU3PDebugPrint(4, "Get Event! evtype=0x%x evdata=0x%x\r\n", evtype, evdata);
         break;
@@ -311,6 +328,7 @@ void usb_event_cb(CyU3PUsbEventType_t evtype, uint16_t evdata)
  * path as broken and emc_wdg_thread() reboots the device. */
 void usb_ep_event_cb(CyU3PUsbEpEvtType evType, CyU3PUSBSpeed_t usbSpeed, uint8_t epNum)
 {
+    (void)usbSpeed;
     if (evType == CYU3P_USBEP_NAK_EVT || evType == CYU3P_USBEP_SLP_EVT)
         return;
     CyU3PDebugPrint(2, "EP Event CB epNum : %d evtype : %d\r\n", epNum, evType);
@@ -360,11 +378,11 @@ CyBool_t usb_setup_cb(uint32_t setupdat0, uint32_t setupdat1)
     uint16_t readCount;
 
     isHandled = CyFalse;
-    bmRequestType = setupdat0;
+    bmRequestType = (unsigned char)setupdat0;
     bRequest = (setupdat0 & 0xff00) >> 8;
-    wValue = setupdat0 >> 16;
-    wIndex = setupdat1;
-    wLength = setupdat1 >> 16;
+    wValue = (unsigned short)(setupdat0 >> 16);
+    wIndex = (unsigned short)setupdat1;
+    wLength = (unsigned short)(setupdat1 >> 16);
 
     CyU3PDebugPrint(4, "REQ 0x%x 0x%x 0x%x 0x%x 0x%x\n", bmRequestType, bRequest, wValue, wIndex, wLength);
 
@@ -397,78 +415,78 @@ CyBool_t usb_setup_cb(uint32_t setupdat0, uint32_t setupdat1)
             switch (wIndex) {
             case EP_CTRL_IN:
                 CyU3PDebugPrint(4, "Reset endpoint1 IN\r\n");
-                CyU3PUsbSetEpNak(wIndex & 0xff, CyTrue);
+                CyU3PUsbSetEpNak(EP_CTRL_IN, CyTrue);
                 CyFx3BusyWait(125);
                 CyU3PDmaChannelReset(&ch_ctrl_in);
-                CyU3PUsbFlushEp(wIndex & 0xff);
-                CyU3PUsbResetEp(wIndex & 0xff);
+                CyU3PUsbFlushEp(EP_CTRL_IN);
+                CyU3PUsbResetEp(EP_CTRL_IN);
                 CyU3PDmaChannelSetXfer(&ch_ctrl_in, 0);
-                CyU3PUsbStall(wIndex & 0xff, CyFalse, CyTrue);
+                CyU3PUsbStall(EP_CTRL_IN, CyFalse, CyTrue);
                 isHandled = CyTrue;
                 CyU3PUsbAckSetup();
-                CyU3PUsbSetEpNak(wIndex & 0xff, CyFalse);
+                CyU3PUsbSetEpNak(EP_CTRL_IN, CyFalse);
                 CyU3PDebugPrint(4, "Reset endpoint1 IN OK\r\n");
                 break;
 
             case EP_CTRL_OUT:
                 CyU3PDebugPrint(4, "Reset endpoint1 OUT\r\n");
-                CyU3PUsbSetEpNak(wIndex & 0xff, CyTrue);
+                CyU3PUsbSetEpNak(EP_CTRL_OUT, CyTrue);
                 CyFx3BusyWait(125);
                 CyU3PDmaChannelReset(&ch_ctrl_out);
-                CyU3PUsbFlushEp(wIndex & 0xff);
-                CyU3PUsbResetEp(wIndex & 0xff);
+                CyU3PUsbFlushEp(EP_CTRL_OUT);
+                CyU3PUsbResetEp(EP_CTRL_OUT);
                 CyU3PDmaChannelSetXfer(&ch_ctrl_out, 0);
-                CyU3PUsbStall(wIndex & 0xff, CyFalse, CyTrue);
+                CyU3PUsbStall(EP_CTRL_OUT, CyFalse, CyTrue);
                 isHandled = CyTrue;
                 CyU3PUsbAckSetup();
-                CyU3PUsbSetEpNak(wIndex & 0xff, CyFalse);
+                CyU3PUsbSetEpNak(EP_CTRL_OUT, CyFalse);
                 CyU3PDebugPrint(4, "Reset endpoint1 OUT OK\r\n");
                 break;
 
             case EP_BULK_IN:
                 CyU3PDebugPrint(4, "Reset endpoint2 IN\r\n");
-                CyU3PUsbSetEpNak(wIndex & 0xff, CyTrue);
+                CyU3PUsbSetEpNak(EP_BULK_IN, CyTrue);
                 CyFx3BusyWait(125);
                 CyU3PDmaChannelReset(&ch_bulk_in);
-                CyU3PUsbFlushEp(wIndex & 0xff);
-                CyU3PUsbResetEp(wIndex & 0xff);
+                CyU3PUsbFlushEp(EP_BULK_IN);
+                CyU3PUsbResetEp(EP_BULK_IN);
                 CyU3PDmaChannelSetXfer(&ch_bulk_in, 0);
-                CyU3PUsbStall(wIndex & 0xff, CyFalse, CyTrue);
+                CyU3PUsbStall(EP_BULK_IN, CyFalse, CyTrue);
                 isHandled = CyTrue;
                 CyU3PUsbAckSetup();
-                CyU3PUsbSetEpNak(wIndex & 0xff, CyFalse);
+                CyU3PUsbSetEpNak(EP_BULK_IN, CyFalse);
                 CyU3PDebugPrint(4, "Reset endpoint2 IN OK\r\n");
                 break;
 
             case EP_BULK_OUT:
                 CyU3PDebugPrint(4, "Reset endpoint2 OUT\r\n");
-                CyU3PUsbSetEpNak(wIndex & 0xff, CyTrue);
+                CyU3PUsbSetEpNak(EP_BULK_OUT, CyTrue);
                 CyFx3BusyWait(125);
                 CyU3PDmaChannelReset(&ch_bulk_out);
-                CyU3PUsbFlushEp(wIndex & 0xff);
-                CyU3PUsbResetEp(wIndex & 0xff);
+                CyU3PUsbFlushEp(EP_BULK_OUT);
+                CyU3PUsbResetEp(EP_BULK_OUT);
                 CyU3PDmaChannelSetXfer(&ch_bulk_out, 0);
-                CyU3PUsbStall(wIndex & 0xff, CyFalse, CyTrue);
+                CyU3PUsbStall(EP_BULK_OUT, CyFalse, CyTrue);
                 isHandled = CyTrue;
                 CyU3PUsbAckSetup();
-                CyU3PUsbSetEpNak(wIndex & 0xff, CyFalse);
+                CyU3PUsbSetEpNak(EP_BULK_OUT, CyFalse);
                 CyU3PDebugPrint(4, "Reset endpoint2 OUT OK\r\n");
                 break;
 
             case EP_IMAGE_IN:
                 CyU3PDebugPrint(4, "Reset endpoint3 IN\r\n");
                 CyU3PGpifDisable(CyTrue);
-                CyU3PUsbSetEpNak(wIndex & 0xff, CyTrue);
+                CyU3PUsbSetEpNak(EP_IMAGE_IN, CyTrue);
                 CyFx3BusyWait(125);
                 CyU3PDmaChannelReset(&ch_image);
-                CyU3PUsbFlushEp(wIndex & 0xff);
-                CyU3PUsbResetEp(wIndex & 0xff);
+                CyU3PUsbFlushEp(EP_IMAGE_IN);
+                CyU3PUsbResetEp(EP_IMAGE_IN);
                 CyU3PDmaChannelSetXfer(&ch_image, 0);
-                CyU3PUsbStall(wIndex & 0xff, CyFalse, CyTrue);
+                CyU3PUsbStall(EP_IMAGE_IN, CyFalse, CyTrue);
                 isHandled = CyTrue;
                 CyU3PUsbAckSetup();
                 gpif_start();
-                CyU3PUsbSetEpNak(wIndex & 0xff, CyFalse);
+                CyU3PUsbSetEpNak(EP_IMAGE_IN, CyFalse);
                 CyU3PDebugPrint(4, "Reset endpoint3 IN OK\r\n");
                 ep83_halt_cleared = 1;
                 break;

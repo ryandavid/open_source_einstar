@@ -194,7 +194,8 @@ std::optional<PoseEstimate> MarkerMap::relocalize(const std::vector<Vec3>& fm, s
     std::optional<PoseEstimate> best;
     std::vector<std::pair<int, int>> ab, ac;
     for (int it = 0; it < params_.ransac_iterations; ++it) {
-        const int i = pick(rng), j = pick(rng), k = pick(rng);
+        const auto draw = [&] { return static_cast<std::size_t>(pick(rng)); };
+        const std::size_t i = draw(), j = draw(), k = draw();
         if (i == j || j == k || i == k) continue;
         const double dij = (fm[i] - fm[j]).norm(), dik = (fm[i] - fm[k]).norm(), djk = (fm[j] - fm[k]).norm();
         if (std::min({dij, dik, djk}) < params_.min_pair_mm) continue;
@@ -206,9 +207,9 @@ std::optional<PoseEstimate> MarkerMap::relocalize(const std::vector<Vec3>& fm, s
                 if (a2 != a || c == b) continue;
                 if (std::abs((markers_[static_cast<std::size_t>(b)].position - markers_[static_cast<std::size_t>(c)].position).norm() - djk) > tol)
                     continue;
-                std::vector<Correspondence> tri{{i, markers_[static_cast<std::size_t>(a)].id, fm[i], markers_[static_cast<std::size_t>(a)].position},
-                                                {j, markers_[static_cast<std::size_t>(b)].id, fm[j], markers_[static_cast<std::size_t>(b)].position},
-                                                {k, markers_[static_cast<std::size_t>(c)].id, fm[k], markers_[static_cast<std::size_t>(c)].position}};
+                std::vector<Correspondence> tri{{static_cast<int>(i), markers_[static_cast<std::size_t>(a)].id, fm[i], markers_[static_cast<std::size_t>(a)].position},
+                                                {static_cast<int>(j), markers_[static_cast<std::size_t>(b)].id, fm[j], markers_[static_cast<std::size_t>(b)].position},
+                                                {static_cast<int>(k), markers_[static_cast<std::size_t>(c)].id, fm[k], markers_[static_cast<std::size_t>(c)].position}};
                 auto T = fit_rigid(tri);
                 if (!T) continue;
                 // Verify against the whole frame.

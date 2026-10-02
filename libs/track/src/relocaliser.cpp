@@ -52,12 +52,12 @@ void GlobalRelocaliser::submit_model(std::vector<SurfacePoint> surface, std::int
     model_job_ = promise->get_future().share();
     model_due_ = due_frame;
     post(
-        [promise, surface = std::move(surface), p = params_]() mutable {
-            sort_canonical(surface);
+        [promise, sorted = std::move(surface), p = params_]() mutable {
+            sort_canonical(sorted);
             OrientedCloud cloud;
-            cloud.points.reserve(surface.size());
-            cloud.normals.reserve(surface.size());
-            for (const auto& sp : surface) {
+            cloud.points.reserve(sorted.size());
+            cloud.normals.reserve(sorted.size());
+            for (const auto& sp : sorted) {
                 cloud.points.push_back(sp.position);
                 cloud.normals.push_back(sp.normal);
             }
@@ -90,8 +90,8 @@ void GlobalRelocaliser::submit_query(std::shared_ptr<const FeatureModel> model, 
     query_job_ = promise->get_future();
     query_due_ = due_frame;
     post(
-        [promise, model = std::move(model), cloud = std::move(frame_cloud), p = params_, seed] {
-            promise->set_value(register_global(cloud, *model, p, seed));
+        [promise, feature_model = std::move(model), cloud = std::move(frame_cloud), p = params_, seed] {
+            promise->set_value(register_global(cloud, *feature_model, p, seed));
         },
         true);  // ahead of a model rebuild: a lost scanner is waiting on it
 }

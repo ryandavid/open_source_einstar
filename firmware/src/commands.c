@@ -99,10 +99,10 @@ uint8_t reply_status(uint32_t length, uint32_t expected, uint32_t replyLength, u
 
     if (length == expected) {
         *p++ = ST_OK;
-        *p++ = (replyLength >> 24) & 0xff;
-        *p++ = (replyLength >> 16) & 0xff;
-        *p++ = (replyLength >> 8) & 0xff;
-        *p = replyLength & 0xff;
+        *p++ = (uint8_t)(replyLength >> 24);
+        *p++ = (uint8_t)(replyLength >> 16);
+        *p++ = (uint8_t)(replyLength >> 8);
+        *p = (uint8_t)replyLength;
         result = ST_OK;
     } else if (length != expected) {
         *p++ = ST_BAD_LENGTH;
@@ -178,7 +178,7 @@ uint32_t command_dispatch(CyU3PDmaBuffer_t cmdBuf, uint8_t *resp)
 
     seq = cmd[PKT_SEQ];
     key = (unsigned short)(cmd[PKT_GROUP] << 8) + cmd[PKT_OPCODE];
-    length = (cmd[PKT_LENGTH] << 24) + (cmd[PKT_LENGTH + 1] << 16) + (cmd[PKT_LENGTH + 2] << 8) +
+    length = ((uint32_t)cmd[PKT_LENGTH] << 24) + ((uint32_t)cmd[PKT_LENGTH + 1] << 16) + ((uint32_t)cmd[PKT_LENGTH + 2] << 8) +
              cmd[PKT_LENGTH + 3];
 
     dst = resp;
@@ -460,7 +460,7 @@ uint32_t command_dispatch(CyU3PDmaBuffer_t cmdBuf, uint8_t *resp)
             cam = ARG(0);
             gain = sensor_get_gain(cam);
             gain_f = gain;
-            gain = gain_f;
+            gain = (unsigned short)gain_f;
             REPLY(0) = (unsigned char)(unsigned short)(gain >> 8);
             REPLY(1) = (unsigned char)gain;
             cam = 0;
@@ -472,7 +472,7 @@ uint32_t command_dispatch(CyU3PDmaBuffer_t cmdBuf, uint8_t *resp)
         if (reply_status(length, 3, 0, resp) == 0) {
             gain = ARG(1) << 8 | ARG(2);
             gain_f = gain;
-            gain = gain_f;
+            gain = (unsigned short)gain_f;
             cam = ARG(0);
             status = sensor_set_gain(cam, gain);
             if (status != 0) {

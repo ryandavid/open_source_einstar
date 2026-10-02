@@ -42,17 +42,33 @@ add_custom_command(OUTPUT "${HOST_BIN}/mkpackage"
     COMMAND ${FX3_HOST_CC} -O2 -Wall -o "${HOST_BIN}/mkpackage" "${CMAKE_CURRENT_SOURCE_DIR}/tools/mkpackage.c"
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tools/mkpackage.c" COMMENT "Building host tool mkpackage" VERBATIM)
 
-# ---- compile flags (the SDK's fx3_debug set)
+# ---- compile flags (the SDK's fx3_debug set; the SDK's headers are system headers)
 add_library(fx3_flags INTERFACE)
 target_compile_definitions(fx3_flags INTERFACE TX_ENABLE_EVENT_TRACE DEBUG CYU3P_FX3=1 __CYU3P_TX__=1)
-target_include_directories(fx3_flags INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include" "${SDK}/inc")
+target_include_directories(fx3_flags INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_include_directories(fx3_flags SYSTEM INTERFACE "${SDK}/inc")
 target_compile_options(fx3_flags INTERFACE -g ${FX3_OPT} -Wall -mcpu=arm926ej-s -marm -mthumb-interwork
                                            -ffunction-sections -fdata-sections -fno-strict-aliasing)
+
+# Our sources' warnings: the host build's set (cmake/EinstarWarnings.cmake) as far as gcc has them
+# (-Wmaybe-uninitialized for clang's -Wconditional-uninitialized). The SDK's own sources keep its flags.
+# Every target builds with -Werror; `cmake --compile-no-warning-as-error` builds anyway.
+set(FX3_WARNINGS -Wall -Wextra -Wpedantic
+                 -Wconversion -Wsign-conversion
+                 -Wuninitialized -Wmaybe-uninitialized
+                 -Wmissing-field-initializers
+                 -Wshadow
+                 -Wswitch-enum -Wimplicit-fallthrough
+                 -Wno-expansion-to-defined)
+set(CMAKE_COMPILE_WARNING_AS_ERROR ON)
 
 # the SDK's cyfxtx.c (heap / DMA buffers), used as-is
 set(APP_SOURCES src/gpif_config.c src/globals.c src/sync.c src/version.c src/boot.c src/usb.c src/app.c
                 src/sensor_i2c.c src/usb_descriptors.c "${SDK}/fw_build/cyfxtx.c" src/spi_flash.c
                 src/gpio_led.c src/commands.c src/update.c src/common.c)
+set(OUR_SOURCES ${APP_SOURCES})
+list(FILTER OUR_SOURCES INCLUDE REGEX "^src/")
+set_source_files_properties(${OUR_SOURCES} PROPERTIES COMPILE_OPTIONS "${FX3_WARNINGS}")
 
 set(LIBS "${SDK}/lib/libcyu3sport.a" "${SDK}/lib/libcyu3lpp.a" "${SDK}/lib/libcyfxapi.a"
          "${SDK}/lib/libcyu3threadx.a" c gcc)

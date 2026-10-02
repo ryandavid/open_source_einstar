@@ -64,7 +64,7 @@ DepthFrame make_depth_frame(const ImageF32& depth, const Intrinsics& k, double m
 void filter_depth_edges(ImageF32& depth, const DepthEdgeFilter& p) {
     const int w = depth.width(), h = depth.height();
     if (w < 3 || h < 3 || (p.radius_px <= 0 && p.radius_rim_px <= 0)) return;
-    std::vector<std::uint8_t> step(static_cast<std::size_t>(w) * h, 0), rim(static_cast<std::size_t>(w) * h, 0);
+    ImageU8 step(w, h, 0), rim(w, h, 0);
     tbb::parallel_for(0, h, [&](int y) {
         for (int x = 0; x < w; ++x) {
             const float z = depth(x, y);
@@ -79,22 +79,22 @@ void filter_depth_edges(ImageF32& depth, const DepthEdgeFilter& p) {
                     if (n <= 0) is_rim = true;
                     else if (std::abs(n - z) > jump) is_step = true;
                 }
-            step[static_cast<std::size_t>(y) * w + x] = is_step;
-            rim[static_cast<std::size_t>(y) * w + x] = is_rim;
+            step(x, y) = is_step;
+            rim(x, y) = is_rim;
         }
     });
     // Separable max filter of each mask, then drop the pixels within the radius.
-    auto dilate = [&](std::vector<std::uint8_t>& m, int r) {
+    auto dilate = [&](ImageU8& m, int r) {
         if (r <= 0) return;
-        std::vector<std::uint8_t> tmp(m.size(), 0);
+        ImageU8 tmp(w, h, 0);
         tbb::parallel_for(0, h, [&](int y) {
             for (int x = 0; x < w; ++x) {
                 std::uint8_t v = 0;
                 for (int d = -r; d <= r && !v; ++d) {
                     const int xx = std::clamp(x + d, 0, w - 1);
-                    v = m[static_cast<std::size_t>(y) * w + xx];
+                    v = m(xx, y);
                 }
-                tmp[static_cast<std::size_t>(y) * w + x] = v;
+                tmp(x, y) = v;
             }
         });
         tbb::parallel_for(0, h, [&](int y) {
@@ -102,30 +102,29 @@ void filter_depth_edges(ImageF32& depth, const DepthEdgeFilter& p) {
                 std::uint8_t v = 0;
                 for (int d = -r; d <= r && !v; ++d) {
                     const int yy = std::clamp(y + d, 0, h - 1);
-                    v = tmp[static_cast<std::size_t>(yy) * w + x];
+                    v = tmp(x, yy);
                 }
-                m[static_cast<std::size_t>(y) * w + x] = v;
+                m(x, y) = v;
             }
         });
     };
     if (p.radius_px > 0) dilate(step, p.radius_px - 1);  // radius 1 = the step pixels themselves
-    else std::ranges::fill(step, std::uint8_t{0});
+    else step.fill(0);
     if (p.radius_rim_px > 0) dilate(rim, p.radius_rim_px - 1);
-    else std::ranges::fill(rim, std::uint8_t{0});
+    else rim.fill(0);
     for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x)
-            if (step[static_cast<std::size_t>(y) * w + x] || rim[static_cast<std::size_t>(y) * w + x]) depth(x, y) = 0.0f;
+            if (step(x, y) || rim(x, y)) depth(x, y) = 0.0f;
     if (p.min_region_px <= 0) return;
     // Speckle filter: flood fill over 4-neighbours whose depths agree; small regions are dropped.
-    std::vector<int> label(static_cast<std::size_t>(w) * h, -1);
-    std::vector<int> stack, members;
+    ImageU8 seen(w, h, 0);
+    std::vector<int> stack, members;  // pixels as y * w + x
     for (int y0 = 0; y0 < h; ++y0)
         for (int x0 = 0; x0 < w; ++x0) {
-            const std::size_t i0 = static_cast<std::size_t>(y0) * w + x0;
-            if (label[i0] >= 0 || depth(x0, y0) <= 0) continue;
+            if (seen(x0, y0) || depth(x0, y0) <= 0) continue;
             members.clear();
-            stack.assign(1, static_cast<int>(i0));
-            label[i0] = 1;
+            stack.assign(1, y0 * w + x0);
+            seen(x0, y0) = 1;
             while (!stack.empty()) {
                 const int i = stack.back();
                 stack.pop_back();
@@ -136,12 +135,11 @@ void filter_depth_edges(ImageF32& depth, const DepthEdgeFilter& p) {
                 const int nx[4] = {x - 1, x + 1, x, x}, ny[4] = {y, y, y - 1, y + 1};
                 for (int k = 0; k < 4; ++k) {
                     if (nx[k] < 0 || ny[k] < 0 || nx[k] >= w || ny[k] >= h) continue;
-                    const std::size_t j = static_cast<std::size_t>(ny[k]) * w + nx[k];
-                    if (label[j] >= 0) continue;
+                    if (seen(nx[k], ny[k])) continue;
                     const float zn = depth(nx[k], ny[k]);
                     if (zn <= 0 || std::abs(zn - z) > jump) continue;
-                    label[j] = 1;
-                    stack.push_back(static_cast<int>(j));
+                    seen(nx[k], ny[k]) = 1;
+                    stack.push_back(ny[k] * w + nx[k]);
                 }
             }
             if (static_cast<int>(members.size()) < p.min_region_px)
@@ -162,7 +160,7 @@ void filter_grazing(DepthFrame& f, const GrazingFilter& p) {
     };
     const double cos_max = p.max_view_angle_deg > 0 ? std::cos(p.max_view_angle_deg * M_PI / 180.0) : -1;
     const double cos_rim = std::cos(p.rim_angle_deg * M_PI / 180.0);
-    std::vector<std::uint8_t> drop(static_cast<std::size_t>(w) * h, 0), steep_rim(static_cast<std::size_t>(w) * h, 0);
+    ImageU8 drop(w, h, 0), steep_rim(w, h, 0);
     tbb::parallel_for(0, h, [&](int y) {
         for (int x = 0; x < w; ++x) {
             if (!valid(x, y)) continue;
@@ -172,7 +170,7 @@ void filter_grazing(DepthFrame& f, const GrazingFilter& p) {
             const double c = facing(x, y);
             // Inside the valid region a missing normal means the neighbours are too far apart: a depth
             // step or a surface too steep to measure.
-            if (cos_max > -1 && ((c >= 0 && c < cos_max) || (c < 0 && !rim))) drop[static_cast<std::size_t>(y) * w + x] = 1;
+            if (cos_max > -1 && ((c >= 0 && c < cos_max) || (c < 0 && !rim))) drop(x, y) = 1;
             if (p.rim_px <= 0 || !rim) continue;
             // Rim pixels have no normal of their own (a neighbour is missing): use the nearest one inside.
             double best = -1;
@@ -185,7 +183,7 @@ void filter_grazing(DepthFrame& f, const GrazingFilter& p) {
                     const int d = std::max(std::abs(dx), std::abs(dy));
                     if (cc >= 0 && d < best_d) best = cc, best_d = d;
                 }
-            if (best < 0 || best < cos_rim) steep_rim[static_cast<std::size_t>(y) * w + x] = 1;  // unknown counts as steep
+            if (best < 0 || best < cos_rim) steep_rim(x, y) = 1;  // unknown counts as steep
         }
     });
     // Widen the steep rim to rim_px pixels, into the valid region.
@@ -193,18 +191,18 @@ void filter_grazing(DepthFrame& f, const GrazingFilter& p) {
         auto next = steep_rim;
         for (int y = 0; y < h; ++y)
             for (int x = 0; x < w; ++x) {
-                if (steep_rim[static_cast<std::size_t>(y) * w + x] || !valid(x, y)) continue;
+                if (steep_rim(x, y) || !valid(x, y)) continue;
                 for (int dy = -1; dy <= 1; ++dy)
                     for (int dx = -1; dx <= 1; ++dx) {
                         const int xx = x + dx, yy = y + dy;
-                        if (xx >= 0 && yy >= 0 && xx < w && yy < h && steep_rim[static_cast<std::size_t>(yy) * w + xx]) next[static_cast<std::size_t>(y) * w + x] = 1;
+                        if (xx >= 0 && yy >= 0 && xx < w && yy < h && steep_rim(xx, yy)) next(x, y) = 1;
                     }
             }
-        steep_rim.swap(next);
+        steep_rim = std::move(next);
     }
     for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x)
-            if (drop[static_cast<std::size_t>(y) * w + x] || steep_rim[static_cast<std::size_t>(y) * w + x]) {
+            if (drop(x, y) || steep_rim(x, y)) {
                 f.points(x, y) = Vec3f::Zero();
                 f.normals(x, y) = Vec3f::Zero();
                 if (!f.weights.empty()) f.weights(x, y) = 0.0f;

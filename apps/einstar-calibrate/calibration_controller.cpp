@@ -479,21 +479,21 @@ void CalibrationController::solve() {
         const auto& ref = factory_ ? factory_ : flash_;
         if (ref) so.fixed_distortion = std::array{ref->left.dist, ref->right.dist};
     }
-    solver_ = std::jthread([this, caps = std::move(caps), width, height, so, flash = flash_, factory = factory_](std::stop_token) {
+    solver_ = std::jthread([this, captures = std::move(caps), width, height, so, flash = flash_, factory = factory_](std::stop_token) {
         SolveState out;
         Stopwatch sw;
-        auto r = calibrate::solve_stereo(caps, width, height, {}, so);
+        auto r = calibrate::solve_stereo(captures, width, height, {}, so);
         out.solve_ms = sw.elapsed_ms();
         if (!r) {
             out.error = r.error().message;
         } else {
             out.ours = std::move(*r);
             if (flash) {
-                if (auto e = calibrate::evaluate_calibration(*flash, caps)) out.flash = std::move(*e);
+                if (auto e = calibrate::evaluate_calibration(*flash, captures)) out.flash = std::move(*e);
                 out.vs_flash = calibrate::compare_calibrations(*flash, out.ours->rig);
             }
             if (factory) {
-                if (auto e = calibrate::evaluate_calibration(*factory, caps)) out.factory = std::move(*e);
+                if (auto e = calibrate::evaluate_calibration(*factory, captures)) out.factory = std::move(*e);
                 out.vs_factory = calibrate::compare_calibrations(*factory, out.ours->rig);
             }
         }

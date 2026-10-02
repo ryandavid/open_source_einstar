@@ -41,7 +41,8 @@ target_link_libraries(metal_cpp INTERFACE
 if(EINSTAR_BUILD_TESTS)
   FetchContent_Declare(Catch2
     URL https://github.com/catchorg/Catch2/archive/refs/tags/v3.8.1.tar.gz
-    DOWNLOAD_EXTRACT_TIMESTAMP ON)
+    DOWNLOAD_EXTRACT_TIMESTAMP ON
+    SYSTEM)
   FetchContent_MakeAvailable(Catch2)
   list(APPEND CMAKE_MODULE_PATH ${catch2_SOURCE_DIR}/extras)
 endif()
@@ -53,7 +54,8 @@ if(EINSTAR_BUILD_APP)
   set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
   FetchContent_Declare(glfw
     URL https://github.com/glfw/glfw/archive/refs/tags/3.4.tar.gz
-    DOWNLOAD_EXTRACT_TIMESTAMP ON)
+    DOWNLOAD_EXTRACT_TIMESTAMP ON
+    SYSTEM)
   FetchContent_MakeAvailable(glfw)
 
   FetchContent_Declare(imgui
@@ -68,7 +70,7 @@ if(EINSTAR_BUILD_APP)
     ${imgui_SOURCE_DIR}/imgui_demo.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_metal.mm)
-  target_include_directories(imgui PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
+  target_include_directories(imgui SYSTEM PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
   target_link_libraries(imgui PUBLIC glfw "-framework Metal" "-framework QuartzCore" "-framework Cocoa")
   target_compile_options(imgui PRIVATE -fobjc-arc -w)
 endif()

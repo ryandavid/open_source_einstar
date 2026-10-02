@@ -13,6 +13,7 @@ void flash_unlock(void) { CyU3PSemaphorePut(&flash_sem); }
  * stays 0. */
 void emc_wdg_timer_cb(uint32_t arg)
 {
+    (void)arg;  /* timer callback argument, unused */
     if (app_state.update_active != 0)
         return;
     emc_wdg_progress++;

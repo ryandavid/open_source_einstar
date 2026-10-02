@@ -180,11 +180,11 @@ TriangleMesh extract_mesh(const track::Volume& volume, const ExtractParams& para
                         if (fn.dot(vn) < 0) std::swap(v[1], v[3]);
                         // Split along the diagonal whose triangles agree best with the surface normals
                         // (the shorter diagonal can fold where the surface is tangent to a grid plane).
-                        auto agreement = [&](std::uint32_t a, std::uint32_t b, std::uint32_t c) {
-                            const Vec3f n = (mesh.vertices[b] - mesh.vertices[a]).cross(mesh.vertices[c] - mesh.vertices[a]);
+                        auto agreement = [&](std::uint32_t i0, std::uint32_t i1, std::uint32_t i2) {
+                            const Vec3f n = (mesh.vertices[i1] - mesh.vertices[i0]).cross(mesh.vertices[i2] - mesh.vertices[i0]);
                             const float l = n.norm();
                             if (l < 1e-12f) return -1.0f;
-                            return (n / l).dot((mesh.normals[a] + mesh.normals[b] + mesh.normals[c]).normalized());
+                            return (n / l).dot((mesh.normals[i0] + mesh.normals[i1] + mesh.normals[i2]).normalized());
                         };
                         const float d02 = std::min(agreement(v[0], v[1], v[2]), agreement(v[0], v[2], v[3]));
                         const float d13 = std::min(agreement(v[0], v[1], v[3]), agreement(v[1], v[2], v[3]));

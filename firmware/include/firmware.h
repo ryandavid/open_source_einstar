@@ -124,8 +124,7 @@ int bulk_dispatch(void *req, void *resp);
 uint32_t fpga_load_addr_get(void);
 
 /* ---- SDK ---------------------------------------------------------------------------------------- */
-/* In the library but not declared in the SDK 1.3.4 headers. The vendor called it undeclared
- * (implicitly returning int), which is what keeps their code; declared the same way. */
-extern int CyU3PDmaChannelSendData(CyU3PDmaChannel *handle, uint8_t *buffer, uint16_t count);
+/* In the library but not declared in the SDK 1.3.4 headers (the vendor called it undeclared). */
+extern CyU3PReturnStatus_t CyU3PDmaChannelSendData(CyU3PDmaChannel *handle, uint8_t *buffer, uint16_t count);
 
 #endif

@@ -77,7 +77,7 @@ void draw_scanner(ImDrawList* dl, const ViewCam& c, const SE3& B_S, ImU32 col, f
     auto box = [&](double x0, double x1, double y0, double y1, double z0, double z1) {
         const std::array<Vec3, 8> v = {at(x0, y0, z0), at(x1, y0, z0), at(x1, y1, z0), at(x0, y1, z0),
                                        at(x0, y0, z1), at(x1, y0, z1), at(x1, y1, z1), at(x0, y1, z1)};
-        for (int i = 0; i < 4; ++i) {
+        for (std::size_t i = 0; i < 4; ++i) {
             line3(dl, c, v[i], v[(i + 1) % 4], col, w);
             line3(dl, c, v[i + 4], v[(i + 1) % 4 + 4], col, w);
             line3(dl, c, v[i], v[i + 4], col, w);

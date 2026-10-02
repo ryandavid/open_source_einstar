@@ -134,11 +134,8 @@ int main(int argc, char** argv) {
                 truth(x, y) = static_cast<float>(R.geometry.disparity_from_depth(z_rect) / 4.0);
             }
         depth::SgmParams sp;
-        const auto& g = R.geometry;
         sp.min_disparity = std::max(0, static_cast<int>(g.disparity_from_depth(700) / 4) - 2);
         sp.num_disparities = static_cast<int>(g.disparity_from_depth(150) / 4) - sp.min_disparity + 4;
-        const auto q_l = depth::downsample2(d.rectified_left.view());
-        const auto q_r = depth::downsample2(d.rectified_right.view());
         struct V { const char* name; int p1, p2, cr; bool eight, slant; float uniq; int lr; };
         for (const V var : {V{"base", 8, 96, 2, false, false, 0.9f, 1}, V{"slant", 8, 96, 2, false, true, 0.9f, 1},
                             V{"slant p1=2", 2, 96, 2, false, true, 0.9f, 1}, V{"slant 8path", 8, 96, 2, true, true, 0.9f, 1},
@@ -153,7 +150,7 @@ int main(int argc, char** argv) {
             for (int x = 0; x < 320; ++x) {
                 if (truth(x, y) < 0) continue;
                 ++t;
-                if (x - truth(x, y) < 3) continue;
+                if (static_cast<float>(x) - truth(x, y) < 3.0f) continue;
                 ++matchable;
                 if (sgm(x, y) < 0) continue;
                 ++v;
@@ -165,9 +162,9 @@ int main(int argc, char** argv) {
             for (int y = 0; y < 256; ++y)
                 for (int x = 0; x < 320; ++x) {
                     std::uint8_t c[3] = {0, 0, 0};
-                    const std::uint8_t g = q_l(x, y) / 2;
-                    c[0] = c[1] = c[2] = g;
-                    if (truth(x, y) >= 0 && x - truth(x, y) >= 3) {
+                    const std::uint8_t grey = q_l(x, y) / 2;
+                    c[0] = c[1] = c[2] = grey;
+                    if (truth(x, y) >= 0 && static_cast<float>(x) - truth(x, y) >= 3.0f) {
                         if (sgm(x, y) < 0) { c[0] = 40; c[1] = 60; c[2] = 220; }
                         else if (std::abs(sgm(x, y) - truth(x, y)) < 1.0f) { c[0] = 40; c[1] = 200; c[2] = 60; }
                         else { c[0] = 230; c[1] = 40; c[2] = 40; }
@@ -209,7 +206,7 @@ int main(int argc, char** argv) {
                 ImageU8 vis(sgm.width(), sgm.height(), 0);
                 for (int y = 0; y < vis.height(); ++y)
                     for (int x = 0; x < vis.width(); ++x)
-                        if (sgm(x, y) >= 0) vis(x, y) = static_cast<std::uint8_t>(std::clamp((sgm(x, y) - sp.min_disparity) * 255.0f / sp.num_disparities, 1.0f, 255.0f));
+                        if (sgm(x, y) >= 0) vis(x, y) = static_cast<std::uint8_t>(std::clamp((sgm(x, y) - static_cast<float>(sp.min_disparity)) * 255.0f / static_cast<float>(sp.num_disparities), 1.0f, 255.0f));
                 pgm(out + "/sgm_raw.pgm", vis);
                 pgm(out + "/q_left.pgm", q_l);
                 pgm(out + "/q_right.pgm", q_r);

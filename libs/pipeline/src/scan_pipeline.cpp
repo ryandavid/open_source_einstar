@@ -263,7 +263,7 @@ GlobalMarkerReport ScanPipeline::run_bundle_adjustment() {
 }
 
 void ScanPipeline::optimize_global_markers(std::function<void(const GlobalMarkerReport&)> done) {
-    post([this, done = std::move(done)] {
+    post([this, on_done = std::move(done)] {
         const auto rep = run_bundle_adjustment();
         if (rep.error.empty()) {
             // Tracking restarts on the optimised map (relocalising against it on the next frame).
@@ -273,7 +273,7 @@ void ScanPipeline::optimize_global_markers(std::function<void(const GlobalMarker
         } else {
             log::warn("global markers: {}", rep.error);
         }
-        if (done) done(rep);
+        if (on_done) on_done(rep);
     });
 }
 
@@ -293,28 +293,28 @@ void ScanPipeline::clear_global_markers() {
 }
 
 void ScanPipeline::set_global_markers(std::vector<markers::MapMarker> map) {
-    post([this, map = std::move(map)]() mutable {
-        for (auto& m : map) m.fixed = true;
+    post([this, fixed = std::move(map)]() mutable {
+        for (auto& m : fixed) m.fixed = true;
         {
             std::lock_guard lock(global_mutex_);
-            global_map_ = map;
+            global_map_ = fixed;
         }
         tracker_.reset(false);
-        tracker_.set_marker_map(std::move(map));
+        tracker_.set_marker_map(std::move(fixed));
         restart_recording(false);  // the loaded map defines a new world frame
         apply_phase();
     });
 }
 
 void ScanPipeline::set_recording_directory(std::string directory) {
-    post([this, directory = std::move(directory)] {
+    post([this, dir = std::move(directory)] {
         {
             std::lock_guard lock(recorder_mutex_);
-            if (directory == record_dir_) return;
+            if (dir == record_dir_) return;
         }
         restart_recording(false);
         std::lock_guard lock(recorder_mutex_);  // push() reads it on the device thread
-        record_dir_ = directory;
+        record_dir_ = dir;
     });
 }
 

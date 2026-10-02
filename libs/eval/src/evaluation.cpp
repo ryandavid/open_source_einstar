@@ -120,7 +120,7 @@ MeshComparison compare_mesh(const recon::TriangleMesh& mesh, const fixtures::Mes
         for (const auto v : t) ours.vertices.push_back(mesh.vertices[v]);
     const fixtures::MeshDistance to_ours(ours);
     std::vector<double> acc;
-    int far = 0;
+    std::size_t far = 0;
     const std::size_t step = std::max<std::size_t>(1, mesh.vertices.size() / 200000);
     for (std::size_t v = 0; v < mesh.vertices.size(); v += step) {
         if (auto d = to_ref.distance(mesh.vertices[v], radius_mm)) acc.push_back(*d);

@@ -19,7 +19,7 @@ int update_begin(pkt_req_t *req, pkt_reply_t *reply)
 
     reply->length_be = 0;
 
-    CyU3PMemCopy((uint8_t *)&size, &req->arg0 + 1, 4);
+    CyU3PMemCopy((uint8_t *)&size, req->payload + 1, 4);
 
     size = BSWAP32(size);
 
@@ -55,7 +55,7 @@ int update_bytes_received = 0;
 
 int update_write_page(pkt_req_t *req, pkt_reply_t *reply)
 {
-    int i;
+    unsigned int i;
     unsigned char sum2;
     int result;
     unsigned int reqLen;
@@ -78,7 +78,7 @@ int update_write_page(pkt_req_t *req, pkt_reply_t *reply)
         goto cleanup_error;
     }
 
-    data = &req->arg0 + 1;
+    data = req->payload + 1;
     sum1 = data[reqLen];
 
     flash_lock();
@@ -180,7 +180,7 @@ int user_page_read(pkt_req_t *req, pkt_reply_t *reply)
     }
 
     flash_lock();
-    flash_rw_pages((((int)page + USER_AREA_SECTOR) << FLASH_SECTOR_SHIFT) / FLASH_PAGE_SIZE,
+    flash_rw_pages((unsigned short)(((page + USER_AREA_SECTOR) << FLASH_SECTOR_SHIFT) / FLASH_PAGE_SIZE),
                    FLASH_SECTOR_SIZE, reply->data, 0, 1);
     flash_unlock();
 
@@ -201,7 +201,7 @@ int user_page_write(pkt_req_t *req, pkt_reply_t *reply)
         return -1;
     }
 
-    CyU3PMemCopy((unsigned char *)&page, (unsigned char *)&req->page_be, 2);
+    CyU3PMemCopy((unsigned char *)&page, req->payload, 2);
 
     page = (page >> 8) | (page << 8);
 
@@ -214,7 +214,7 @@ int user_page_write(pkt_req_t *req, pkt_reply_t *reply)
     flash_erase_sector((unsigned short)(page + USER_AREA_SECTOR), 0);
 
     flash_rw_pages((unsigned short)(((page + USER_AREA_SECTOR) << FLASH_SECTOR_SHIFT) / FLASH_PAGE_SIZE),
-                   FLASH_SECTOR_SIZE, (uint8_t *)(&req->page_be + 1), 0, 0);
+                   FLASH_SECTOR_SIZE, req->payload + 2, 0, 0);
 
     flash_unlock();
     return ret;
@@ -253,7 +253,7 @@ int bulk_dispatch(void *req, void *resp_buf)
         return -1;
 
     if (p->seq == bulk_last_seq) {
-        bulk_last_seq = -1;
+        bulk_last_seq = SEQ_NONE;
         return -1;
     }
     bulk_last_seq = p->seq;
@@ -299,12 +299,11 @@ int bulk_dispatch(void *req, void *resp_buf)
 /* Flash address of the FPGA bitstream to load: the slot the boot record boots. */
 uint32_t fpga_load_addr_get(void)
 {
-    int addr = 0;
-    boot_record_t *p = 0;
-    unsigned char buf[FLASH_PAGE_SIZE] = {0};
+    uint32_t addr = 0;
+    boot_record_t rec = {0};
+    const boot_record_t *p = &rec;
 
-    flash_rw_pages(BOOT_RECORD_PAGE, FLASH_PAGE_SIZE, buf, 0, 1);
-    p = (boot_record_t *)buf;
+    flash_rw_pages(BOOT_RECORD_PAGE, FLASH_PAGE_SIZE, (uint8_t *)&rec, 0, 1);  /* the record is a page and more */
 
     CyU3PDebugPrint(4, "uiNewAppAddr: 0x%x, uiOldAppAddr: 0x%x, ucIsBootNewApp: 0x%x\r\n", p->new_app, p->old_app, p->boot_new);
 

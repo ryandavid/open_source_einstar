@@ -2431,7 +2431,7 @@ ImageU8 render_mesh_in_frame(const recon::TriangleMesh& mesh, int width, const V
     const double scale = (width - 20) / std::max(1e-6, hi.x() - lo.x());
     const int height = std::max(20, static_cast<int>((hi.y() - lo.y()) * scale) + 20);
     ImageU8 img(width, height, 24);
-    std::vector<double> zbuf(static_cast<std::size_t>(width) * height, 1e18);
+    Image<double> zbuf(width, height, 1e18);
     auto px = [&](const Vec3& q) { return Vec2((q.x() - lo.x()) * scale + 10, (q.y() - lo.y()) * scale + 10); };
     for (const auto& t : mesh.triangles) {
         const Vec3 &a = p[t[0]], &b = p[t[1]], &c = p[t[2]];
@@ -2453,7 +2453,7 @@ ImageU8 render_mesh_in_frame(const recon::TriangleMesh& mesh, int width, const V
                 const double w2 = 1 - w0 - w1;
                 if (w0 < 0 || w1 < 0 || w2 < 0) continue;
                 const double z = w0 * a.z() + w1 * b.z() + w2 * c.z();
-                auto& zb = zbuf[static_cast<std::size_t>(y) * width + x];
+                auto& zb = zbuf(x, y);
                 if (z < zb) zb = z, img(x, y) = shade;
             }
     }

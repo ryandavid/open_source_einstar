@@ -4,6 +4,7 @@
 #include <cmath>
 #include <limits>
 #include <mutex>
+#include <optional>
 
 #include <tbb/concurrent_vector.h>
 #include <tbb/parallel_for.h>
@@ -56,11 +57,23 @@ bool trilinear_sample(VoxelReader& r, const Vec3f& g, float& out) {
 }
 
 // Trilinear where all 8 neighbours are observed, otherwise the nearest observed voxel.
-bool robust_sample(VoxelReader& r, const Vec3f& g, float& out) {
-    if (trilinear_sample(r, g, out)) return true;
-    float w;
-    return r.get(static_cast<int>(std::floor(g.x())), static_cast<int>(std::floor(g.y())), static_cast<int>(std::floor(g.z())),
-                 out, w);
+std::optional<float> robust_sample(VoxelReader& r, const Vec3f& g) {
+    float sdf, w;
+    if (trilinear_sample(r, g, sdf)) return sdf;
+    if (r.get(static_cast<int>(std::floor(g.x())), static_cast<int>(std::floor(g.y())), static_cast<int>(std::floor(g.z())), sdf, w))
+        return sdf;
+    return std::nullopt;
+}
+
+// The SDF gradient at g by central differences, if all six neighbours have a sample.
+std::optional<Vec3f> sdf_gradient(VoxelReader& r, const Vec3f& g) {
+    Vec3f n;
+    for (int axis = 0; axis < 3; ++axis) {
+        const auto lo = robust_sample(r, g - Vec3f::Unit(axis)), hi = robust_sample(r, g + Vec3f::Unit(axis));
+        if (!lo || !hi) return std::nullopt;
+        n[axis] = *hi - *lo;
+    }
+    return n;
 }
 
 }  // namespace
@@ -198,7 +211,7 @@ std::optional<float> TsdfVolume::sample_sdf(const Vec3f& world) const {
 RaycastResult TsdfVolume::raycast(const SE3& T_world_camera, const Intrinsics& k) const {
     std::shared_lock lock(mutex_);
     RaycastResult out{k, Image<Vec3f>(k.width, k.height, Vec3f::Zero()), Image<Vec3f>(k.width, k.height, Vec3f::Zero()),
-                      Image<std::uint8_t>(k.width, k.height, 0)};
+                      Image<std::uint8_t>(k.width, k.height, 0), nullptr};  // CPU volume: no device data
     const Eigen::Matrix4f T_cw = T_world_camera.inverse().matrix().cast<float>();
     const Eigen::Matrix3f R_wc = T_world_camera.linear().cast<float>();
     const Vec3f origin = T_world_camera.translation().cast<float>();
@@ -250,26 +263,21 @@ RaycastResult TsdfVolume::raycast(const SE3& T_world_camera, const Intrinsics& k
             bool have_prev = false;
             while (t < t_end) {
                 const Vec3f p = origin + t * dir;
-                float s;
-                if (!robust_sample(r, p * inv_voxel, s)) {
+                const auto sample = robust_sample(r, p * inv_voxel);
+                if (!sample) {
                     have_prev = false;
                     t += params_.voxel_mm;
                     continue;
                 }
+                const float s = *sample;
                 if (have_prev && prev_sdf > 0 && s <= 0) {
                     const float t_hit = prev_t + (t - prev_t) * prev_sdf / (prev_sdf - s);
                     const Vec3f hit = origin + t_hit * dir;
-                    // Gradient by central differences.
-                    const Vec3f g = hit * inv_voxel;
-                    float sx0, sx1, sy0, sy1, sz0, sz1;
-                    if (robust_sample(r, g - Vec3f(1, 0, 0), sx0) && robust_sample(r, g + Vec3f(1, 0, 0), sx1) &&
-                        robust_sample(r, g - Vec3f(0, 1, 0), sy0) && robust_sample(r, g + Vec3f(0, 1, 0), sy1) &&
-                        robust_sample(r, g - Vec3f(0, 0, 1), sz0) && robust_sample(r, g + Vec3f(0, 0, 1), sz1)) {
-                        Vec3f n(sx1 - sx0, sy1 - sy0, sz1 - sz0);
-                        const float len = n.norm();
+                    if (const auto n = sdf_gradient(r, hit * inv_voxel)) {
+                        const float len = n->norm();
                         if (len > 1e-6f) {
                             out.points(u, v) = hit;
-                            out.normals(u, v) = n / len;
+                            out.normals(u, v) = *n / len;
                             out.valid(u, v) = 1;
                         }
                     }

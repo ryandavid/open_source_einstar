@@ -63,7 +63,7 @@ TEST_CASE("scene renderer draws splats, markers and lines offscreen") {
 
     std::vector<std::uint8_t> px(W * H * 4);
     color->getBytes(px.data(), W * 4, MTL::Region(0, 0, W, H), 0);
-    auto at = [&](int x, int y) { return &px[(y * W + x) * 4]; };  // BGRA
+    auto at = [&](int x, int y) { return &px[static_cast<std::size_t>(y * W + x) * 4]; };  // BGRA
     // Centre of the image shows the red patch (lit, so red dominates).
     const auto* c = at(W / 2, H / 2);
     CHECK(c[2] > 100);

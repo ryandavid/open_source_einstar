@@ -151,6 +151,7 @@ int main(int argc, char** argv) {
                 counts[band][2] += err > 2.0;
             }
     }
+    const auto pct = [](long n, long total) { return 100.0 * static_cast<double>(n) / static_cast<double>(std::max(1L, total)); };
     long tot = 0, g5 = 0, g2 = 0;
     for (int k = 0; k < 3; ++k) tot += kind[k][0], g5 += kind[k][1], g2 += kind[k][2];
     std::println("all: {} pixels, {} > 0.5 mm, {} > 2 mm", tot, g5, g2);
@@ -158,13 +159,13 @@ int main(int argc, char** argv) {
                  disp_hist[0], disp_hist[1], disp_hist[2], disp_hist[3], disp_z[0], disp_z[1], disp_z[2], disp_z[3]);
     for (int b = 0; b < 6; ++b)
         std::println("texture std {:2}-{:2}: good {:7}, bad (>=1 px) {:6} ({:.1f}% bad)", b * 5, b == 5 ? 255 : b * 5 + 5, tex[0][b], tex[1][b],
-                     100.0 * tex[1][b] / std::max(1L, tex[0][b] + tex[1][b]));
+                     pct(tex[1][b], tex[0][b] + tex[1][b]));
     std::println("gross: {} too close, {} too far; {} within 6 px of a true silhouette, {} not; {} rays hit nothing", signed_hist[0], signed_hist[1],
                  sil_hist[1], sil_hist[0], no_hit);
     for (int k = 0; k < 3; ++k)
         std::println("{:12}: {:8} pixels, {:5.2f}% > 0.5 mm, {:5.2f}% > 2 mm", k == 0 ? "interior" : k == 1 ? "hole border" : "depth jump", kind[k][0],
-                     100.0 * kind[k][1] / std::max(1L, kind[k][0]), 100.0 * kind[k][2] / std::max(1L, kind[k][0]));
+                     pct(kind[k][1], kind[k][0]), pct(kind[k][2], kind[k][0]));
     for (int b = 0; b < 4; ++b)
         std::println("{} px from an edge: {:8} pixels, {:5.2f}% > 0.5 mm, {:5.2f}% > 2 mm", b < 3 ? std::to_string(b + 1) : std::string(">3"),
-                     counts[b][0], 100.0 * counts[b][1] / std::max(1L, counts[b][0]), 100.0 * counts[b][2] / std::max(1L, counts[b][0]));
+                     counts[b][0], pct(counts[b][1], counts[b][0]), pct(counts[b][2], counts[b][0]));
 }

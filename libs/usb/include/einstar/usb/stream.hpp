@@ -69,7 +69,7 @@ struct FrameGroup {
 
     [[nodiscard]] unsigned mask() const {
         unsigned m = 0;
-        for (int i = 0; i < 3; ++i)
+        for (std::size_t i = 0; i < sensors.size(); ++i)
             if (sensors[i]) m |= 1u << i;
         return m;
     }

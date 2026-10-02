@@ -66,7 +66,7 @@ template <typename T>
 class Image {
 public:
     Image() = default;
-    Image(int w, int h, T fill = T{}) : width_(w), height_(h), pixels_(static_cast<std::size_t>(w) * h, fill) {}
+    Image(int w, int h, T fill = T{}) : width_(w), height_(h), pixels_(static_cast<std::size_t>(w) * static_cast<std::size_t>(h), fill) {}
 
     [[nodiscard]] int width() const { return width_; }
     [[nodiscard]] int height() const { return height_; }
@@ -78,8 +78,8 @@ public:
     [[nodiscard]] std::span<T> pixels() { return pixels_; }
     [[nodiscard]] std::span<const T> pixels() const { return pixels_; }
 
-    [[nodiscard]] T& operator()(int x, int y) { return pixels_[static_cast<std::size_t>(y) * width_ + x]; }
-    [[nodiscard]] const T& operator()(int x, int y) const { return pixels_[static_cast<std::size_t>(y) * width_ + x]; }
+    [[nodiscard]] T& operator()(int x, int y) { return pixels_[index(x, y)]; }
+    [[nodiscard]] const T& operator()(int x, int y) const { return pixels_[index(x, y)]; }
 
     [[nodiscard]] ImageView<T> view() { return {pixels_.data(), width_, height_}; }
     [[nodiscard]] ImageView<const T> view() const { return {pixels_.data(), width_, height_}; }
@@ -87,6 +87,11 @@ public:
     void fill(T v) { std::fill(pixels_.begin(), pixels_.end(), v); }
 
 private:
+    [[nodiscard]] std::size_t index(int x, int y) const {
+        assert(x >= 0 && x < width_ && y >= 0 && y < height_);
+        return static_cast<std::size_t>(y) * static_cast<std::size_t>(width_) + static_cast<std::size_t>(x);
+    }
+
     int width_ = 0;
     int height_ = 0;
     std::vector<T, PageAlignedAllocator<T>> pixels_;

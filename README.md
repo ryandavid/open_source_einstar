@@ -142,6 +142,9 @@ cmake -B build && cmake --build build -j && ctest --test-dir build --output-on-f
   `build/tools/einstar-bench`. The default build type is RelWithDebInfo. For a debug build with the
   sanitizers, use a separate directory:
   `cmake -B build-debug -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"`.
+- **Warnings:** the build treats warnings as errors (`cmake/EinstarWarnings.cmake`; the firmware has the same set as
+  far as gcc supports it). A compiler newer than the tested one may bring new warnings; configure with
+  `--compile-no-warning-as-error` to build anyway.
 - **Tests:** some use recorded scans and calibration captures from `tests/fixtures`.
 - **Firmware:** off by default, since it needs the Arm GNU Toolchain and a user-supplied FX3 SDK. Configure with
   `-DEINSTAR_BUILD_FIRMWARE=ON` to build it with everything else, into `firmware/` in the build directory. See

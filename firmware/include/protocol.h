@@ -43,12 +43,8 @@ typedef struct __attribute__((packed)) {
         struct { uint8_t group, opcode; };
     };
     uint32_t length_be;           /* payload length, as stored (big-endian) */
-    union {                       /* payload; named views of its start (they change the code:
-                                   * `&arg0 + 1` is two additions, `payload + 1` one) */
-        uint8_t  payload[0];
-        uint8_t  arg0;            /* bulk 00/06: not used, then the data */
-        uint16_t page_be;         /* bulk 10/57, 10/58: user page number, big-endian */
-    };
+    uint8_t  payload[];           /* bulk 00/06: one unused byte, then the data;
+                                   * bulk 10/57, 10/58: user page number (big-endian), then (10/58) the page */
 } pkt_req_t;
 
 typedef struct __attribute__((packed)) {

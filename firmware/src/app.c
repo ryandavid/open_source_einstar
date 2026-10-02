@@ -28,6 +28,7 @@ struct flash_sr { uint8_t sr1, sr2, sr3, pad; };   /* flash_read_status_regs() r
  * configuration, then starts the other two worker threads. */
 void fpga_boot_thread(uint32_t input)
 {
+    (void)input;  /* ThreadX entry argument, unused */
     struct flash_sr sr = {0};
 
     spi_init();
@@ -58,6 +59,7 @@ void fpga_boot_thread(uint32_t input)
  * the bulk channel (EP 0x02 -> bulk_dispatch() -> EP 0x82). */
 void com_thread(uint32_t input)
 {
+    (void)input;  /* ThreadX entry argument, unused */
     CyU3PReturnStatus_t status;
     uint16_t replyLength;
     CyU3PDmaBuffer_t inBuf;
@@ -128,7 +130,8 @@ void com_thread(uint32_t input)
  * emc_wdg_timer is never started, so the count stays 0. */
 void emc_wdg_thread(uint32_t input)
 {
-    uint32_t connected;
+    (void)input;  /* ThreadX entry argument, unused */
+    CyBool_t connected;
 
     connected = 0;
 
@@ -181,6 +184,7 @@ void emc_wdg_thread(uint32_t input)
  * its reply (in a 50-byte buffer) goes out on EP 0x81. Command 8 asks for a reboot after the reply. */
 void control_thread(uint32_t input)
 {
+    (void)input;  /* ThreadX entry argument, unused */
     CyU3PReturnStatus_t status;
     uint8_t *reply;
     uint16_t replyLength;
@@ -209,7 +213,7 @@ top:
         if (reply == NULL)
             goto next;
 
-        replyLength = command_dispatch(cmd, reply);
+        replyLength = (uint16_t)command_dispatch(cmd, reply);
         if (replyLength != 0) {
             status = CyU3PDmaChannelSendData(&ch_ctrl_in, reply, replyLength);
         }

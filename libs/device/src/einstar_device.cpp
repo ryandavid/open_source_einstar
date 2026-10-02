@@ -253,10 +253,15 @@ bool has_quick_section(std::span<const std::uint8_t> b) {
            b[kType + 2] == 0 && b[kType + 3] == 0;
 }
 
+// Page `page` (4 KB) of the calibration pages.
+std::span<const std::uint8_t> flash_page(std::span<const std::uint8_t> pages, int page) {
+    constexpr std::size_t kPage = 4096;
+    return pages.subspan(static_cast<std::size_t>(page) * kPage, kPage);
+}
+
 }  // namespace
 
 Result<std::vector<int>> EinstarDevice::write_calibration_blob(std::span<const std::uint8_t> blob, const BackupSink& save_backup) {
-    constexpr std::size_t kPage = 4096;
     if (streaming_) return make_error(Errc::busy, "stop the stream before writing the calibration");
     if (blob.size() != kCalibrationBlobSize) return make_error(Errc::invalid_argument, "calibration blob must be 6568 bytes");
     if (!has_quick_section(blob)) return make_error(Errc::invalid_argument, "new calibration blob has no quick-calibration section");
@@ -274,7 +279,7 @@ Result<std::vector<int>> EinstarDevice::write_calibration_blob(std::span<const s
     std::ranges::copy(blob, next.begin());
     std::vector<int> written;
     for (int page = 0; page < 2; ++page) {
-        const std::span<const std::uint8_t> want(next.data() + page * kPage, kPage), old(current->data() + page * kPage, kPage);
+        const auto want = flash_page(next, page), old = flash_page(*current, page);
         if (std::ranges::equal(want, old)) continue;
         auto r = write_user_page(page, want);
         if (!r) {
@@ -285,7 +290,7 @@ Result<std::vector<int>> EinstarDevice::write_calibration_blob(std::span<const s
             // Put back every page touched so far.
             std::string outcome = "the previous calibration was put back";
             for (int p = 0; p <= page; ++p)
-                if (auto back = write_user_page(p, std::span<const std::uint8_t>(current->data() + p * kPage, kPage)); !back)
+                if (auto back = write_user_page(p, flash_page(*current, p)); !back)
                     outcome = std::format("page {} could NOT be put back ({}): restore it from the backup", p, back.error().message);
             return make_error(r.error().code, std::format("{}; {}", r.error().message, outcome));
         }
@@ -295,15 +300,14 @@ Result<std::vector<int>> EinstarDevice::write_calibration_blob(std::span<const s
 }
 
 Result<std::vector<int>> EinstarDevice::restore_calibration_pages(std::span<const std::uint8_t> backup) {
-    constexpr std::size_t kPage = 4096;
     if (streaming_) return make_error(Errc::busy, "stop the stream before restoring the calibration");
     if (backup.size() != kCalibrationPagesSize) return make_error(Errc::invalid_argument, "a calibration backup is 8192 bytes (pages 0-1)");
     if (!has_quick_section(backup)) return make_error(Errc::blocked, "not a calibration backup (no quick-calibration section)");
     const auto current = read_flash(0, kCalibrationPagesSize);  // (may fail after an interrupted write: then write both)
     std::vector<int> written;
     for (int page = 0; page < 2; ++page) {
-        const std::span<const std::uint8_t> want(backup.data() + page * kPage, kPage);
-        if (current && std::ranges::equal(want, std::span<const std::uint8_t>(current->data() + page * kPage, kPage))) continue;
+        const auto want = flash_page(backup, page);
+        if (current && std::ranges::equal(want, flash_page(*current, page))) continue;
         auto r = write_user_page(page, want);
         if (!r) r = write_user_page(page, want);
         if (!r) return std::unexpected(r.error());
@@ -511,7 +515,7 @@ Result<void> EinstarDevice::start_stream(GroupSink sink) {
         // The scanner's group id counts modulo 256 (measured; the header field is 32 bits wide): extend
         // it so ids keep increasing for the whole stream (recordings use them as frame indices).
         groups_ = std::make_unique<usb::GroupAssembler>(
-            [this, sink = std::move(sink), base = std::uint32_t{0}, last = std::optional<std::uint32_t>{},
+            [this, on_group = std::move(sink), base = std::uint32_t{0}, last = std::optional<std::uint32_t>{},
              previous = std::optional<std::uint32_t>{}, time_us = std::uint64_t{0}](usb::FrameGroup&& g) mutable {
                 if (last && g.frame_id < *last && *last <= 0xFFu) base += 256;
                 last = g.frame_id;
@@ -524,7 +528,7 @@ Result<void> EinstarDevice::start_stream(GroupSink sink) {
                 g.timestamp = time_us;
                 for (auto& s : g.sensors)
                     if (s) s->frame_id = g.frame_id;
-                sink(std::move(g));
+                on_group(std::move(g));
             });
         groups_->set_expected_mask(rgb_triggers_ > 0 ? 0b111u : 0b011u);
         frames_ = std::make_unique<usb::FrameAssembler>(s0.width, s0.height, [this](usb::StreamFrame&& f) {

@@ -209,9 +209,9 @@ RegistrationResult register_point_to_plane(const Cloud& source, const CloudIndex
             const int j = target.nearest(p, params.conflict_radius_mm);
             if (j < 0) return;
             ++near;
-            const Vec3f& n = tc.normals[static_cast<std::size_t>(j)];
-            if (std::abs(n.dot(p - tc.points[static_cast<std::size_t>(j)])) > params.conflict_distance_mm ||
-                n.dot(R * source.normals[sel[k]]) < params.conflict_normal_dot)
+            const Vec3f& normal = tc.normals[static_cast<std::size_t>(j)];
+            if (std::abs(normal.dot(p - tc.points[static_cast<std::size_t>(j)])) > params.conflict_distance_mm ||
+                normal.dot(R * source.normals[sel[k]]) < params.conflict_normal_dot)
                 ++bad;
         });
         res.conflict = near > 0 ? static_cast<double>(bad) / near : 0.0;

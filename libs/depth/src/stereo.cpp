@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cassert>
 #include <cmath>
 #include <limits>
 #include <vector>
@@ -26,26 +27,33 @@ struct CostVolume {
     int w = 0, h = 0, d = 0;
     std::vector<Cost> data;
 
-    CostVolume(int w_, int h_, int d_, Cost fill) : w(w_), h(h_), d(d_), data(static_cast<std::size_t>(w_) * h_ * d_, fill) {}
-    [[nodiscard]] Cost* at(int x, int y) { return data.data() + (static_cast<std::size_t>(y) * w + x) * d; }
-    [[nodiscard]] const Cost* at(int x, int y) const { return data.data() + (static_cast<std::size_t>(y) * w + x) * d; }
+    CostVolume(int w_, int h_, int d_, Cost fill)
+        : w(w_), h(h_), d(d_), data(static_cast<std::size_t>(w_) * static_cast<std::size_t>(h_) * static_cast<std::size_t>(d_), fill) {}
+    [[nodiscard]] Cost* at(int x, int y) { return data.data() + offset(x, y); }
+    [[nodiscard]] const Cost* at(int x, int y) const { return data.data() + offset(x, y); }
+
+private:
+    [[nodiscard]] std::size_t offset(int x, int y) const {
+        assert(x >= 0 && x < w && y >= 0 && y < h);
+        return (static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x)) * static_cast<std::size_t>(d);
+    }
 };
 
 // Aggregates matching costs along one scanline direction and adds into `sum`.
 // The path walks from (x0, y0) stepping (dx, dy) until leaving the image.
 void aggregate_path(const CostVolume& cost, ImageView<const std::uint8_t> guide, CostVolume& sum, int x0, int y0,
                     int dx, int dy, const SgmParams& p, std::vector<Cost>& prev, std::vector<Cost>& cur) {
-    const int nd = cost.d;
+    const auto nd = static_cast<std::size_t>(cost.d);
     int x = x0, y = y0;
     const Cost* c = cost.at(x, y);
     Cost prev_min = kMaxCost;
-    for (int k = 0; k < nd; ++k) {
+    for (std::size_t k = 0; k < nd; ++k) {
         prev[k] = c[k];
         prev_min = std::min(prev_min, c[k]);
     }
     {
         Cost* s = sum.at(x, y);
-        for (int k = 0; k < nd; ++k) s[k] = static_cast<Cost>(s[k] + prev[k]);
+        for (std::size_t k = 0; k < nd; ++k) s[k] = static_cast<Cost>(s[k] + prev[k]);
     }
     int prev_intensity = guide(x, y);
     x += dx;
@@ -59,7 +67,7 @@ void aggregate_path(const CostVolume& cost, ImageView<const std::uint8_t> guide,
         c = cost.at(x, y);
         const int jump = prev_min + p2;
         Cost cur_min = kMaxCost;
-        for (int k = 0; k < nd; ++k) {
+        for (std::size_t k = 0; k < nd; ++k) {
             int best = std::min<int>(prev[k], jump);
             if (k > 0) best = std::min<int>(best, prev[k - 1] + p.p1);
             if (k + 1 < nd) best = std::min<int>(best, prev[k + 1] + p.p1);
@@ -72,7 +80,7 @@ void aggregate_path(const CostVolume& cost, ImageView<const std::uint8_t> guide,
             cur_min = std::min(cur_min, v);
         }
         Cost* s = sum.at(x, y);
-        for (int k = 0; k < nd; ++k) s[k] = static_cast<Cost>(s[k] + cur[k]);
+        for (std::size_t k = 0; k < nd; ++k) s[k] = static_cast<Cost>(s[k] + cur[k]);
         std::swap(prev, cur);
         prev_min = cur_min;
         x += dx;
@@ -274,7 +282,7 @@ ImageF32 sgm_disparity(ImageView<const std::uint8_t> left, ImageView<const std::
             }
         }
         tbb::parallel_for(tbb::blocked_range<std::size_t>(0, starts.size()), [&](const tbb::blocked_range<std::size_t>& r) {
-            std::vector<Cost> prev(nd), cur(nd);
+            std::vector<Cost> prev(static_cast<std::size_t>(nd)), cur(static_cast<std::size_t>(nd));
             for (std::size_t i = r.begin(); i != r.end(); ++i) {
                 aggregate_path(cost, left, sum, starts[i].first, starts[i].second, dir.dx, dir.dy, p, prev, cur);
             }
@@ -333,14 +341,14 @@ ImageF32 sgm_disparity(ImageView<const std::uint8_t> left, ImageView<const std::
 
 void remove_speckles(ImageF32& disparity, const SpeckleParams& p) {
     const int w = disparity.width(), h = disparity.height();
-    std::vector<int> label(static_cast<std::size_t>(w) * h, -1);
+    ImageU8 seen(w, h, 0);
     std::vector<int> stack;
-    std::vector<int> region;
+    std::vector<int> region;  // pixels as y * w + x
     for (int start = 0; start < w * h; ++start) {
-        if (label[start] >= 0 || disparity.data()[start] < 0) continue;
+        if (seen.data()[start] || disparity.data()[start] < 0) continue;
         region.clear();
         stack.push_back(start);
-        label[start] = start;
+        seen.data()[start] = 1;
         while (!stack.empty()) {
             const int i = stack.back();
             stack.pop_back();
@@ -352,8 +360,8 @@ void remove_speckles(ImageF32& disparity, const SpeckleParams& p) {
                 if (n[0] < 0 || n[1] < 0 || n[0] >= w || n[1] >= h) continue;
                 const int j = n[1] * w + n[0];
                 const float dj = disparity.data()[j];
-                if (label[j] >= 0 || dj < 0 || std::abs(dj - d) > p.max_diff) continue;
-                label[j] = start;
+                if (seen.data()[j] || dj < 0 || std::abs(dj - d) > p.max_diff) continue;
+                seen.data()[j] = 1;
                 stack.push_back(j);
             }
         }

@@ -21,7 +21,7 @@ TEST_CASE("symmetry probe on mustang frames 480-520", "[.probe]") {
     track::Tracker tracker;
     auto fit = [&](const fixtures::Frame& f, const SE3& pose) {
         std::vector<float> e;
-        int miss = 0;
+        std::size_t miss = 0;
         const Eigen::Matrix4f T = pose.matrix().cast<float>();
         for (const auto& p : fixtures::unproject(f, 6)) {
             if (auto d = dist.distance((T * p.homogeneous()).head<3>(), 3.0f)) e.push_back(*d);

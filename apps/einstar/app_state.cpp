@@ -36,7 +36,7 @@ void AppState::process_scan(const recon::ProcessParams& params) {
     }
     if (process_thread_.joinable()) process_thread_.join();
     cancel_ = false;
-    process_thread_ = std::jthread([this, params = recon::ProcessParams(params)]() mutable {
+    process_thread_ = std::jthread([this, run_params = params]() mutable {
         const auto path = session_->pipeline().flush_recording();
         auto fail = [&](const std::string& msg) {
             std::lock_guard lock(mutex_);
@@ -47,13 +47,13 @@ void AppState::process_scan(const recon::ProcessParams& params) {
         if (path.empty()) return fail("nothing has been recorded yet");
         auto reader = session::SessionReader::open(path);
         if (!reader) return fail(reader.error().message);
-        params.cancel = &cancel_;
-        params.progress = [this](const std::string& stage, double f) {
+        run_params.cancel = &cancel_;
+        run_params.progress = [this](const std::string& stage, double f) {
             std::lock_guard lock(mutex_);
             process_.stage = stage;
             process_.fraction = f;
         };
-        auto r = recon::process_session(**reader, params);
+        auto r = recon::process_session(**reader, run_params);
         if (!r) return fail(r.error().message);
         const auto& rep = r->report;
         std::string times;

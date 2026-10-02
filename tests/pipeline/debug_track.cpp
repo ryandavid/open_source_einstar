@@ -92,7 +92,7 @@ int main(int argc, char** argv) {
             for (int dz = -1; dz <= 1; ++dz)
                 for (int dy = -1; dy <= 1; ++dy)
                     for (int dx = -1; dx <= 1; ++dx) {
-                        auto it = grid.find(key(q + Vec3f(2.0f * dx, 2.0f * dy, 2.0f * dz)));
+                        auto it = grid.find(key(q + 2.0f * Vec3f(static_cast<float>(dx), static_cast<float>(dy), static_cast<float>(dz))));
                         if (it == grid.end()) continue;
                         for (const auto& p : it->second) best = std::min(best, (p - q).norm());
                     }

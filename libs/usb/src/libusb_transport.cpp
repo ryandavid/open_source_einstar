@@ -209,7 +209,9 @@ private:
                 --self->in_flight_;
                 return;
             }
-            default:
+            case LIBUSB_TRANSFER_ERROR:
+            case LIBUSB_TRANSFER_NO_DEVICE:
+            case LIBUSB_TRANSFER_OVERFLOW:
                 self->errors_.fetch_add(1, std::memory_order_relaxed);
                 break;
         }

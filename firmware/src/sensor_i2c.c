@@ -33,15 +33,14 @@
  * "leave unchanged" flags in bits 7 and 3. */
 #define FPGA_MODE_FIELD      7
 #define FPGA_MODE_LD_SHIFT   4
-#define FPGA_MODE_LD_KEEP    0xFFFFFF80  /* bit 7 (the vendor's constant) */
+#define FPGA_MODE_LD_KEEP    0x80        /* bit 7 (the vendor wrote 0xFFFFFF80; the byte keeps 0x80) */
 #define FPGA_MODE_LED_KEEP   8
 
 
 typedef struct {
     uint16_t reg;
     uint8_t  val;
-    uint8_t  pad;
-} sensor_reg_t;
+} sensor_reg_t;    /* 4 bytes, as the vendor's table: val is followed by a padding byte */
 
 /* SC130GS initialisation: {register, value}, written to each camera by sensors_init(); ends at register 0x0001 */
 const sensor_reg_t sc130_init_regs[111] = {
@@ -293,7 +292,7 @@ CyU3PReturnStatus_t sensor_set_gain(uint8_t cam, uint16_t percent)
     gain = percent;
     gain = gain * SC_GAIN_UNITY;
     gain = gain / 100.0f;
-    regval = gain;
+    regval = (uint16_t)gain;  /* truncated, then rounded */
     if (gain - 0.5 > regval)
         regval = regval + 1;
 
@@ -379,7 +378,7 @@ uint16_t sensor_get_gain(uint8_t cam)
     gain = regval;
     gain = gain * 100.0f;
     gain = gain / SC_GAIN_UNITY;
-    regval = gain;
+    regval = (uint16_t)gain;  /* truncated, then rounded */
     if (gain - 0.5 > regval) {
         regval = regval + 1;
     }

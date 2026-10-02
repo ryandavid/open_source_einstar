@@ -18,7 +18,7 @@ int sensor_from_camera_bits(std::uint8_t bits) {
 }
 
 FrameAssembler::FrameAssembler(int width, int height, Sink sink)
-    : width_(width), height_(height), frame_bytes_(static_cast<std::size_t>(width) * height), sink_(std::move(sink)) {}
+    : width_(width), height_(height), frame_bytes_(static_cast<std::size_t>(width) * static_cast<std::size_t>(height)), sink_(std::move(sink)) {}
 
 void FrameAssembler::reset() {
     received_ = 0;
