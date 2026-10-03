@@ -47,9 +47,6 @@ struct PointSet {
 // fitted as a huge cylinder) and degenerate cones are not considered.
 [[nodiscard]] std::optional<FitResult> fit_best(std::span<const SurfaceKind> kinds, const PointSet& data, const FitOptions& options = {});
 
-// Number of free parameters of a surface kind.
-[[nodiscard]] int parameter_count(SurfaceKind kind);
-
 // Robust scale: 1.4826 * median(|r|).
 [[nodiscard]] double robust_sigma(std::span<const double> residuals);
 

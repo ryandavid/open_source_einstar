@@ -29,30 +29,7 @@ Vec3 weighted_centroid(const PointSet& d) {
     return w > 0 ? Vec3(c / w) : c;
 }
 
-Vec3 rotate_axis(const Vec3& a, double d0, double d1) {
-    const Vec3 u = any_perpendicular(a), v = a.cross(u);
-    return (a + d0 * u + d1 * v).normalized();
-}
-
-// Applies a small local change of the surface's parameters (see parameter_count for the layout).
-Surface retract(const Surface& s, const VecX& d) {
-    return std::visit(Overloaded{
-                          [&](const Plane& p) -> Surface { return Plane{rotate_axis(p.normal, d[0], d[1]), p.offset + d[2]}; },
-                          [&](const Cylinder& c) -> Surface {
-                              const Vec3 u = any_perpendicular(c.axis), v = c.axis.cross(u);
-                              return Cylinder{c.point + d[2] * u + d[3] * v, rotate_axis(c.axis, d[0], d[1]), c.radius + d[4]};
-                          },
-                          [&](const Cone& c) -> Surface {
-                              return Cone{c.apex + Vec3(d[2], d[3], d[4]), rotate_axis(c.axis, d[0], d[1]),
-                                          std::clamp(c.half_angle + d[5], 1e-4, std::numbers::pi / 2 - 1e-4)};
-                          },
-                          [&](const Sphere& sp) -> Surface { return Sphere{sp.center + Vec3(d[0], d[1], d[2]), sp.radius + d[3]}; },
-                          [&](const Torus& t) -> Surface {
-                              return Torus{t.center + Vec3(d[2], d[3], d[4]), rotate_axis(t.axis, d[0], d[1]), t.major + d[5], t.minor + d[6]};
-                          },
-                      },
-                      s);
-}
+Surface retract(const Surface& s, const VecX& d) { return perturbed(s, std::span<const double>(d.data(), static_cast<std::size_t>(d.size()))); }
 
 // Keeps the reference point of an axis near the data (the axis' closest point to the centroid).
 Surface normalise(const Surface& s, const Vec3& centroid) {
@@ -241,17 +218,6 @@ FitResult finish(const Surface& s, const PointSet& d, const FitOptions& o) {
 }
 
 }  // namespace
-
-int parameter_count(SurfaceKind kind) {
-    switch (kind) {
-        case SurfaceKind::plane: return 3;
-        case SurfaceKind::cylinder: return 5;
-        case SurfaceKind::cone: return 6;
-        case SurfaceKind::sphere: return 4;
-        case SurfaceKind::torus: return 7;
-    }
-    return 0;
-}
 
 double robust_sigma(std::span<const double> residuals) {
     if (residuals.empty()) return 0;

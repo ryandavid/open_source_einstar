@@ -2,6 +2,7 @@
 
 // Analytic surfaces fitted to scan regions: the faces a CAD model is made of.
 
+#include <span>
 #include <string_view>
 #include <variant>
 
@@ -56,6 +57,16 @@ enum class SurfaceKind { plane, cylinder, cone, sphere, torus };
 [[nodiscard]] Vec3 project(const Surface& s, const Vec3& p);
 // Rigid motion of a surface: x' = T x.
 [[nodiscard]] Surface transformed(const Surface& s, const SE3& T);
+
+// Number of free parameters of a surface kind, and a small change of them (for fitting and solving):
+//   plane     [normal tilt u, normal tilt v, offset]
+//   cylinder  [axis tilt u, axis tilt v, axis shift u, axis shift v, radius]
+//   cone      [axis tilt u, axis tilt v, apex x, apex y, apex z, half angle]
+//   sphere    [centre x, y, z, radius]
+//   torus     [axis tilt u, axis tilt v, centre x, y, z, major radius, minor radius]
+// where (u, v) is a basis perpendicular to the current direction (any_perpendicular, and direction x it).
+[[nodiscard]] int parameter_count(SurfaceKind kind);
+[[nodiscard]] Surface perturbed(const Surface& s, std::span<const double> delta);
 
 // A unit vector perpendicular to n.
 [[nodiscard]] Vec3 any_perpendicular(const Vec3& n);
