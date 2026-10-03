@@ -477,6 +477,13 @@ void ModelApp::draw_ui(render::ViewCamera& camera) {
             if (ImGui::InputDouble("dia", &dia, 0, 0, "%.3f", ImGuiInputTextFlags_EnterReturnsTrue)) run("hole.update", {{"hole", h["id"]}, {"diameter", dia}});
             ImGui::SameLine();
             ImGui::TextDisabled("scan %.3f (%s)", h["measured_diameter"].get<double>(), h["measured_from"].get<std::string>().c_str());
+            std::string forms;
+            if (h.contains("counterbore_diameter"))
+                forms += std::format("  counterbore {:.2f} x {:.2f}", h["counterbore_diameter"].get<double>(), h.value("counterbore_depth", 0.0));
+            if (h.contains("countersink_diameter"))
+                forms += std::format("  countersink {:.2f} at {:.0f} deg", h["countersink_diameter"].get<double>(), h.value("countersink_angle_deg", 90.0));
+            if (h.contains("point_angle_deg")) forms += std::format("  drill point {:.0f} deg", h["point_angle_deg"].get<double>());
+            if (!forms.empty()) ImGui::TextDisabled("%s", forms.c_str());
             bool through = h["through"];
             if (ImGui::Checkbox("through", &through) && through) run("hole.update", {{"hole", h["id"]}, {"through", true}});
             if (!through) {

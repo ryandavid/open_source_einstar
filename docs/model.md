@@ -85,11 +85,51 @@ The MCP server's instructions describe the modelling workflow. A typical exchang
 3. `model_solve`, `model_build`.
 4. `model_deviation`, a screenshot, and a report of any conflicts and of what each measurement cost.
 
+## Holes
+
+- **Finding them:** holes are found as round openings in a plane face. The diameter comes from the scanned
+  wall, or from the opening when little wall was seen.
+- **Forms:** the scan's counterbores, countersinks and drill points are measured. `model.hole.update` sets
+  or corrects them, and they are built and named in the STEP file.
+- **In the solve:** holes take part through their axis: the wall's label, or a cylinder fitted to the
+  opening. They are held parallel to their face's normal. Constraints that mean an axis can name a hole,
+  e.g. `axis_distance` for a pitch or a bolt circle's radius, or `offset` from the datum.
+
+## Constraints
+
+| Constraint | Meaning |
+|---|---|
+| aligned | along a datum axis |
+| parallel, perpendicular, angle | between directions |
+| coplanar | two planes on one plane |
+| coaxial | two axes on one line |
+| distance | between parallel planes |
+| axis_distance | between parallel axes |
+| offset | a position along a datum axis |
+| radius, diameter | a size |
+| tangent | a plane and a cylinder or sphere, or two cylinders |
+| symmetric | mirrored about a datum plane |
+| equal_radius | the same radius |
+
+These give, in 3D, what a sketch would give a prismatic or turned part.
+
+## Freeform faces
+
+`model.freeform` makes a label a B-spline height field over its best-fit plane. It fits a region no primitive
+describes, such as a domed or sculpted top. The face reaches past its region so that it meets its neighbours.
+It is held as fitted in the solve, built by OpenCASCADE as the same spline, and exported as a B-spline face.
+
+## Scale
+
+`model.solve` compares the user's measured lengths with what the scan alone gives, and reports the factor
+they imply and whether it is significant. `model.scale` applies a factor to the scan and everything on it.
+A significant factor is also a reason to check the scanner's calibration.
+
 ## Known limits
 
-- Only analytic surfaces: freeform (B-spline) patches for regions no primitive fits are not done yet.
-- Holes are round, through or flat-bottomed. Countersinks, counterbores and a drill point's cone are not
-  modelled yet.
-- Hole positions are measured, not yet constrainable (e.g. "on a 38 mm pitch").
-- Tolerances and the rim correction (`fit::HoleOptions::rim_bias_voxels`) are calibrated on synthetic
-  surface-nets scans; real scans may need their own values.
+- **Freeform faces must be height fields over a plane.** A region that folds over itself has to be split.
+- **Sketch-and-extrude is not built as such.** Its relations are the constraints above, on 3D faces.
+- **Calibration is synthetic only:** tolerances and the rim correction (`fit::HoleOptions::rim_bias_voxels`) are
+  tuned on synthetic surface-nets scans, and real scans may need their own values.
+- **Untested on a real machined part:** the real scans tried so far (a display and bucket, a cast differential)
+  are not machined parts. Detection runs on them in 6-19 s.

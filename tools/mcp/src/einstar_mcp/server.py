@@ -35,7 +35,12 @@ Modelling (the model app) -- the user describes the part in words and measuremen
 - 'Make it square': model_datum_create (z from the main face, x from a side), then model_square. Prefer one datum
   with aligned faces over pairwise perpendicular constraints.
 - Measurements: model_hole_update(diameter) for a measured hole, model_fillet_update(radius), and
-  model_constraint_add (distance between faces, offset from the datum, diameter, angle ...).
+  model_constraint_add (distance between faces, offset from the datum, diameter, angle, axis_distance for hole
+  pitches and bolt circles, tangent, symmetric, equal_radius ...). Holes can be named wherever an axis is meant.
+- Holes: detection measures counterbores, countersinks and drill points; model_hole_update sets or corrects them.
+- A face no primitive fits (a domed or sculpted surface): model_freeform on a label painted on it.
+- model_solve's 'scale' says whether the user's measurements show the scan too large or small; offer model_scale
+  when it is significant (and suggest checking the scanner's calibration).
 - Where the scan is open (the bottom it stood on, a blind hole's floor), the model needs the user's knowledge:
   model_face_add_plane for an unseen face, model_hole_update(depth) for a blind hole. Ask when you do not know.
 - model_solve, then model_build; check model_deviation (hot spots: where the model departs from the scan; edge bands
