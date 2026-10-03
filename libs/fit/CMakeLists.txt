@@ -1,4 +1,4 @@
-add_library(einstar_fit src/surface.cpp src/mesh_topology.cpp src/bvh.cpp src/synthetic_part.cpp)
+add_library(einstar_fit src/surface.cpp src/mesh_topology.cpp src/bvh.cpp src/synthetic_part.cpp src/primitive_fit.cpp src/grow.cpp)
 add_library(einstar::fit ALIAS einstar_fit)
 target_include_directories(einstar_fit PUBLIC include)
 target_link_libraries(einstar_fit PUBLIC einstar::core einstar::recon PRIVATE einstar::track TBB::tbb)
