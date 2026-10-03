@@ -322,11 +322,14 @@ std::vector<MethodSpec> build() {
         "datum axis; parallel / perpendicular / coplanar / coaxial {a, b}; angle {a, b, degrees}; radius {label, value}; "
         "diameter {label or hole, value} (a measured hole size); distance {a, b, value}: between parallel planes; offset "
         "{label, datum, axis, value}: a face or axis at a position along a datum axis; axis_distance {a, b, value}: two "
-        "parallel axes this far apart (a hole pitch, or a hole from a boss or bolt-circle centre). Where an axis is meant "
-        "(aligned, parallel, perpendicular, angle, coaxial, offset, axis_distance) a hole may be named in place of a label. "
-        "Prefer one datum with aligned faces over many pairwise perpendicular constraints.",
+        "parallel axes this far apart (a hole pitch, or a hole from a boss or bolt-circle centre); tangent {a, b}: a plane "
+        "and a cylinder or sphere, or two cylinders, touching (a fillet against its faces, a slot's rounded end); "
+        "symmetric {a, b, datum, axis}: two faces or axes mirrored about the datum's plane normal to that axis; "
+        "equal_radius {a, b}: the same radius, whatever it is. Where an axis is meant (aligned, parallel, perpendicular, "
+        "angle, coaxial, offset, axis_distance, symmetric) a hole may be named in place of a label. Prefer one datum with "
+        "aligned faces over many pairwise perpendicular constraints.",
         object({{"type", one_of({"aligned", "parallel", "perpendicular", "angle", "coplanar", "coaxial", "radius", "diameter", "distance", "offset",
-                                 "axis_distance"},
+                                 "axis_distance", "tangent", "symmetric", "equal_radius"},
                                 "The constraint.")},
                 {"label", kLabel}, {"a", kLabel}, {"b", kLabel}, {"hole", ref("A hole (diameter).")}, {"datum", ref("A datum.")},
                 {"axis", kAxis}, {"value", num("mm.")}, {"degrees", num("0-90.")}},

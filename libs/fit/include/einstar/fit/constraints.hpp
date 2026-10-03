@@ -78,7 +78,18 @@ struct AxisDistance {  // two parallel axes this far apart (implies parallel): a
     double value;
 };
 
-using Constraint = std::variant<Aligned, Parallel, Perpendicular, Angle, Coplanar, Coaxial, Radius, Diameter, Distance, Offset, AxisDistance>;
+struct Tangent {  // a plane and a cylinder (or sphere), or two cylinders, touching along a line (point)
+    int a, b;
+};
+struct Symmetric {  // two faces or axes mirrored about the datum's plane normal to axis k (through its origin)
+    int a, b, datum, axis;
+};
+struct EqualRadius {  // the same radius (fillets, bosses), whatever it is
+    int a, b;
+};
+
+using Constraint = std::variant<Aligned, Parallel, Perpendicular, Angle, Coplanar, Coaxial, Radius, Diameter, Distance, Offset, AxisDistance,
+                                Tangent, Symmetric, EqualRadius>;
 
 [[nodiscard]] std::string describe(const Constraint& c);
 

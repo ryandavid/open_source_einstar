@@ -102,6 +102,9 @@ int rows_of(const Constraint& c) {
                           [](const Distance&) { return 3; },
                           [](const Offset&) { return 1; },
                           [](const AxisDistance&) { return 3; },
+                          [](const Tangent&) { return 3; },
+                          [](const Symmetric&) { return 1; },
+                          [](const EqualRadius&) { return 1; },
                       },
                       c);
 }
@@ -113,6 +116,7 @@ Involved involved(const Constraint& c) {
     return std::visit(Overloaded{
                           [](const Aligned& a) { return Involved{{a.feature}, {a.datum}}; },
                           [](const Offset& o) { return Involved{{o.feature}, {o.datum}}; },
+                          [](const Symmetric& o) { return Involved{{o.a, o.b}, {o.datum}}; },
                           [](const Radius& r) { return Involved{{r.feature}, {}}; },
                           [](const Diameter& d) { return Involved{{d.feature}, {}}; },
                           [](const auto& pair) { return Involved{{pair.a, pair.b}, {}}; },
@@ -163,6 +167,22 @@ std::string check(const Constraint& c, const SolveInput& in) {
                               return radius_index(kind(d.feature)) ? "" : "only cylinders, spheres and tori have a diameter";
                           },
                           [&](const Distance& d) -> std::string { return is_plane(d.a) && is_plane(d.b) ? "" : "distance needs two planes"; },
+                          [&](const Tangent& t) -> std::string {
+                              const auto ka = kind(t.a), kb = kind(t.b);
+                              const auto one = [&](SurfaceKind x, SurfaceKind y) { return (ka == x && kb == y) || (ka == y && kb == x); };
+                              if (one(SurfaceKind::plane, SurfaceKind::cylinder) || one(SurfaceKind::plane, SurfaceKind::sphere) ||
+                                  one(SurfaceKind::cylinder, SurfaceKind::cylinder))
+                                  return "";
+                              return "tangent needs a plane and a cylinder or sphere, or two cylinders";
+                          },
+                          [&](const Symmetric& o) -> std::string {
+                              if (o.axis < 0 || o.axis > 2) return "axis must be 0, 1 or 2";
+                              if (kind(o.a) != kind(o.b)) return "symmetric needs two faces or axes of the same kind";
+                              return kind(o.a) == SurfaceKind::freeform ? "a freeform face has no position" : "";
+                          },
+                          [&](const EqualRadius& e) -> std::string {
+                              return radius_index(kind(e.a)) && radius_index(kind(e.b)) ? "" : "equal radius needs cylinders, spheres or tori";
+                          },
                           [&](const AxisDistance& d) -> std::string {
                               if (!(d.value > 0)) return "the distance must be positive";
                               return has_direction(d.a) && has_direction(d.b) && !is_plane(d.a) && !is_plane(d.b) ? ""
@@ -183,6 +203,18 @@ Vec3 direction(const State& s, int f) { return *direction_of(s.surfaces[static_c
 Vec3 position(const State& s, int f) { return position_of(s.surfaces[static_cast<std::size_t>(f)]); }
 Vec3 datum_axis(const State& s, int d, int k) { return s.datums[static_cast<std::size_t>(d)].linear().col(k); }
 
+// Where a face or axis is along a datum axis, from the datum origin: a plane where the axis line meets it, an axis
+// (or centre) by its point's projection.
+double along(const State& s, int f, int datum, int axis) {
+    const SE3& T = s.datums[static_cast<std::size_t>(datum)];
+    const Vec3 e = T.linear().col(axis);
+    if (const auto* pl = std::get_if<Plane>(&s.surfaces[static_cast<std::size_t>(f)])) {
+        const double ne = pl->normal.dot(e);
+        if (std::abs(ne) > 1e-6) return (pl->offset - pl->normal.dot(T.translation())) / ne;
+    }
+    return (position(s, f) - T.translation()).dot(e);
+}
+
 Frozen freeze(const Constraint& c, const State& s) {
     Frozen fz;
     const auto basis = [&](const Vec3& e) {
@@ -195,6 +227,24 @@ Frozen freeze(const Constraint& c, const State& s) {
                    [&](const Coplanar& p) { basis(direction(s, p.b)); },
                    [&](const Coaxial& p) { basis(direction(s, p.a)); },
                    [&](const AxisDistance& p) { basis(direction(s, p.a)); },
+                   [&](const Tangent& t) {
+                       const Surface& a = s.surfaces[static_cast<std::size_t>(t.a)];
+                       const Surface& b = s.surfaces[static_cast<std::size_t>(t.b)];
+                       if (std::holds_alternative<Cylinder>(a) && std::holds_alternative<Cylinder>(b)) {
+                           basis(direction(s, t.a));
+                           const auto& ca = std::get<Cylinder>(a);
+                           const auto& cb = std::get<Cylinder>(b);
+                           Vec3 dd = cb.point - ca.point;
+                           dd -= dd.dot(ca.axis) * ca.axis;
+                           // Touching outside (centres r_a + r_b apart) or inside (|r_a - r_b|): whichever is nearer now.
+                           fz.sign = std::abs(dd.norm() - (ca.radius + cb.radius)) <= std::abs(dd.norm() - std::abs(ca.radius - cb.radius)) ? 1 : -1;
+                       } else {
+                           const bool plane_first = std::holds_alternative<Plane>(a);
+                           const auto& pl = std::get<Plane>(plane_first ? a : b);
+                           const Surface& other = plane_first ? b : a;
+                           fz.sign = pl.normal.dot(position_of(other)) - pl.offset >= 0 ? 1 : -1;
+                       }
+                   },
                    [&](const Distance& d) {
                        basis(direction(s, d.b));
                        const auto& pa = std::get<Plane>(s.surfaces[static_cast<std::size_t>(d.a)]);
@@ -247,9 +297,29 @@ void evaluate(const Constraint& c, const State& s, const Frozen& fz, double* out
                        d -= d.dot(ua) * ua;
                        out[2] = d.norm() - p.value;
                    },
-                   [&](const Offset& o) {
-                       const SE3& T = s.datums[static_cast<std::size_t>(o.datum)];
-                       out[0] = (position(s, o.feature) - T.translation()).dot(T.linear().col(o.axis)) - o.value;
+                   [&](const Offset& o) { out[0] = along(s, o.feature, o.datum, o.axis) - o.value; },
+                   [&](const Symmetric& o) { out[0] = along(s, o.a, o.datum, o.axis) + along(s, o.b, o.datum, o.axis); },
+                   [&](const EqualRadius& e) {
+                       out[0] = radius_of(s.surfaces[static_cast<std::size_t>(e.a)]) - radius_of(s.surfaces[static_cast<std::size_t>(e.b)]);
+                   },
+                   [&](const Tangent& t) {
+                       const Surface& a = s.surfaces[static_cast<std::size_t>(t.a)];
+                       const Surface& b = s.surfaces[static_cast<std::size_t>(t.b)];
+                       out[0] = out[1] = out[2] = 0;  // rows a kind of pair does not use stay zero
+                       if (std::holds_alternative<Cylinder>(a) && std::holds_alternative<Cylinder>(b)) {
+                           const auto& ca = std::get<Cylinder>(a);
+                           const auto& cb = std::get<Cylinder>(b);
+                           parallel_rows(cb.axis, ca.axis);
+                           Vec3 dd = cb.point - ca.point;
+                           dd -= dd.dot(ca.axis) * ca.axis;
+                           out[2] = dd.norm() - (fz.sign > 0 ? ca.radius + cb.radius : std::abs(ca.radius - cb.radius));
+                           return;
+                       }
+                       const bool plane_first = std::holds_alternative<Plane>(a);
+                       const auto& pl = std::get<Plane>(plane_first ? a : b);
+                       const Surface& other = plane_first ? b : a;
+                       out[0] = fz.sign * (pl.normal.dot(position_of(other)) - pl.offset) - radius_of(other);
+                       if (const auto* cyl = std::get_if<Cylinder>(&other)) out[1] = pl.normal.dot(cyl->axis);  // the axis along the plane
                    },
                },
                c);
@@ -563,6 +633,11 @@ std::vector<std::string> direction_conflicts(const SolveInput& in, const std::ve
                        [&](const Coaxial& p) { join(ci, f(p.a), f(p.b)); },
                        [&](const Distance& d) { join(ci, f(d.a), f(d.b)); },
                        [&](const AxisDistance& d) { join(ci, f(d.a), f(d.b)); },
+                       [&](const Tangent& t) {
+                           const auto ka = kind_of(in.features[f(t.a)].surface), kb = kind_of(in.features[f(t.b)].surface);
+                           if (ka == SurfaceKind::cylinder && kb == SurfaceKind::cylinder) join(ci, f(t.a), f(t.b));
+                           else if (ka != SurfaceKind::sphere && kb != SurfaceKind::sphere) separate(ci, f(t.a), f(t.b));  // the axis along the plane
+                       },
                        [&](const Perpendicular& p) { separate(ci, f(p.a), f(p.b)); },
                        [&](const Angle& a) {
                            if (a.degrees < 1e-9) join(ci, f(a.a), f(a.b));
@@ -641,6 +716,11 @@ std::string describe(const Constraint& c) {
                           [](const Diameter& d) { return std::format("feature {} diameter {:.4f}", d.feature, d.value); },
                           [](const Distance& d) { return std::format("features {} and {} {:.4f} apart", d.a, d.b, d.value); },
                           [](const AxisDistance& d) { return std::format("axes of features {} and {} {:.4f} apart", d.a, d.b, d.value); },
+                          [](const Tangent& t) { return std::format("features {} and {} tangent", t.a, t.b); },
+                          [](const Symmetric& o) {
+                              return std::format("features {} and {} symmetric about datum {} {}", o.a, o.b, o.datum, kAxis[static_cast<std::size_t>(std::clamp(o.axis, 0, 2))]);
+                          },
+                          [](const EqualRadius& e) { return std::format("features {} and {} of equal radius", e.a, e.b); },
                           [](const Offset& o) {
                               return std::format("feature {} at {} {:.4f} from datum {}", o.feature, kAxis[static_cast<std::size_t>(std::clamp(o.axis, 0, 2))], o.value, o.datum);
                           },

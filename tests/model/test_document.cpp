@@ -373,3 +373,47 @@ TEST_CASE("a freeform face: a domed top fitted as a B-spline, built into the sol
     run(again, "open", {{"path", path.string()}});
     CHECK(std::abs(run(again, "build")["volume_mm3"].get<double>() - built["volume_mm3"].get<double>()) < 1e-6);
 }
+
+TEST_CASE("sketch-like constraints: fillets tangent to their faces, all of one radius; sides symmetric about the datum") {
+    model::Document doc;
+    run(doc, "open_demo");
+    squared_demo(doc);
+    run(doc, "label.update", {{"label", label_along(doc, {-80, 3, 12}, {1, 0, 0})}, {"name", "left"}});
+    json s = run(doc, "summary");
+    REQUIRE(s["fillets"].size() == 8);
+    std::string first;
+    for (const auto& f : s["fillets"]) {
+        const std::string lab = f["label"];
+        run(doc, "constraint.add", {{"type", "tangent"}, {"a", lab}, {"b", f["between"][0]}});
+        run(doc, "constraint.add", {{"type", "tangent"}, {"a", lab}, {"b", f["between"][1]}});
+        if (first.empty()) first = lab;
+        else run(doc, "constraint.add", {{"type", "equal_radius"}, {"a", first}, {"b", lab}});
+    }
+    run(doc, "constraint.add", {{"type", "symmetric"}, {"a", "right"}, {"b", "left"}, {"datum", "part"}, {"axis", "x"}});
+    const json solved = run(doc, "solve");
+    REQUIRE(solved["converged"].get<bool>());
+    s = run(doc, "summary");
+    double worst_cost = 0;
+    for (const auto& c : s["constraints"]) {
+        const std::string type = c["constraint"]["type"];
+        if (type != "tangent" && type != "equal_radius" && type != "symmetric") continue;
+        INFO(c.dump());
+        CHECK(c["last_solve"]["status"] == "satisfied");
+        CHECK(c["last_solve"]["violation"].get<double>() < 1e-9);
+        worst_cost = std::max(worst_cost, c["last_solve"]["moves_scan_fit_mm"].get<double>());
+    }
+    std::println("tangent / equal radius / symmetric: worst cost {:.4f} mm", worst_cost);
+    CHECK(worst_cost < 0.1);
+    // One radius for all fillets, near the part's 2 mm.
+    double r0 = -1;
+    for (const auto& l : s["labels"])
+        if (l["role"] == "fillet" && l.contains("solved") && l["solved"]["kind"] == "cylinder") {
+            const double r = l["solved"]["radius"];
+            if (r0 < 0) r0 = r;
+            CHECK(std::abs(r - r0) < 1e-9);
+        }
+    std::println("common fillet radius {:.4f}", r0);
+    CHECK(std::abs(r0 - 2.0) < 0.1);
+    // The datum's origin moved to the middle between the sides (x = 0 on the part).
+    CHECK(std::abs(s["datums"][0]["origin"][0].get<double>()) < 0.02);
+}

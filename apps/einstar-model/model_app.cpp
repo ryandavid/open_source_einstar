@@ -15,8 +15,9 @@ namespace einstar::modelapp {
 namespace {
 
 constexpr std::array<const char*, 3> kDisplayNames{"labels", "deviation", "model"};
-constexpr std::array<const char*, 10> kConstraintTypes{"aligned", "parallel", "perpendicular", "angle", "coplanar",
-                                                       "coaxial", "radius", "diameter", "distance", "offset"};
+constexpr std::array<const char*, 14> kConstraintTypes{"aligned",   "parallel", "perpendicular", "angle",         "coplanar",
+                                                       "coaxial",   "radius",   "diameter",      "distance",      "offset",
+                                                       "axis_distance", "tangent", "symmetric", "equal_radius"};
 
 render::Rgba8 hsv(float h, float s, float v) {
     const float c = v * s, x = c * (1 - std::abs(std::fmod(h * 6, 2.0f) - 1)), m = v - c;
@@ -539,8 +540,9 @@ void ModelApp::draw_ui(render::ViewCamera& camera) {
         ImGui::SetNextItemWidth(120);
         combo("##ct", form_.type, types);
         const std::string type = types[static_cast<std::size_t>(form_.type)];
-        const bool pair = type == "parallel" || type == "perpendicular" || type == "angle" || type == "coplanar" || type == "coaxial" || type == "distance";
-        const bool on_datum = type == "aligned" || type == "offset";
+        const bool pair = type == "parallel" || type == "perpendicular" || type == "angle" || type == "coplanar" || type == "coaxial" ||
+                          type == "distance" || type == "axis_distance" || type == "tangent" || type == "symmetric" || type == "equal_radius";
+        const bool on_datum = type == "aligned" || type == "offset" || type == "symmetric";
         ImGui::SameLine();
         ImGui::SetNextItemWidth(110);
         combo(pair ? "##ca" : "##cl", form_.a, names);
@@ -557,7 +559,7 @@ void ModelApp::draw_ui(render::ViewCamera& camera) {
             ImGui::SetNextItemWidth(40);
             ImGui::Combo("##cx", &form_.axis, "x\0y\0z\0");
         }
-        if (type == "angle" || type == "radius" || type == "diameter" || type == "distance" || type == "offset") {
+        if (type == "angle" || type == "radius" || type == "diameter" || type == "distance" || type == "offset" || type == "axis_distance") {
             ImGui::SetNextItemWidth(100);
             ImGui::InputDouble(type == "angle" ? "degrees" : "mm", &form_.value, 0, 0, "%.4f");
             ImGui::SameLine();
@@ -569,7 +571,9 @@ void ModelApp::draw_ui(render::ViewCamera& camera) {
             else p["label"] = name(form_.a);
             if (on_datum && !datums.empty()) p["datum"] = datums[static_cast<std::size_t>(form_.datum)], p["axis"] = std::string(1, "xyz"[form_.axis]);
             if (type == "angle") p["degrees"] = form_.value;
-            else p["value"] = form_.value;
+            else if (type != "tangent" && type != "symmetric" && type != "equal_radius" && type != "parallel" && type != "perpendicular" &&
+                     type != "coplanar" && type != "coaxial" && type != "aligned")
+                p["value"] = form_.value;
             run("constraint.add", p);
         }
         for (const auto& c : summary["constraints"]) {

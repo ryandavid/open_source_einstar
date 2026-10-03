@@ -964,6 +964,14 @@ struct Document::Impl {
             any("a");
             any("b");
             value(true);
+        } else if (type == "tangent" || type == "equal_radius") {
+            lbl("a");
+            lbl("b");
+        } else if (type == "symmetric") {
+            any("a");
+            any("b");
+            spec["datum"] = datum_ref(need(p, "datum")).id;
+            spec["axis"] = axis_index(need(p, "axis"));
         } else if (type == "angle") {
             any("a");
             any("b");
@@ -1135,6 +1143,9 @@ struct Document::Impl {
             else if (type == "distance") fc = fit::Distance{f("a"), f("b"), s["value"].get<double>()};
             else if (type == "offset") fc = fit::Offset{f("label"), dt(), s["axis"].get<int>(), s["value"].get<double>()};
             else if (type == "axis_distance") fc = fit::AxisDistance{f("a"), f("b"), s["value"].get<double>()};
+            else if (type == "tangent") fc = fit::Tangent{f("a"), f("b")};
+            else if (type == "equal_radius") fc = fit::EqualRadius{f("a"), f("b")};
+            else if (type == "symmetric") fc = fit::Symmetric{f("a"), f("b"), dt(), s["axis"].get<int>()};
             if (!fc) continue;
             constraint_of.push_back(c.id);
             in.constraints.push_back(*fc);
