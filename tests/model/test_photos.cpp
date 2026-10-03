@@ -246,6 +246,23 @@ TEST_CASE("a photo registered to the scan: its camera from matched points, the s
     CHECK(!proj["on_scan"].is_null());
     CHECK(model::overlay_lines(doc, doc.state().photos[0]).size() > 100);
 
+    // The scan coloured from the photo: a vertex it sees takes the photo's colour there (the photo is a gradient:
+    // red across, green down); the back of the part, which it does not see, stays uncoloured.
+    const auto colours = model::photo_colours(doc);
+    const auto& mesh = doc.mesh();
+    const auto nearest = [&](const Vec3& p) {
+        std::size_t best = 0;
+        for (std::size_t v = 0; v < mesh.vertices.size(); ++v)
+            if ((mesh.vertices[v].cast<double>() - p).squaredNorm() < (mesh.vertices[best].cast<double>() - p).squaredNorm()) best = v;
+        return best;
+    };
+    const std::size_t seen = nearest({0, -10, 20}), behind = nearest({0, 25, 2});
+    REQUIRE(colours[seen][3] == 255);
+    const Vec2 at = *truth.project(mesh.vertices[seen].cast<double>());
+    CHECK(std::abs(colours[seen][0] - 255.0 * at.x() / W) < 12);
+    CHECK(std::abs(colours[seen][1] - 255.0 * at.y() / H) < 12);
+    CHECK(colours[behind][3] == 0);
+
     // Background is not the part: no matching on it, and it hides nothing.
     const std::string under = proj["on_scan"]["label"];
     run(doc, "label.update", {{"label", under}, {"role", "ignore"}});

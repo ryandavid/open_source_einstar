@@ -10,11 +10,12 @@
 #include "dialogs.hpp"
 #include "einstar/model/io.hpp"
 #include "einstar/model/json.hpp"
+#include "einstar/model/photo_geometry.hpp"
 
 namespace einstar::modelapp {
 namespace {
 
-constexpr std::array<const char*, 3> kDisplayNames{"labels", "deviation", "model"};
+constexpr std::array<const char*, 4> kDisplayNames{"labels", "deviation", "model", "photos"};
 constexpr std::array<const char*, 14> kConstraintTypes{"aligned",   "parallel", "perpendicular", "angle",         "coplanar",
                                                        "coaxial",   "radius",   "diameter",      "distance",      "offset",
                                                        "axis_distance", "tangent", "symmetric", "equal_radius"};
@@ -126,7 +127,33 @@ bool ModelApp::start(std::string_view command, json params, model::Author author
     return true;
 }
 
+std::string ModelApp::photo_colours_key() const {
+    std::string key = std::format("{}", static_cast<const void*>(doc.has_scan() ? &doc.mesh() : nullptr));
+    for (const auto& ph : doc.state().photos)
+        if (ph.camera && ph.use_for_colour) key += std::format("|{}:{:.6f}:{:.6f}", ph.id, ph.camera->focal_px, ph.camera->T_camera_world.translation().x());
+    // Background labels (ignore) are left uncoloured: a change of role changes the colouring.
+    for (const auto& l : doc.state().labels)
+        if (l.role == model::Role::ignore) key += std::format("|i{}", l.id);
+    return key;
+}
+
 void ModelApp::update() {
+    if (colour_job_.valid() && colour_job_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        photo_colours_ = colour_job_.get();
+        busy_text_.clear();
+        shown_revision_ = ~0ull;  // redraw with them
+        return;
+    }
+    // Photo colours wanted and out of date: made in the background (the document waits).
+    if (display == Display::photos && !busy() && doc.has_scan()) {
+        const auto key = photo_colours_key();
+        if (key != photo_colours_key_) {
+            photo_colours_key_ = key;
+            busy_text_ = "Colouring the scan from the photos ...";
+            colour_job_ = std::async(std::launch::async, [this] { return model::photo_colours(doc); });
+            return;
+        }
+    }
     if (command_job_.valid() && command_job_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
         model::Outcome o = command_job_.get();
         busy_text_.clear();
@@ -297,7 +324,13 @@ std::optional<RenderUpdate> ModelApp::take_render_update() {
             shown_scan_ = &m;
         }
         u.colors.assign(m.vertices.size(), {200, 202, 208, 255});
-        if (display == Display::deviation && doc.built() && doc.built()->result.ok) {
+        if (display == Display::photos) {
+            // Where no photo sees the part: a darker grey.
+            for (std::size_t v = 0; v < u.colors.size(); ++v)
+                u.colors[v] = v < photo_colours_.size() && photo_colours_[v][3]
+                                  ? render::Rgba8{photo_colours_[v][0], photo_colours_[v][1], photo_colours_[v][2], 255}
+                                  : render::Rgba8{120, 122, 128, 255};
+        } else if (display == Display::deviation && doc.built() && doc.built()->result.ok) {
             const auto& d = doc.built()->deviation.distance;
             for (std::size_t v = 0; v < u.colors.size() && v < d.size(); ++v) {
                 const auto c = fit::deviation_color(d[v], static_cast<float>(tol), static_cast<float>(range));
@@ -397,6 +430,13 @@ void ModelApp::draw_ui(render::ViewCamera& camera) {
         ImGui::RadioButton("Deviation", &d, 1);
         ImGui::SameLine();
         ImGui::RadioButton("Model", &d, 2);
+        const bool registered = std::ranges::any_of(doc.state().photos, [](const model::Photo& ph) { return ph.camera.has_value(); });
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!registered);
+        ImGui::RadioButton("Photos", &d, 3);
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("The scan coloured from its registered photos (Photo window: Match to scan).");
         display = static_cast<Display>(d);
         ImGui::SameLine();
         ImGui::Checkbox("Edges", &show_edges);

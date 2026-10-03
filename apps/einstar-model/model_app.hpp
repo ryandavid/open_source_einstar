@@ -4,6 +4,8 @@
 // (processing an .estr). Everything that changes the document goes through ModelApp::run (the document's
 // commands), from the panels, the brush and the agent alike.
 
+#include <array>
+#include <cstdint>
 #include <filesystem>
 #include <future>
 #include <optional>
@@ -20,7 +22,7 @@ namespace einstar::modelapp {
 
 using model::json;
 
-enum class Display { labels, deviation, model };
+enum class Display { labels, deviation, model, photos };
 [[nodiscard]] std::string_view display_name(Display d);
 [[nodiscard]] std::optional<Display> display_from_name(std::string_view s);
 
@@ -51,7 +53,7 @@ public:
     // background too; the window stays live, and nothing else touches the document until they finish.
     [[nodiscard]] static bool is_slow(std::string_view command);
     bool start(std::string_view command, json params, model::Author author = model::Author::user);
-    [[nodiscard]] bool busy() const { return job_.valid() || command_job_.valid(); }
+    [[nodiscard]] bool busy() const { return job_.valid() || command_job_.valid() || colour_job_.valid(); }
     [[nodiscard]] const std::string& busy_text() const { return busy_text_; }
     // Called every frame: finishes background work.
     void update();
@@ -92,6 +94,11 @@ private:
     std::string busy_text_;
     std::optional<model::Outcome> open_outcome_;
     std::future<model::Outcome> command_job_;
+    // The scan coloured from registered photos (Display::photos), made in the background when they change.
+    std::future<std::vector<std::array<std::uint8_t, 4>>> colour_job_;
+    std::vector<std::array<std::uint8_t, 4>> photo_colours_;
+    std::string photo_colours_key_;  // what they were made from
+    [[nodiscard]] std::string photo_colours_key() const;
     std::string command_name_;
     struct Stroke {
         bool erase = false;

@@ -448,9 +448,9 @@ std::vector<MethodSpec> build() {
     add("model.view", model, mutating,
         "What the modelling app's 3D view shows and from where (then ui.screenshot to see it). mode: labels (each label's "
         "colour; painted seeds brighter), deviation (green within tolerance, yellow-red where the scan is outside the model, "
-        "cyan-blue inside), model (the built solid). preset: look from top, bottom, front, back, left, right or iso (in the "
+        "cyan-blue inside), model (the built solid), photos (the scan coloured from its registered photos). preset: look from top, bottom, front, back, left, right or iso (in the "
         "first datum's axes when there is one). frame: fit a label (or 'all') in the view.",
-        object({{"mode", one_of({"labels", "deviation", "model"}, "What to show.")},
+        object({{"mode", one_of({"labels", "deviation", "model", "photos"}, "What to show.")},
                 {"preset", one_of({"top", "bottom", "front", "back", "left", "right", "iso", "scanned"},
                                   "Look from (scanned: the side the scanner saw the surface from).")},
                 {"frame", str("A label's name, or 'all'.")},

@@ -134,6 +134,15 @@ length, the photo's camera is solved, relative to the part only.
 - `model.photo.project` maps a pixel to a scan point and label, and a scan point back to a pixel.
 - The photo's camera is drawn in the 3D view, and *View from photo* takes the 3D view to it.
 
+### Photo colour on the scan
+
+The *Photos* view mode (`model.view mode=photos`) colours the scan from its registered photos. Each vertex
+takes its colour from the photo that sees it most head-on, where nothing of the part hides it.
+- Background (scan labelled `ignore`) stays grey, as does what no photo sees.
+- A photo where something covers the part (a hand, the assembly) can be left out with *use for colour*
+  (`model.photo.update`).
+- The colours are made in the background, and again only when a camera or the scan changes.
+
 ### Applying a measurement
 
 *Apply* (`model.photo.apply`) makes an annotation's value hold on the model. What it becomes depends on its

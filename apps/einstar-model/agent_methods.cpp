@@ -120,7 +120,7 @@ void register_model_agent(agent::Server& server, ModelApp& app, render::ViewCame
         if (app.busy()) return agent::error(ErrorCode::refused, "busy: " + app.busy_text());
         if (p.contains("mode")) {
             const auto d = display_from_name(p["mode"].get<std::string>());
-            if (!d) throw agent::Server::BadParams("mode is labels, deviation or model");
+            if (!d) throw agent::Server::BadParams("mode is labels, deviation, model or photos");
             app.display = *d;
         }
         if (p.contains("edges")) app.show_edges = p["edges"].get<bool>();

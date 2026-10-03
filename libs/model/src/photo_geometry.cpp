@@ -4,6 +4,11 @@
 #include <cmath>
 #include <numbers>
 
+#include <tbb/blocked_range.h>
+#include <tbb/parallel_for.h>
+
+#include "einstar/image/image.hpp"
+
 namespace einstar::model {
 
 fit::PinholeCamera pinhole_of(const PhotoCamera& c) {
@@ -126,6 +131,68 @@ ScanReading read_on_scan(const Document& doc, const Photo& ph, const Annotation&
         if ((centre && near_axis(*centre)) || std::ranges::any_of(hits, [&](const auto& h) { return h && near_axis(h->point); }))
             out.suggested_links.push_back(hole.id);
     }
+    return out;
+}
+
+std::vector<std::array<std::uint8_t, 4>> photo_colours(const Document& doc, int max_edge) {
+    std::vector<std::array<std::uint8_t, 4>> out;
+    if (!doc.has_scan()) return out;
+    const auto& mesh = doc.mesh();
+    out.assign(mesh.vertices.size(), {0, 0, 0, 0});
+    struct Source {
+        fit::PinholeCamera camera;
+        image::Rgba pixels;
+        double scale = 1;  // decoded px per photo px
+    };
+    std::vector<Source> sources;
+    for (const auto& ph : doc.state().photos) {
+        if (!ph.camera || !ph.use_for_colour || !ph.blob) continue;
+        auto img = image::decode(ph.blob->bytes, max_edge);
+        if (!img) continue;
+        const double scale = static_cast<double>(img->width) / ph.width;
+        sources.push_back({pinhole_of(*ph.camera), std::move(*img), scale});
+    }
+    if (sources.empty()) return out;
+    const auto& topo = doc.topology();
+    tbb::parallel_for(tbb::blocked_range<std::size_t>(0, mesh.vertices.size(), 2048), [&](const auto& range) {
+        for (std::size_t v = range.begin(); v < range.end(); ++v) {
+            const auto tris = topo.vertex_triangles(static_cast<std::uint32_t>(v));
+            if (tris.empty() || is_background(doc, tris[0])) continue;
+            const Vec3 p = mesh.vertices[v].cast<double>();
+            const Vec3 n = v < mesh.normals.size() ? Vec3(mesh.normals[v].cast<double>()) : Vec3::Zero();
+            double best = 0.15;  // seen at more than ~80 degrees off: too oblique to trust
+            const Source* from = nullptr;
+            Vec2 at = Vec2::Zero();
+            for (const auto& src : sources) {
+                const Vec3 to_eye = src.camera.center() - p;
+                const double dist = to_eye.norm();
+                const double facing = n.dot(to_eye) / dist;
+                if (facing <= best) continue;
+                const auto px = src.camera.project(p);
+                if (!px) continue;
+                const Vec2 q = *px * src.scale;
+                if (q.x() < 0 || q.y() < 0 || q.x() >= src.pixels.width - 1 || q.y() >= src.pixels.height - 1) continue;
+                const auto hit = first_part_hit(doc, src.camera.center(), -to_eye / dist);
+                if (hit && (hit->point - src.camera.center()).norm() < dist - std::max(1.0, 0.01 * dist)) continue;  // hidden
+                best = facing;
+                from = &src;
+                at = q;
+            }
+            if (!from) continue;
+            // Bilinear.
+            const int x0 = static_cast<int>(at.x()), y0 = static_cast<int>(at.y());
+            const double fx = at.x() - x0, fy = at.y() - y0;
+            const auto px = [&](int x, int y, int c) {
+                return static_cast<double>(from->pixels.pixels[(static_cast<std::size_t>(y) * static_cast<std::size_t>(from->pixels.width) + static_cast<std::size_t>(x)) * 4 +
+                                                               static_cast<std::size_t>(c)]);
+            };
+            for (int c = 0; c < 3; ++c) {
+                const double val = (1 - fy) * ((1 - fx) * px(x0, y0, c) + fx * px(x0 + 1, y0, c)) + fy * ((1 - fx) * px(x0, y0 + 1, c) + fx * px(x0 + 1, y0 + 1, c));
+                out[v][static_cast<std::size_t>(c)] = static_cast<std::uint8_t>(std::clamp(val, 0.0, 255.0));
+            }
+            out[v][3] = 255;
+        }
+    });
     return out;
 }
 
