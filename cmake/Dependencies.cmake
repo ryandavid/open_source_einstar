@@ -6,6 +6,21 @@ find_package(Eigen3 REQUIRED NO_MODULE)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBUSB REQUIRED IMPORTED_TARGET libusb-1.0)
 find_package(TBB REQUIRED)
+# Homebrew keeps TBB's headers in a directory the compiler searches implicitly
+# (/usr/local/include on Intel, /opt/homebrew/include on Apple Silicon). CMake
+# drops implicit directories from the compile line, so the -isystem that would
+# mark TBB::tbb's (imported, hence system) headers as system headers is never
+# emitted -- and TBB's own headers then get compiled under our -Werror warning
+# flags, e.g. -Wsign-conversion firing inside <tbb/blocked_range.h>. Drop TBB's
+# include dir from the implicit list so it is passed as -isystem, like every
+# other third-party dependency here. (Harmless if TBB lives off a non-implicit
+# path: the dir is simply not in the list to remove.)
+get_target_property(_einstar_tbb_includes TBB::tbb INTERFACE_INCLUDE_DIRECTORIES)
+if(_einstar_tbb_includes)
+  list(REMOVE_ITEM CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES ${_einstar_tbb_includes})
+  list(REMOVE_ITEM CMAKE_OBJCXX_IMPLICIT_INCLUDE_DIRECTORIES ${_einstar_tbb_includes})
+endif()
+unset(_einstar_tbb_includes)
 find_package(zstd CONFIG QUIET)
 if(NOT zstd_FOUND)
   pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
