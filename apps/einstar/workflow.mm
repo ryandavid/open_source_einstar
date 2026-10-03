@@ -32,6 +32,10 @@ std::string choose_file(NSString* message) {
     panel.message = message;
     if (const char* home = std::getenv("HOME"))
         panel.directoryURL = [NSURL fileURLWithPath:[NSString stringWithUTF8String:(std::string(home) + "/Documents/Einstar/Scans").c_str()]];
+    // Launched by einstar-mcp, the app is a background process; without this the panel opens un-keyed at the
+    // normal window level, behind the always-front Metal window, so it never shows. Activating raises it to
+    // the modal level in front and makes it key.
+    [NSApp activateIgnoringOtherApps:YES];
     if ([panel runModal] == NSModalResponseOK) return panel.URL.path.UTF8String;
     return {};
 }

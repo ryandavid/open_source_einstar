@@ -2,9 +2,10 @@
 
 #include <array>
 #include <cctype>
-#include <charconv>
 #include <cmath>
+#include <cstdlib>
 #include <format>
+#include <string>
 #include <utility>
 
 namespace einstar::model {
@@ -34,10 +35,14 @@ struct Scanner {
     [[nodiscard]] bool at_digit() const { return i < s.size() && (std::isdigit(static_cast<unsigned char>(s[i])) || s[i] == '.'); }
     std::optional<double> number() {
         if (!at_digit()) return std::nullopt;
-        double v = 0;
-        const auto r = std::from_chars(s.data() + i, s.data() + s.size(), v);
-        if (r.ec != std::errc()) return std::nullopt;
-        i = static_cast<std::size_t>(r.ptr - s.data());
+        // Apple's libc++ has no floating-point std::from_chars, so parse with strtod. The view may not be
+        // null-terminated, so copy the remainder (these strings are short); at_digit() ruled out a sign/inf/nan.
+        const std::string rest(s.substr(i));
+        const char* begin = rest.c_str();
+        char* end = nullptr;
+        const double v = std::strtod(begin, &end);
+        if (end == begin) return std::nullopt;
+        i += static_cast<std::size_t>(end - begin);
         return v;
     }
     // 1.5, 3/8, 1 1/2

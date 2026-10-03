@@ -216,7 +216,9 @@ TEST_CASE("a photo registered to the scan: its camera from matched points, the s
     }
     std::println("registered: {}", last["camera"].dump());
     CHECK(last["camera"]["rms_px"].get<double>() < 0.5);
-    const auto& cam = *doc.state().photos[0].camera;
+    // A copy, not a reference: later mutating commands replace the document state (copy-on-write for undo),
+    // which would dangle a reference into the photo's camera.
+    const auto cam = *doc.state().photos[0].camera;
     CHECK((model::pinhole_of(cam).center() - eye).norm() < 1.0);
 
     // A dimension across the flange's front edge, and a hole's rim: the scan's reading and the suggested links.

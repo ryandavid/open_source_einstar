@@ -425,7 +425,8 @@ void ModelApp::draw_ui(render::ViewCamera& camera) {
     // ---- View ----
     if (ImGui::CollapsingHeader("View", ImGuiTreeNodeFlags_DefaultOpen)) {
         int d = static_cast<int>(display);
-        ImGui::RadioButton("Labels", &d, 0);
+        // ##view keeps the "Labels" caption but a distinct ID from the Labels section header below.
+        ImGui::RadioButton("Labels##view", &d, 0);
         ImGui::SameLine();
         ImGui::RadioButton("Deviation", &d, 1);
         ImGui::SameLine();

@@ -26,6 +26,7 @@ std::optional<std::filesystem::path> choose_open_file(const std::vector<std::str
     panel.canChooseDirectories = NO;
     panel.allowsMultipleSelection = NO;
     panel.allowedContentTypes = types_of(extensions);
+    [NSApp activateIgnoringOtherApps:YES];  // background-launched: bring the panel to the front, keyed (see below)
     if ([panel runModal] != NSModalResponseOK || panel.URLs.count == 0) return std::nullopt;
     return std::filesystem::path(panel.URLs.firstObject.fileSystemRepresentation);
 }
@@ -37,6 +38,7 @@ std::vector<std::filesystem::path> choose_open_files(const std::vector<std::stri
     panel.allowsMultipleSelection = YES;
     panel.allowedContentTypes = types_of(extensions);
     std::vector<std::filesystem::path> out;
+    [NSApp activateIgnoringOtherApps:YES];  // background-launched: bring the panel to the front, keyed
     if ([panel runModal] != NSModalResponseOK) return out;
     for (NSURL* url in panel.URLs) out.emplace_back(url.fileSystemRepresentation);
     return out;
@@ -72,6 +74,7 @@ std::optional<std::filesystem::path> choose_save_file(const std::string& name, c
     NSSavePanel* panel = [NSSavePanel savePanel];
     panel.nameFieldStringValue = [NSString stringWithUTF8String:name.c_str()];
     panel.allowedContentTypes = types_of({extension});
+    [NSApp activateIgnoringOtherApps:YES];  // background-launched: bring the panel to the front, keyed
     if ([panel runModal] != NSModalResponseOK || !panel.URL) return std::nullopt;
     return std::filesystem::path(panel.URL.fileSystemRepresentation);
 }

@@ -235,6 +235,7 @@ std::string choose_directory() {
     panel.canChooseFiles = NO;
     panel.allowsMultipleSelection = NO;
     panel.message = @"Choose a folder of calibration captures (imageLeftN / imageRightN)";
+    [NSApp activateIgnoringOtherApps:YES];  // background-launched: bring the panel to the front, keyed
     if ([panel runModal] == NSModalResponseOK) return panel.URL.path.UTF8String;
     return {};
 }
@@ -245,6 +246,7 @@ std::string choose_path() {
     panel.canChooseFiles = YES;
     panel.allowsMultipleSelection = NO;
     panel.message = @"Choose a calibration: EXStar's CCF folder, a flash dump (.bin) or an einstar-calibrate calibration.txt";
+    [NSApp activateIgnoringOtherApps:YES];  // background-launched: bring the panel to the front, keyed
     if ([panel runModal] == NSModalResponseOK) return panel.URL.path.UTF8String;
     return {};
 }
@@ -255,6 +257,7 @@ std::string choose_file() {
     panel.canChooseFiles = YES;
     panel.allowsMultipleSelection = NO;
     panel.message = @"Choose a calibration backup (flash-backup-*.bin)";
+    [NSApp activateIgnoringOtherApps:YES];  // background-launched: bring the panel to the front, keyed
     if ([panel runModal] == NSModalResponseOK) return panel.URL.path.UTF8String;
     return {};
 }
