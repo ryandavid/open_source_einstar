@@ -1134,7 +1134,12 @@ struct Document::Impl {
             for (const int id : a.links) j["links"].push_back(link_name(id));
         }
         if (const auto c = annotation_circle(a)) j["circle"] = {{"center", {c->first.x(), c->first.y()}}, {"radius_px", c->second}};
-        if (a.applied) j["applied_to"] = a.applied;
+        if (a.applied) {
+            if (const auto c = std::ranges::find(d.state_.constraints, a.applied, &ConstraintDef::id); c != d.state_.constraints.end())
+                j["applied"] = constraint_json(*c);
+            for (const auto& f : d.state_.fillets)
+                if (f.id == a.applied) j["applied"] = {{"fillet", f.name}, {"radius", f.used_radius()}};
+        }
         if (ph.camera) {
             const auto scan = scan_reading(ph, a);
             for (const auto& [k, v] : scan.items()) j[k] = v;
@@ -1450,6 +1455,69 @@ struct Document::Impl {
         }
         if (out.empty()) fail("give 'pixel' and/or 'point'");
         return out;
+    }
+
+    // Turns an annotation's value into what it measures on the model, by its links: a constraint (a distance between
+    // two faces, a pitch between two holes, a diameter or radius, an angle) or a fillet's radius. Applying again
+    // replaces what it applied before.
+    json photo_apply(const json& p) {
+        need_scan();
+        auto [ph, a] = annotation_ref(need(p, "annotation"));
+        if (!a->value) refuse(std::format("{} has no value to apply", a->name));
+        const double v = *a->value;
+        const char form = a->entered.empty() ? 0 : parse_value(a->entered, a->kind == AnnotationKind::angle).value_or(ParsedValue{}).form;
+        std::vector<int> holes, fillets, planes, round;  // round: cylinder and sphere labels
+        for (const int id : a->links) {
+            if (std::ranges::any_of(d.state_.holes, [&](const Hole& h) { return h.id == id; })) holes.push_back(id);
+            else if (std::ranges::any_of(d.state_.fillets, [&](const Fillet& f) { return f.id == id; })) fillets.push_back(id);
+            else if (const Label* l = d.label(id)) {
+                const auto* s = l->given ? &*l->given : l->fit ? &*l->fit : nullptr;
+                const auto kind = s ? fit::kind_of(*s) : fit::SurfaceKind::freeform;
+                if (kind == fit::SurfaceKind::plane) planes.push_back(id);
+                else if (kind == fit::SurfaceKind::cylinder || kind == fit::SurfaceKind::sphere) round.push_back(id);
+                else if (l->role == Role::fillet) round.push_back(id);
+            }
+        }
+        const std::size_t n = a->links.size();
+        const bool diameter = a->kind == AnnotationKind::diameter || form == 'D';
+        const bool radius = form == 'R';
+        json spec;
+        int fillet = 0;
+        double fillet_radius = 0;
+        if (a->kind == AnnotationKind::angle) {
+            if (n != 2) refuse(std::format("{}: link the two faces (or holes) the angle is between", a->name));
+            spec = {{"type", "angle"}, {"a", a->links[0]}, {"b", a->links[1]}, {"degrees", v}};
+        } else if ((diameter || radius) && n == 1) {
+            if (!holes.empty()) spec = {{"type", "diameter"}, {"hole", holes[0]}, {"value", radius ? 2 * v : v}};
+            else if (!fillets.empty()) fillet = fillets[0], fillet_radius = radius ? v : v / 2;
+            else if (!round.empty()) spec = {{"type", radius ? "radius" : "diameter"}, {"label", round[0]}, {"value", v}};
+        } else if (n == 2 && planes.size() == 2) {
+            spec = {{"type", "distance"}, {"a", planes[0]}, {"b", planes[1]}, {"value", v}};
+        } else if (n == 2 && holes.size() + round.size() == 2) {
+            const auto axes = [&] {
+                std::vector<int> x = holes;
+                x.insert(x.end(), round.begin(), round.end());
+                return x;
+            }();
+            spec = {{"type", "axis_distance"}, {"a", axes[0]}, {"b", axes[1]}, {"value", v}};
+        }
+        if (spec.is_null() && !fillet)
+            refuse(std::format("{}: its links do not say what it measures. Link two faces for a distance, two holes for a pitch, a hole "
+                               "(with a diameter) for its size, a fillet (R...) for its radius, or two faces for an angle",
+                               a->name));
+        // What it applied before goes.
+        if (a->applied && std::ranges::any_of(d.state_.constraints, [&](const ConstraintDef& c) { return c.id == a->applied; }))
+            constraint_remove({{"constraint", a->applied}});
+        json out;
+        if (fillet) {
+            fillet_update({{"fillet", fillet}, {"radius", fillet_radius}});
+            a->applied = fillet;
+            out = {{"fillet", link_name(fillet)}, {"radius", fillet_radius}};
+        } else {
+            out = constraint_add(spec);
+            a->applied = out["id"].get<int>();
+        }
+        return {{"annotation", a->name}, {"applied", out}};
     }
 
     json photo_list(const json& p) const {
@@ -1945,6 +2013,7 @@ const std::map<std::string, CommandInfo, std::less<>>& table() {
         {"photo.correspond.remove", {[](I& i, const json& p) { return i.photo_correspond_remove(p); }, true}},
         {"photo.register", {[](I& i, const json& p) { return i.photo_register(p); }, true}},
         {"photo.project", {[](I& i, const json& p) { return i.photo_project(p); }, false}},
+        {"photo.apply", {[](I& i, const json& p) { return i.photo_apply(p); }, true}},
         {"note.add", {[](I& i, const json& p) { return i.note_add(p); }, true}},
         {"note.update", {[](I& i, const json& p) { return i.note_update(p); }, true}},
         {"note.delete", {[](I& i, const json& p) { return i.note_delete(p); }, true}},

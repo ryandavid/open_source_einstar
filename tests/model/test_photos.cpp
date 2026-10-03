@@ -264,3 +264,57 @@ TEST_CASE("a photo registered to the scan: its camera from matched points, the s
     CHECK((model::pinhole_of(*again.state().photos[0].camera).center() - model::pinhole_of(cam).center()).norm() < 1e-9);
     CHECK(again.state().photos[0].correspondences.size() == corners.size());
 }
+
+TEST_CASE("a measurement on a photo applied to the model: by its links, a distance, a pitch, a diameter, a radius, an angle") {
+    TempDir tmp;
+    model::Document doc;
+    run(doc, "open_demo");
+    run(doc, "detect");
+    run(doc, "photo.import", {{"path", write_photo(tmp.path, "bench.jpg", 400, 300).string()}});
+    const json s = run(doc, "summary");
+    // The faces and holes by where they are.
+    const auto label_at = [&](json origin, json dir) { return run(doc, "raycast", {{"origin", origin}, {"direction", dir}})["label"].get<std::string>(); };
+    const std::string top = label_at({10, 8, 100}, {0, 0, -1}), flange = label_at({45, 0, 100}, {0, 0, -1});
+    const std::string right = label_at({80, 3, 12}, {-1, 0, 0}), front = label_at({3, -80, 12}, {0, 1, 0});
+    std::string h1, h2, blind;
+    for (const auto& h : s["holes"]) {
+        const double x = h["center"][0], y = h["center"][1];
+        if (std::hypot(x - 42, y + 19) < 1) h1 = h["name"];
+        if (std::hypot(x - 42, y - 19) < 1) h2 = h["name"];
+        if (std::hypot(x, y) < 1) blind = h["name"];
+    }
+    REQUIRE(!s["fillets"].empty());
+    const std::string fillet = s["fillets"][0]["name"];
+    const auto annotate = [&](const char* kind, json points, json value, json links) {
+        return run(doc, "photo.annotate", {{"photo", "bench"}, {"kind", kind}, {"points", points}, {"value", value}, {"links", links}})["name"].get<std::string>();
+    };
+    const json two = {{10, 10}, {200, 10}};
+    const auto applied = [&](const std::string& name) { return run(doc, "photo.apply", {{"annotation", name}})["applied"]; };
+
+    CHECK(applied(annotate("dimension", two, "16 mm", {top, flange}))["constraint"]["type"] == "distance");
+    CHECK(applied(annotate("dimension", two, "38", {h1, h2}))["constraint"]["type"] == "axis_distance");
+    const json dia = applied(annotate("diameter", {{50, 50}, {60, 60}, {70, 50}}, "Ø8.0", {blind}));
+    CHECK(dia["constraint"]["type"] == "diameter");
+    CHECK(dia["constraint"]["value"].get<double>() == Approx(8.0));
+    const json r = applied(annotate("callout", two, "R2", {fillet}));
+    CHECK(r["fillet"] == fillet);
+    CHECK(r["radius"].get<double>() == Approx(2.0));
+    CHECK(applied(annotate("angle", {{10, 10}, {100, 100}, {190, 10}}, "90", {right, front}))["constraint"]["type"] == "angle");
+
+    // Not enough to go on: said so.
+    const std::string vague = annotate("dimension", two, "12", {top});
+    const auto o = doc.apply("photo.apply", {{"annotation", vague}});
+    CHECK(!o.ok);
+    CHECK(o.error.find("Link two faces") != std::string::npos);
+
+    // Applying again replaces; after a solve, the annotation shows how its constraint fared.
+    const std::size_t before = run(doc, "summary")["constraints"].size();
+    run(doc, "photo.annotation.update", {{"annotation", "D1"}, {"value", "16.0 mm"}});
+    applied("D1");
+    CHECK(run(doc, "summary")["constraints"].size() == before);
+    run(doc, "solve");
+    const json listed = run(doc, "photo.list", {{"photo", "bench"}})["photos"][0]["annotations"];
+    REQUIRE(listed[0].contains("applied"));
+    CHECK(listed[0]["applied"]["last_solve"]["status"].is_string());
+    std::println("D1 after the solve: {}", listed[0]["applied"]["last_solve"].dump());
+}

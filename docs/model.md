@@ -134,6 +134,24 @@ length, the photo's camera is solved, relative to the part only.
 - `model.photo.project` maps a pixel to a scan point and label, and a scan point back to a pixel.
 - The photo's camera is drawn in the 3D view, and *View from photo* takes the 3D view to it.
 
+### Applying a measurement
+
+*Apply* (`model.photo.apply`) makes an annotation's value hold on the model. What it becomes depends on its
+links:
+
+| Linked to | Becomes |
+|---|---|
+| two plane faces | a `distance` |
+| two holes or cylinders | an `axis_distance` (a pitch) |
+| a hole, with a diameter or a value typed `Ø…` | the hole's `diameter` |
+| a cylinder | its `diameter`, or its `radius` when typed `R…` |
+| a fillet, typed `R…` | the fillet's radius |
+| two faces, with an angle | an `angle` |
+
+- After a solve, the annotation shows how its constraint fared: its status and how far it moved the scan fit.
+- Applying again replaces what was applied before.
+- Applied photo measurements count toward the scale check like any other measurement.
+
 ## When the scan changes
 
 The model keeps its own copy of the mesh, so a changed source cannot move the labels underneath it. When

@@ -639,8 +639,32 @@ struct PhotoUi::Impl {
             }
             if (ImGui::BeginPopupContextItem("annotation menu")) {
                 if (ImGui::MenuItem("Edit...")) begin_edit(a.id, a.kind, a.points, &a);
+                if (ImGui::MenuItem("Apply to the model", nullptr, false, a.value && !a.links.empty())) app.run("photo.apply", {{"annotation", a.id}});
                 if (ImGui::MenuItem("Delete")) remove = a.id;
                 ImGui::EndPopup();
+            }
+            if (a.applied) {
+                // How what it applied fared in the last solve.
+                const auto& st = app.doc.state();
+                std::string how;
+                for (const auto& c : st.constraints)
+                    if (c.id == a.applied) {
+                        how = std::format("applied: {}", c.spec["type"].get<std::string>());
+                        const auto key = std::to_string(c.id);
+                        if (st.solve_report.contains("constraints") && st.solve_report["constraints"].contains(key)) {
+                            const auto& r = st.solve_report["constraints"][key];
+                            how += std::format(", {}, moves the scan fit {:.3f} mm", r.value("status", "?"), r.value("moves_scan_fit_mm", 0.0));
+                        } else {
+                            how += " (solve to see how it fits)";
+                        }
+                    }
+                for (const auto& f : st.fillets)
+                    if (f.id == a.applied) how = std::format("applied: {} radius", f.name);
+                if (!how.empty()) {
+                    ImGui::Indent();
+                    ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.55f, 1), "%s", how.c_str());
+                    ImGui::Unindent();
+                }
             }
             if (!a.links.empty() || a.author != "user") {
                 std::string about;
@@ -658,6 +682,14 @@ struct PhotoUi::Impl {
                 const auto* a = annotation(ph, selected);
                 begin_edit(a->id, a->kind, a->points, a);
             }
+            ImGui::SameLine();
+            const auto* sel = annotation(ph, selected);
+            ImGui::BeginDisabled(!sel->value || sel->links.empty());
+            if (ImGui::Button("Apply")) app.run("photo.apply", {{"annotation", selected}});
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("Make the value hold on the model, by its links: two faces (a distance), two holes (their pitch),\n"
+                                  "a hole (its diameter), a fillet (R: its radius), two faces with an angle.");
             ImGui::SameLine();
             if (ImGui::Button("Delete")) {
                 app.run("photo.annotation.delete", {{"annotation", selected}});

@@ -54,7 +54,11 @@ Modelling (the model app) -- the user describes the part in words and measuremen
   somewhere else than the scan. Look at them (model_photo_get, grid=true to read pixel positions) before asking the user
   what you could see. Annotations (D1, DIA2, A3, C4, N5 ...) hold measured values and remarks; links say which labels or
   holes they are about. When the user tells you something about the part, keep it: model_photo_annotate on a photo that
-  shows it, or model_note_add.
+  shows it, or model_note_add. A measured annotation with links becomes a constraint (or a hole's size, a fillet's
+  radius) with model_photo_apply -- offer it rather than doing it unasked, then solve and report its status and cost.
+- A registered photo (model_photo_correspond: 6 points on the part, matched pixel to scan point) gives each annotation
+  the scan's own reading (scan_value) and suggested_links: compare them with the user's values, and use
+  model_photo_get(overlay=true) to see how the model fits the photo. Never assume a photo shows the scan's setting.
 - When model_summary's scan.source is 'changed' (the .estr was scanned further or edited since), model_reprocess
   makes the mesh again and carries the labels over; solve and build again after. In the scanning app, scan_open
   brings a recording back as a paused scan (edit it, process it, or connect the scanner and continue it)."""

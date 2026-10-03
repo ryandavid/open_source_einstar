@@ -2433,6 +2433,28 @@
   },
   {
     "app": "model",
+    "description": "Makes an annotation's value hold on the model, by what it is linked to: two faces, a distance; two holes, their pitch; a hole (a diameter, or a value typed with Ø), its size; a fillet (typed with R), its radius; a cylinder, its diameter or radius; two faces with an angle, the angle. The constraint's status and cost show in model.photo.list after model.solve. Applying again replaces it.",
+    "kind": "mutating",
+    "name": "model.photo.apply",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "annotation": {
+          "description": "An annotation: its name (D1 ...) or id.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        }
+      },
+      "required": [
+        "annotation"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
     "description": "For a registered photo: what a pixel shows on the part (a point and its label), and/or where a scan point appears in the photo (and whether the part hides it there).",
     "kind": "read_only",
     "name": "model.photo.project",

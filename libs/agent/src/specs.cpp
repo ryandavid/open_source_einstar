@@ -426,6 +426,12 @@ std::vector<MethodSpec> build() {
         "Solves the photo's camera again from its matched points; reports each point's error in px and which disagree with "
         "the rest.",
         object({{"photo", ref("A photo: its name or id.")}}, {"photo"}));
+    add("model.photo.apply", model, mutating,
+        "Makes an annotation's value hold on the model, by what it is linked to: two faces, a distance; two holes, their "
+        "pitch; a hole (a diameter, or a value typed with Ø), its size; a fillet (typed with R), its radius; a cylinder, its "
+        "diameter or radius; two faces with an angle, the angle. The constraint's status and cost show in model.photo.list "
+        "after model.solve. Applying again replaces it.",
+        object({{"annotation", ref("An annotation: its name (D1 ...) or id.")}}, {"annotation"}));
     add("model.photo.project", model, read_only,
         "For a registered photo: what a pixel shows on the part (a point and its label), and/or where a scan point appears in "
         "the photo (and whether the part hides it there).",
