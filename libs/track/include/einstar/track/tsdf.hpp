@@ -15,6 +15,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "einstar/core/lasso.hpp"
 #include "einstar/track/frame.hpp"
 
 namespace einstar::track {
@@ -77,6 +78,13 @@ struct SurfacePoint {
 // depend on how they were produced (GPU extraction appends in a varying order).
 void sort_canonical(std::vector<SurfacePoint>& points);
 
+// Voxels an erase cleared, as they were (to undo it): global voxel coordinates (brick * 8 + local).
+struct ErasedVoxels {
+    std::vector<Eigen::Vector3i> voxel;
+    std::vector<float> sdf, weight;  // sdf normalised as in Brick
+    [[nodiscard]] std::size_t size() const { return voxel.size(); }
+};
+
 // Fused surface model. Implemented on the CPU (TsdfVolume, the reference) and in Metal.
 class Volume {
 public:
@@ -113,6 +121,13 @@ public:
     [[nodiscard]] virtual std::uint32_t frame_counter() const = 0;
     [[nodiscard]] virtual const TsdfParams& params() const = 0;
     virtual void clear() = 0;
+
+    // Clears every observed voxel whose centre `selection` contains -- the surface and its truncation
+    // band, so neither extraction nor raycasting finds it -- and returns what they held. Bricks stay
+    // allocated and later frames fuse into them as usual.
+    virtual ErasedVoxels erase(const LassoSelection& selection) = 0;
+    // Puts erased voxels back (undo; nothing may have been fused since).
+    virtual void restore(const ErasedVoxels& erased) = 0;
 };
 
 class TsdfVolume final : public Volume {
@@ -131,6 +146,8 @@ public:
     [[nodiscard]] std::uint32_t frame_counter() const override { return frame_counter_; }
     [[nodiscard]] const TsdfParams& params() const override { return params_; }
     void clear() override;
+    ErasedVoxels erase(const LassoSelection& selection) override;
+    void restore(const ErasedVoxels& erased) override;
 
     // Trilinear SDF sample in mm (nullopt if unobserved).
     [[nodiscard]] std::optional<float> sample_sdf(const Vec3f& world) const;

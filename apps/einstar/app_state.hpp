@@ -11,6 +11,7 @@
 #include <Eigen/Core>
 
 #include "einstar/core/image.hpp"
+#include "einstar/core/lasso.hpp"
 #include "einstar/recon/process.hpp"
 #include "einstar/core/timing.hpp"
 #include "einstar/render/overlays.hpp"
@@ -38,6 +39,8 @@ struct RenderUpdate {
     std::optional<Eigen::Matrix4f> scanner_pose;
     // Processed mesh (full replacement when present; an empty mesh clears it).
     std::optional<std::pair<std::vector<render::MeshVertex>, std::vector<std::uint32_t>>> mesh;
+    // An edit's update: only the model changed; keep everything else (the stale frame overlay goes).
+    bool model_only = false;
 };
 
 struct Hud {
@@ -65,6 +68,13 @@ struct Hud {
     std::uint64_t recorded_frames = 0;
     std::uint64_t raw_frames = 0, raw_dropped = 0;
     std::string notice;  // short-lived message (e.g. a brightness change from the scanner's buttons)
+};
+
+// Paused-scan editing.
+struct EditStatus {
+    std::size_t undo_depth = 0;  // deletes that can still be undone
+    bool busy = false;           // a delete or undo is running
+    std::string message;         // the last one's outcome
 };
 
 struct ProcessStatus {
@@ -124,6 +134,18 @@ public:
     bool load_global_markers(const std::string& path);
     [[nodiscard]] std::string global_marker_status() const;
 
+    // Paused-scan editing (UI thread): a lasso selection built in the 3D view -- everything inside each
+    // stroke, front to back -- is deleted from the live model and from the recording's frames so far
+    // (rescanning the area brings it back). Deletes can be undone until scanning resumes.
+    [[nodiscard]] bool can_edit() const;
+    void add_lasso(LassoStroke stroke);
+    void clear_selection();
+    [[nodiscard]] const LassoSelection& selection() const { return selection_; }
+    [[nodiscard]] std::uint64_t selection_version() const { return selection_version_; }
+    void delete_selection();
+    void undo_delete();
+    [[nodiscard]] EditStatus edit_status() const;
+
     // Process step on the recorded scan (background thread).
     void process_scan(const recon::ProcessParams& params);
     void cancel_processing();
@@ -143,6 +165,10 @@ private:
     std::string error_;
     mutable std::mutex mutex_;
     std::optional<RenderUpdate> pending_;
+    LassoSelection selection_;  // UI thread
+    std::uint64_t selection_version_ = 0;
+    EditStatus edit_;           // guarded by mutex_
+    void on_edit(const pipeline::EditResult& r, bool undo);
     Hud hud_;
     std::vector<Eigen::Vector3f> trail_;
     std::atomic<bool> toggle_requested_{false};

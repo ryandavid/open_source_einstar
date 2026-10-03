@@ -377,4 +377,39 @@ kernel void extract_render(device const atomic_uint* keys [[buffer(0)]], device 
     rv.color = uchar4(uchar(grey - 40.0f * (1 - c)), uchar(grey - 20.0f * (1 - c)), uchar(grey), 255);
     out[slot] = rv;
 }
+
+// ---- erase (a lasso, through all depths) and restore ----
+// Observed voxels whose centre the selection contains. With write == 0 only counts them; otherwise also
+// records each (global coordinate, value) and clears it to unobserved.
+kernel void erase_voxels(device half2* voxels [[buffer(0)]], device const int4* coords [[buffer(1)]],
+                         const device LassoStroke* strokes [[buffer(2)]], const device uchar* masks [[buffer(3)]],
+                         device int4* out_coords [[buffer(4)]], device float2* out_values [[buffer(5)]],
+                         device atomic_uint* out_count [[buffer(6)]], constant VolumeArgs& a [[buffer(7)]],
+                         constant uint& stroke_count [[buffer(8)]], constant uint& write [[buffer(9)]],
+                         uint3 tg3 [[threadgroup_position_in_grid]], uint3 lid [[thread_position_in_threadgroup]]) {
+    const uint brick = tg3.x;
+    const uint vi = brick * 512u + (lid.z * 8u + lid.y) * 8u + lid.x;
+    const half2 v = voxels[vi];
+    if (float(v.y) <= 0.0f) return;
+    const int3 g = coords[brick].xyz * kBrick + int3(lid);
+    if (!lasso_contains((float3(g) + 0.5f) * a.voxel, strokes, stroke_count, masks)) return;
+    const uint slot = atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed);
+    if (write == 0) return;
+    out_coords[slot] = int4(g, 0);
+    out_values[slot] = float2(v);
+    voxels[vi] = half2(1.0h, 0.0h);
+}
+
+kernel void restore_voxels(device const atomic_uint* keys [[buffer(0)]], device const atomic_int* values [[buffer(1)]],
+                           device half2* voxels [[buffer(2)]], device const int4* in_coords [[buffer(3)]],
+                           device const float2* in_values [[buffer(4)]], constant VolumeArgs& a [[buffer(5)]],
+                           constant uint& count [[buffer(6)]], uint i [[thread_position_in_grid]]) {
+    if (i >= count) return;
+    const int3 g = in_coords[i].xyz;
+    const int3 b = int3(floor_div8(g.x), floor_div8(g.y), floor_div8(g.z));
+    const int brick = lookup(keys, values, a.table_mask, b);
+    if (brick < 0) return;  // cleared since
+    const int3 l = g - b * kBrick;
+    voxels[uint(brick) * 512u + uint((l.z * kBrick + l.y) * kBrick + l.x)] = half2(in_values[i]);
+}
 )METAL"

@@ -200,3 +200,68 @@ TEST_CASE("session files carry the scanner, per-frame extras, drops and raw IR")
     CHECK((*t)->read_raw(1).has_value());
     std::filesystem::remove(path);
 }
+
+TEST_CASE("an erase removes the selected depth from the frames before it, an undo cancels it") {
+    const auto path = (std::filesystem::temp_directory_path() / "einstar_test_session_erase.estr").string();
+    std::mt19937 rng(5);
+    std::vector<session::FrameRecord> frames;
+    for (std::uint64_t i = 0; i < 20; ++i) frames.push_back(make_frame(i, rng));
+    session::SessionHeader h;
+    h.depth_intrinsics = {64, 48, 58.0, 58.0, 32.0, 24.0};
+    // Orthographic onto 200 x 200 px: world x in [-1000, 1000] -> px x / 10 + 100. The lasso: world x < 0.
+    Eigen::Matrix4f vp = Eigen::Matrix4f::Identity();
+    vp(0, 0) = vp(1, 1) = 0.001f;
+    vp(2, 2) = 0.0f;
+    LassoSelection west;
+    west.add({vp, Eigen::Vector2f(200, 200), {{0, 0}, {100, 0}, {100, 200}, {0, 200}}, false});
+    LassoSelection all;
+    all.add({vp, Eigen::Vector2f(200, 200), {{0, 0}, {200, 0}, {200, 200}, {0, 200}}, false});
+    {
+        auto w = session::SessionWriter::create(path, h);
+        REQUIRE(w.has_value());
+        for (int i = 0; i < 10; ++i) (*w)->write(frames[static_cast<std::size_t>(i)]);
+        (*w)->write_erase(1, west);  // frames 0-9
+        for (int i = 10; i < 20; ++i) (*w)->write(frames[static_cast<std::size_t>(i)]);
+        (*w)->write_erase(2, all);  // undone below
+        (*w)->write_undo(2);
+        (*w)->close();
+    }
+    auto r = session::SessionReader::open(path);
+    REQUIRE(r.has_value());
+    REQUIRE((*r)->erasures().size() == 1);
+    CHECK((*r)->erasures()[0].id == 1);
+    CHECK((*r)->erasures()[0].frames_before == 10);
+    const auto& k = h.depth_intrinsics;
+    int removed = 0, kept = 0;
+    for (std::size_t i = 0; i < 20; ++i) {
+        const auto f = (*r)->read(i);
+        REQUIRE(f.has_value());
+        const auto& orig = frames[i];
+        for (int v = 0; v < 48; ++v)
+            for (int u = 0; u < 64; ++u) {
+                const float z = orig.depth(u, v);
+                if (z <= 0) continue;
+                const Vec3 p = orig.T_world_camera * Vec3((u - k.cx) * z / k.fx, (v - k.cy) * z / k.fy, z);
+                const bool erased = i < 10 && p.x() < -0.5;  // (half a lasso pixel of margin either side)
+                if (i < 10 && std::abs(p.x()) <= 10.5) continue;
+                if (erased) {
+                    CHECK(f->depth(u, v) == 0.0f);
+                    CHECK(f->confidence(u, v) == 0.0f);
+                    ++removed;
+                } else {
+                    CHECK(std::abs(f->depth(u, v) - orig.depth(u, v)) <= 0.011f);  // stored in 1/50 mm
+                    ++kept;
+                }
+            }
+    }
+    CHECK(removed > 1000);
+    CHECK(kept > 1000);
+    // A frame live tracking lost gets the erases at a pose given for it.
+    auto lost = frames[3];
+    (*r)->apply_erasures(3, lost, SE3::Identity());
+    bool any_left = false;
+    for (int v = 0; v < 48; ++v)
+        for (int u = 0; u < 64; ++u) any_left |= lost.depth(u, v) > 0 && (u - k.cx) * lost.depth(u, v) / k.fx < -11;
+    CHECK_FALSE(any_left);
+    std::filesystem::remove(path);
+}

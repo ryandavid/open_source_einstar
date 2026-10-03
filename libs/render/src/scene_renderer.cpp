@@ -11,6 +11,7 @@ namespace einstar::render {
 namespace {
 
 constexpr const char* kShaderSource =
+#include "einstar/core/lasso.metal.inc"
 #include "shaders.metal.inc"
     ;
 
@@ -21,8 +22,10 @@ struct Uniforms {
     float point_size;
     float min_point_px;
     float lighting;
-    float pad[3];
+    std::uint32_t lasso_count;
+    float pad[2];
 };
+static_assert(sizeof(Uniforms) == 160);
 
 Result<gpu::Ref<MTL::RenderPipelineState>> make_pipeline(gpu::Context& ctx, MTL::Library* lib, const char* vs,
                                                          const char* fs, MTL::PixelFormat color,
@@ -70,6 +73,9 @@ Result<std::unique_ptr<SceneRenderer>> SceneRenderer::create(std::shared_ptr<gpu
     auto solid = make_pipeline(*r->ctx_, *lib, "solid_vs", "solid_fs", color, depth, false);
     if (!solid) return std::unexpected(solid.error());
     r->solid_pso_ = std::move(*solid);
+    // Selection buffers are bound for every splat draw: placeholders until a selection is set.
+    r->lasso_strokes_ = r->ctx_->mirrored_buffer(sizeof(GpuLassoStroke));
+    r->lasso_masks_ = r->ctx_->mirrored_buffer(16);
     // The scanner model as triangles (fans over its convex faces), each face's vertices with its normal.
     {
         std::vector<PointVertex> tris;
@@ -151,6 +157,25 @@ void SceneRenderer::set_mesh(std::span<const MeshVertex> vertices, std::span<con
     mesh_index_count_ = indices.size();
 }
 
+void SceneRenderer::set_selection(const LassoSelection& selection) {
+    const auto& strokes = selection.gpu_strokes();
+    const auto& masks = selection.mask_bytes();
+    lasso_count_ = 0;
+    if (strokes.empty()) return;
+    // Fresh buffers (a frame in flight keeps reading the old ones; command buffers retain them).
+    const std::size_t stroke_bytes = strokes.size() * sizeof(GpuLassoStroke);
+    auto stroke_buf = ctx_->mirrored_buffer(stroke_bytes);
+    auto mask_buf = ctx_->mirrored_buffer(std::max<std::size_t>(masks.size(), 16));
+    if (!stroke_buf || !mask_buf) return;
+    lasso_strokes_ = std::move(stroke_buf);
+    lasso_masks_ = std::move(mask_buf);
+    std::memcpy(lasso_strokes_->contents(), strokes.data(), stroke_bytes);
+    std::memcpy(lasso_masks_->contents(), masks.data(), masks.size());
+    gpu::Context::cpu_modified(lasso_strokes_.get(), 0, stroke_bytes);
+    gpu::Context::cpu_modified(lasso_masks_.get(), 0, masks.size());
+    lasso_count_ = static_cast<std::uint32_t>(strokes.size());
+}
+
 void SceneRenderer::set_lines(std::span<const LineVertex> l) { upload(lines_, l.data(), l.size(), sizeof(LineVertex), false); }
 
 void SceneRenderer::encode(MTL::RenderCommandEncoder* enc, const ViewCamera& cam, float vw, float vh,
@@ -163,14 +188,19 @@ void SceneRenderer::encode(MTL::RenderCommandEncoder* enc, const ViewCamera& cam
     u.point_size = s.point_size_mm;
     u.min_point_px = s.min_point_px;
     u.lighting = s.lighting ? 1.0f : 0.0f;
+    u.lasso_count = lasso_count_;
 
     enc->setDepthStencilState(depth_state_.get());
     enc->setVertexBytes(&u, sizeof(u), 1);
 
     auto draw_splats = [&](const Layer& layer) {
         if (layer.count == 0) return;
+        const std::uint32_t selectable = &layer == &model_ ? 1u : 0u;  // only the model can be selected
         enc->setRenderPipelineState(splat_pso_.get());
         enc->setVertexBuffer(layer.buffer.get(), 0, 0);
+        enc->setVertexBuffer(lasso_strokes_.get(), 0, 2);
+        enc->setVertexBuffer(lasso_masks_.get(), 0, 3);
+        enc->setVertexBytes(&selectable, sizeof(selectable), 4);
         enc->drawPrimitives(MTL::PrimitiveTypeTriangleStrip, NS::UInteger(0), NS::UInteger(4), NS::UInteger(layer.count));
     };
     if (s.show_mesh && mesh_index_count_ > 0) {

@@ -14,7 +14,7 @@ function(einstar_add_test name)
   catch_discover_tests(${name})
 endfunction()
 
-einstar_add_test(test_core core/test_se3.cpp core/test_spsc_ring.cpp)
+einstar_add_test(test_core core/test_se3.cpp core/test_spsc_ring.cpp core/test_lasso.cpp)
 target_link_libraries(test_core PRIVATE einstar::core)
 
 einstar_add_test(test_depth depth/test_stereo.cpp depth/test_metal_stereo.cpp)
@@ -68,3 +68,4 @@ target_link_libraries(test_recon PRIVATE einstar::recon einstar::fixtures einsta
 add_executable(debug_depth_errors pipeline/debug_depth_errors.cpp)
 einstar_target_defaults(debug_depth_errors)
 target_link_libraries(debug_depth_errors PRIVATE einstar::pipeline einstar::synth)
+

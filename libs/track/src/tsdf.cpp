@@ -123,6 +123,40 @@ void TsdfVolume::clear() {
     frame_counter_ = 0;
 }
 
+ErasedVoxels TsdfVolume::erase(const LassoSelection& selection) {
+    ErasedVoxels out;
+    if (selection.empty()) return out;
+    std::unique_lock lock(mutex_);
+    for (auto& [c, b] : bricks_)
+        for (int z = 0; z < kBrickSize; ++z)
+            for (int y = 0; y < kBrickSize; ++y)
+                for (int x = 0; x < kBrickSize; ++x) {
+                    const auto i = static_cast<std::size_t>(voxel_index(x, y, z));
+                    if (b->weight[i] <= 0) continue;
+                    const Eigen::Vector3i g(c.x * kBrickSize + x, c.y * kBrickSize + y, c.z * kBrickSize + z);
+                    if (!selection.contains((g.cast<float>() + Vec3f::Constant(0.5f)) * params_.voxel_mm)) continue;
+                    out.voxel.push_back(g);
+                    out.sdf.push_back(b->sdf[i]);
+                    out.weight.push_back(b->weight[i]);
+                    b->sdf[i] = 1.0f;
+                    b->weight[i] = 0.0f;
+                }
+    return out;
+}
+
+void TsdfVolume::restore(const ErasedVoxels& erased) {
+    std::unique_lock lock(mutex_);
+    for (std::size_t k = 0; k < erased.size(); ++k) {
+        const Eigen::Vector3i& g = erased.voxel[k];
+        const BrickCoord c{floor_div(g.x(), kBrickSize), floor_div(g.y(), kBrickSize), floor_div(g.z(), kBrickSize)};
+        const auto it = bricks_.find(c);
+        if (it == bricks_.end()) continue;  // cleared since
+        const auto i = static_cast<std::size_t>(voxel_index(g.x() - c.x * kBrickSize, g.y() - c.y * kBrickSize, g.z() - c.z * kBrickSize));
+        it->second->sdf[i] = erased.sdf[k];
+        it->second->weight[i] = erased.weight[k];
+    }
+}
+
 void TsdfVolume::integrate(const DepthFrame& frame, const SE3& T_world_camera, float weight_scale, bool extend_only) {
     frame.ensure_cpu();
     const Eigen::Matrix4f T_wc = T_world_camera.matrix().cast<float>();

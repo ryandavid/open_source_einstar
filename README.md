@@ -30,6 +30,9 @@ variants on discrete GPUs.
   resets the view. The scanner is shown as a low-poly model at its live pose. "Follow scanner" (View) keeps
   the camera behind and above the scanner, upright as it is held, looking where it points over its top (so
   the scanner stays low in the view, clear of the scan); orbiting or panning leaves it.
+- **Editing a paused scan:** Shift-drag a lasso to select (Option-drag deselects) -- everything inside it,
+  front to back -- and Delete removes it from the live model and from the recording, so processing never
+  sees it; Cmd+Z undoes until you resume. Rescanning a deleted area brings it back.
 - **Scanner controls:** the start / pause and brightness buttons, the top LED as a distance indicator, and
   exposure, gain, projector and strobe settings.
 - **Recording:** every scan is saved to `~/Documents/Einstar/Scans/*.estr`: depth, poses, markers, the
@@ -40,7 +43,7 @@ variants on discrete GPUs.
   - meshing, optional smoothing and error-bounded simplification;
   - export to STL, PLY or OBJ.
 - **Emulator:** a simulated scanner and scene, for trying everything without hardware.
-- Headless capture of the window: `--snapshot out.png [seconds] [--process] [--raw] [--markers] [--idle]`.
+- Headless capture of the window: `--snapshot out.png [seconds] [--process] [--raw] [--markers] [--idle] [--edit select|delete]`.
 
 ### Einstar Calibration: calibrating the camera pair
 

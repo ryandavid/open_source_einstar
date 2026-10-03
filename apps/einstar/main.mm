@@ -126,16 +126,19 @@ static bool write_png(id<MTLCommandQueue> queue, id<MTLTexture> tex, const char*
 }
 
 int main(int argc, char** argv) {
-    // --snapshot <out.png> [seconds] [--process] [--raw]: run the emulator scan headless and save one frame
-    // of the UI; with --process the scan is stopped after `seconds`, processed, and the snapshot shows the
-    // mesh; --raw also records raw IR.
+    // --snapshot <out.png> [seconds] [--process] [--raw] [--edit select|delete]: run the emulator scan
+    // headless and save one frame of the UI; with --process the scan is stopped after `seconds`, processed,
+    // and the snapshot shows the mesh; --raw also records raw IR; --edit pauses after `seconds` and lassos
+    // a block left of the view's centre (and deletes it), before any processing.
     const char* snapshot_path = nullptr;
     double snapshot_seconds = 8.0;
     bool snapshot_process = false;
     bool snapshot_raw = false;
     bool snapshot_markers = false;
     bool snapshot_idle = false;
+    int snapshot_edit = 0;  // 1 select, 2 delete
     for (int i = 1; i < argc; ++i) {
+        if (std::string_view(argv[i]) == "--edit" && i + 1 < argc) snapshot_edit = std::string_view(argv[i + 1]) == "delete" ? 2 : 1;
         if (std::string_view(argv[i]) == "--snapshot" && i + 1 < argc) {
             snapshot_path = argv[i + 1];
             if (i + 2 < argc && argv[i + 2][0] != '-') snapshot_seconds = std::atof(argv[i + 2]);
@@ -146,6 +149,7 @@ int main(int argc, char** argv) {
         if (std::string_view(argv[i]) == "--idle") snapshot_idle = true;        // snapshot the start screen (not connected)
     }
     bool snapshot_processing = false;
+    int snapshot_edit_stage = 0;
     if (!glfwInit()) {
         std::println(stderr, "glfwInit failed");
         return 1;
@@ -185,6 +189,12 @@ int main(int argc, char** argv) {
     app::AppState state;
     render::ViewCamera camera;
     std::optional<Eigen::Matrix4f> scanner_pose;  // latest: the scanner model, "Follow scanner"
+    std::uint64_t shown_selection = 0;            // the edit selection the renderer has
+    // A lasso being drawn (Shift-drag adds, Option-drag removes), in window points.
+    struct Lasso {
+        bool active = false, subtract = false;
+        std::vector<ImVec2> points;
+    } lasso;
     auto last_view_frame = std::chrono::steady_clock::now();
     render::RenderSettings settings;
     MouseState mouse;
@@ -244,9 +254,14 @@ int main(int argc, char** argv) {
 
             // Pull whatever the pipeline produced since last frame into GPU buffers.
             state.update();
-            if (auto upd = state.take_render_update()) {
+            auto upd = state.take_render_update();
+            if (upd) {
                 if (upd->model) (*renderer)->set_model_points(*upd->model);
                 if (upd->model_gpu) (*renderer)->set_model_buffer(upd->model_gpu->buffer, upd->model_gpu->count);
+            }
+            if (upd && upd->model_only) {
+                (*renderer)->set_frame_points({});  // an edit: the last frame's overlay is stale
+            } else if (upd) {
                 if (upd->frame_gpu) (*renderer)->set_frame_buffer(upd->frame_gpu->buffer, upd->frame_gpu->count);
                 else (*renderer)->set_frame_points(upd->frame_points);
                 (*renderer)->set_markers(upd->markers);
@@ -269,18 +284,62 @@ int main(int argc, char** argv) {
                 preview_right.upload(device, upd->ir_right);
                 if (upd->scanner_pose) scanner_pose = upd->scanner_pose;
             }
+            if (state.selection_version() != shown_selection) {
+                (*renderer)->set_selection(state.selection());
+                shown_selection = state.selection_version();
+            }
 
             ImGuiIO& io = ImGui::GetIO();
             // Camera navigation when the mouse is over the 3D view.
             double mx, my;
             glfwGetCursorPos(window, &mx, &my);
+            // Lasso (a paused scan): Shift-drag adds to the selection, Option-drag removes from it; the
+            // drag draws instead of orbiting. On release the outline, in framebuffer px with this view's
+            // projection, becomes a stroke.
+            {
+                const bool l_down = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+                const ImVec2 at(static_cast<float>(mx), static_cast<float>(my));
+                if (lasso.active && l_down) {
+                    const ImVec2 last = lasso.points.back();
+                    if (std::hypot(at.x - last.x, at.y - last.y) >= 3.0f) lasso.points.push_back(at);
+                } else if (lasso.active) {
+                    LassoStroke stroke;
+                    stroke.view_proj = camera.projection(static_cast<float>(fb_w) / static_cast<float>(std::max(fb_h, 1))) * camera.view();
+                    stroke.viewport = Eigen::Vector2f(static_cast<float>(fb_w), static_cast<float>(fb_h));
+                    stroke.subtract = lasso.subtract;
+                    for (const auto& q : lasso.points)
+                        stroke.polygon.emplace_back(q.x * io.DisplayFramebufferScale.x, q.y * io.DisplayFramebufferScale.y);
+                    state.add_lasso(std::move(stroke));
+                    lasso = {};
+                } else if (!io.WantCaptureMouse && l_down && !mouse.rotating && (io.KeyShift || io.KeyAlt) && state.can_edit()) {
+                    lasso.active = true;
+                    lasso.subtract = io.KeyAlt && !io.KeyShift;
+                    lasso.points = {at};
+                }
+            }
+            // (Not while typing in a text field; a focused panel is fine.)
+            if (!io.WantTextInput) {
+                if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+                    if (lasso.active) lasso = {};
+                    else state.clear_selection();
+                }
+                if (ImGui::IsKeyPressed(ImGuiKey_Delete, false) || ImGui::IsKeyPressed(ImGuiKey_Backspace, false)) state.delete_selection();
+                if (io.KeySuper && ImGui::IsKeyPressed(ImGuiKey_Z, false)) state.undo_delete();
+            }
+            if (lasso.active && lasso.points.size() > 1) {
+                // The outline so far, and (fainter) the edge that will close it.
+                auto* fg = ImGui::GetForegroundDrawList();
+                const ImU32 col = lasso.subtract ? IM_COL32(110, 190, 255, 255) : IM_COL32(255, 120, 70, 255);
+                fg->AddPolyline(lasso.points.data(), static_cast<int>(lasso.points.size()), col, ImDrawFlags_None, 2.0f);
+                fg->AddLine(lasso.points.back(), lasso.points.front(), (col & 0x00FFFFFFu) | (90u << IM_COL32_A_SHIFT), 1.0f);
+            }
             if (!io.WantCaptureMouse) {
                 const bool l = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
                 const bool r = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS ||
                                glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_MIDDLE) == GLFW_PRESS;
                 const bool moved = mx != mouse.last_x || my != mouse.last_y;
                 // Turning or moving the view by hand leaves "Follow scanner"; zooming keeps it.
-                if (l && mouse.rotating && moved) {
+                if (l && mouse.rotating && moved && !lasso.active) {
                     camera.orbit(float(mx - mouse.last_x) * 0.008f, float(my - mouse.last_y) * 0.008f);
                     state.follow_scanner = false;
                 }
@@ -288,7 +347,7 @@ int main(int argc, char** argv) {
                     camera.pan(float(mx - mouse.last_x), float(my - mouse.last_y), float(fb_h) / io.DisplayFramebufferScale.y);
                     state.follow_scanner = false;
                 }
-                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && !io.KeyShift && !io.KeyAlt) {
                     camera.reset();
                     state.follow_scanner = false;
                 }
@@ -458,6 +517,30 @@ int main(int argc, char** argv) {
                 // floods the GPU with view renders and starves the scan).
                 std::this_thread::sleep_until(next_view_frame);
                 next_view_frame = std::max(next_view_frame + std::chrono::microseconds(16667), std::chrono::steady_clock::now());
+            }
+            if (snapshot_path && snapshot_edit != 0 && snapshot_clock.elapsed_ms() > snapshot_seconds * 1000.0) {
+                // Pause, lasso a block of the view (as a Shift-drag would), delete it if asked, then carry on.
+                if (snapshot_edit_stage == 0) {
+                    state.stop_scan();
+                    snapshot_edit_stage = 1;
+                } else if (snapshot_edit_stage == 1 && state.can_edit()) {
+                    LassoStroke stroke;
+                    stroke.view_proj = camera.projection(static_cast<float>(fb_w) / static_cast<float>(std::max(fb_h, 1))) * camera.view();
+                    stroke.viewport = Eigen::Vector2f(static_cast<float>(fb_w), static_cast<float>(fb_h));
+                    const float x0 = 0.30f * static_cast<float>(fb_w), x1 = 0.48f * static_cast<float>(fb_w);
+                    const float y0 = 0.25f * static_cast<float>(fb_h), y1 = 0.60f * static_cast<float>(fb_h);
+                    stroke.polygon = {{x0, y0}, {x1, y0}, {x1, y1}, {x0, y1}};
+                    state.add_lasso(std::move(stroke));
+                    if (snapshot_edit == 2) state.delete_selection();
+                    snapshot_edit_stage = 2;
+                } else if (snapshot_edit_stage == 2) {
+                    const auto es = state.edit_status();
+                    if (snapshot_edit == 1 || (!es.busy && es.undo_depth > 0)) {
+                        if (!es.message.empty()) std::println("edit: {}", es.message);
+                        snapshot_edit = 0;  // done: render the result, then snapshot or process
+                    }
+                }
+                continue;
             }
             if (snapshot_path && snapshot_process && snapshot_clock.elapsed_ms() > snapshot_seconds * 1000.0) {
                 if (!snapshot_processing) {

@@ -158,7 +158,9 @@ void AppState::new_scan(bool discard) {
     if (!session_) return;
     if (scanning()) stop_scan();
     session_->reset_model(discard);
+    clear_selection();
     std::lock_guard lock(mutex_);
+    edit_ = {};
     trail_.clear();
     if (!pending_) pending_.emplace();
     pending_->model = std::vector<render::PointVertex>{};
@@ -174,6 +176,11 @@ std::string AppState::status() const {
 
 void AppState::start_scan() {
     if (!session_) return;
+    clear_selection();
+    {
+        std::lock_guard lock(mutex_);
+        edit_ = {};  // deletes are final once frames fuse again
+    }
     if (auto r = session_->start_scan(settings); !r) {
         error_ = r.error().message;
         log::error("start scan: {}", error_);
@@ -191,7 +198,9 @@ void AppState::toggle_scan() {
 
 void AppState::clear_model() {
     if (session_) session_->reset_model();
+    clear_selection();
     std::lock_guard lock(mutex_);
+    edit_ = {};
     trail_.clear();
     if (!pending_) pending_.emplace();
     pending_->model = std::vector<render::PointVertex>{};
@@ -313,6 +322,70 @@ void AppState::update() {
             hud_.temperature_c = -273.0f;
             hud_.temperature_note = "no sensor reading";
         }
+    }
+}
+
+bool AppState::can_edit() const {
+    if (!session_ || scanning()) return false;
+    std::lock_guard lock(mutex_);
+    return hud_.model_points > 0 && !edit_.busy;
+}
+
+void AppState::add_lasso(LassoStroke stroke) {
+    selection_.add(std::move(stroke));
+    ++selection_version_;
+}
+
+void AppState::clear_selection() {
+    if (selection_.strokes().empty()) return;
+    selection_.clear();
+    ++selection_version_;
+}
+
+void AppState::delete_selection() {
+    if (!can_edit() || selection_.empty()) return;
+    {
+        std::lock_guard lock(mutex_);
+        edit_.busy = true;
+    }
+    session_->pipeline().erase(selection_, [this](pipeline::EditResult r) { on_edit(r, false); });
+    clear_selection();
+}
+
+void AppState::undo_delete() {
+    if (!session_ || scanning()) return;
+    {
+        std::lock_guard lock(mutex_);
+        if (edit_.undo_depth == 0 || edit_.busy) return;
+        edit_.busy = true;
+    }
+    session_->pipeline().undo_erase([this](pipeline::EditResult r) { on_edit(r, true); });
+}
+
+EditStatus AppState::edit_status() const {
+    std::lock_guard lock(mutex_);
+    return edit_;
+}
+
+void AppState::on_edit(const pipeline::EditResult& r, bool undo) {
+    std::lock_guard lock(mutex_);
+    const std::size_t before = hud_.model_points, after = r.model.size();
+    hud_.model_points = after;
+    edit_.busy = false;
+    edit_.undo_depth = r.undo_depth;
+    if (undo) edit_.message = std::format("Undone: {} points back", after > before ? after - before : 0);
+    else if (r.erased_voxels == 0) edit_.message = "Nothing in the selection";
+    else edit_.message = std::format("Deleted {} points", before > after ? before - after : 0);
+    if (!pending_) {
+        pending_.emplace();
+        pending_->model_only = true;
+    }
+    if (r.model.buffer) {
+        pending_->model_gpu = GpuPoints{r.model.buffer, r.model.buffer_count};
+        pending_->model.reset();
+    } else {
+        pending_->model = r.model.points;
+        pending_->model_gpu.reset();
     }
 }
 

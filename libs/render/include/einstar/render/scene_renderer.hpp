@@ -11,6 +11,7 @@
 
 #include <Metal/Metal.hpp>
 
+#include "einstar/core/lasso.hpp"
 #include "einstar/gpu/context.hpp"
 #include "einstar/render/overlays.hpp"
 #include "einstar/render/types.hpp"
@@ -45,6 +46,8 @@ public:
     // Processed triangle mesh (replaces any previous one; empty clears it).
     void set_mesh(std::span<const MeshVertex> vertices, std::span<const std::uint32_t> indices);
     [[nodiscard]] bool has_mesh() const { return mesh_index_count_ > 0; }
+    // Model points the selection contains are highlighted (an empty selection highlights nothing).
+    void set_selection(const LassoSelection& selection);
     // The scanner model (scanner_model.hpp) at this pose; nullopt hides it.
     void set_scanner_pose(const std::optional<Mat4f>& T_world_scanner) { scanner_pose_ = T_world_scanner; }
 
@@ -70,6 +73,8 @@ private:
     gpu::Ref<MTL::Buffer> scanner_vertices_;  // the scanner model's triangles, in its frame
     std::size_t scanner_vertex_count_ = 0;
     std::optional<Mat4f> scanner_pose_;
+    gpu::Ref<MTL::Buffer> lasso_strokes_, lasso_masks_;
+    std::uint32_t lasso_count_ = 0;
     gpu::Ref<MTL::Buffer> mesh_vertices_, mesh_indices_;
     std::size_t mesh_index_count_ = 0;
     gpu::Ref<MTL::DepthStencilState> depth_state_;

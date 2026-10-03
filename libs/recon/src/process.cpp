@@ -574,6 +574,9 @@ Result<ProcessResult> process_session(const session::SessionReader& s, const Pro
                     errors[j] = rec.error().message;
                     return;
                 }
+                // Read applies the session's erases at the live pose; a frame live tracking lost has
+                // none, so at the pose recovered for it.
+                if (!rec->accepted()) s.apply_erasures(todo[b + j].first, *rec, todo[b + j].second);
                 batch[j] = frame_of(*rec, k, params);
                 weight[j] = (rec->flags & session::frame_degenerate) ? params.degenerate_weight : 1.0f;
             });

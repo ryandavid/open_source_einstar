@@ -27,6 +27,8 @@ constexpr std::uint32_t kDevice = tag("DEVC");
 constexpr std::uint32_t kExtras = tag("FXTR");
 constexpr std::uint32_t kDropped = tag("DROP");
 constexpr std::uint32_t kRaw = tag("RAWI");
+constexpr std::uint32_t kErase = tag("ERAS");
+constexpr std::uint32_t kUndo = tag("UNDO");
 constexpr double kDepthScale = 50.0;  // u16 units per mm (0.02 mm, up to 1310 mm)
 constexpr int kZstdLevel = 1;  // ~2x faster than 3 for 2% larger files (recording runs every frame)
 
@@ -384,6 +386,43 @@ void SessionWriter::write_dropped(const DroppedFrame& frame) {
     cv_.notify_one();
 }
 
+void SessionWriter::write_erase(std::uint32_t id, const LassoSelection& selection) {
+    Writer p;
+    p.put(kErase);
+    p.put(id);
+    p.put(static_cast<std::uint32_t>(selection.strokes().size()));
+    for (const auto& s : selection.strokes()) {
+        for (int i = 0; i < 16; ++i) p.put(s.view_proj.data()[i]);
+        p.put(s.viewport.x());
+        p.put(s.viewport.y());
+        p.put(static_cast<std::uint8_t>(s.subtract ? 1 : 0));
+        p.put(static_cast<std::uint32_t>(s.polygon.size()));
+        for (const auto& q : s.polygon) {
+            p.put(q.x());
+            p.put(q.y());
+        }
+    }
+    flush();  // small records jump ahead of queued frames: let every earlier frame land first
+    {
+        std::lock_guard lock(mutex_);
+        if (closing_) return;
+        queue_.push_back(std::move(p.b));
+    }
+    cv_.notify_one();
+}
+
+void SessionWriter::write_undo(std::uint32_t id) {
+    Writer p;
+    p.put(kUndo);
+    p.put(id);
+    {
+        std::lock_guard lock(mutex_);
+        if (closing_) return;
+        queue_.push_back(std::move(p.b));
+    }
+    cv_.notify_one();
+}
+
 bool SessionWriter::write_raw(RawFrame frame, std::size_t max_raw_backlog) {
     {
         std::lock_guard lock(mutex_);
@@ -625,6 +664,28 @@ Result<std::unique_ptr<SessionReader>> SessionReader::open(const std::string& pa
                 d.timestamp_s = rd.get<double>();
                 d.reason = rd.get_string();
                 if (rd.ok) r->dropped_.push_back(std::move(d));
+            } else if (t == kErase) {
+                SessionErase e;
+                e.id = rd.get<std::uint32_t>();
+                e.frames_before = r->frames_.size();
+                const auto strokes = rd.get<std::uint32_t>();
+                for (std::uint32_t s = 0; s < strokes && rd.ok; ++s) {
+                    LassoStroke st;
+                    for (int i = 0; i < 16; ++i) st.view_proj.data()[i] = rd.get<float>();
+                    st.viewport.x() = rd.get<float>();
+                    st.viewport.y() = rd.get<float>();
+                    st.subtract = rd.get<std::uint8_t>() != 0;
+                    const auto n = rd.get<std::uint32_t>();
+                    for (std::uint32_t i = 0; i < n && rd.ok; ++i) {
+                        const float x = rd.get<float>();
+                        st.polygon.emplace_back(x, rd.get<float>());
+                    }
+                    e.selection.add(std::move(st));
+                }
+                if (rd.ok) r->erasures_.push_back(std::move(e));
+            } else if (t == kUndo) {
+                const auto id = rd.get<std::uint32_t>();
+                if (rd.ok) std::erase_if(r->erasures_, [&](const SessionErase& e) { return e.id == id; });
             }
         }
         r->in_.seekg(static_cast<std::streamoff>(payload_at + size));
@@ -651,7 +712,26 @@ Result<FrameRecord> SessionReader::read(std::size_t i) const {
     }
     if (!decode_images(data.data(), data.size(), b.width, b.height, b.has_confidence, f.depth, f.confidence))
         return make_error(Errc::io, std::format("frame {}: corrupt image data", i));
+    if (f.accepted()) apply_erasures(i, f, f.T_world_camera);
     return f;
+}
+
+void SessionReader::apply_erasures(std::size_t i, FrameRecord& frame, const SE3& T_world_camera) const {
+    const auto& k = header_.depth_intrinsics;
+    const Eigen::Matrix4f T = T_world_camera.matrix().cast<float>();
+    for (const auto& e : erasures_) {
+        if (i >= e.frames_before || e.selection.empty()) continue;
+        for (int v = 0; v < frame.depth.height(); ++v)
+            for (int u = 0; u < frame.depth.width(); ++u) {
+                const float z = frame.depth(u, v);
+                if (z <= 0) continue;
+                // As make_depth_frame unprojects a pixel.
+                const Eigen::Vector4f p(static_cast<float>((u - k.cx) * z / k.fx), static_cast<float>((v - k.cy) * z / k.fy), z, 1.0f);
+                if (!e.selection.contains((T * p).head<3>())) continue;
+                frame.depth(u, v) = 0.0f;
+                if (!frame.confidence.empty()) frame.confidence(u, v) = 0.0f;
+            }
+    }
 }
 
 std::uint64_t SessionReader::raw_bytes() const {

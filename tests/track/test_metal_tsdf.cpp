@@ -1,7 +1,9 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <print>
+#include <tuple>
 
 #include "einstar/core/timing.hpp"
 #include "einstar/track/icp.hpp"
@@ -245,4 +247,63 @@ TEST_CASE("Metal surface extraction is reproducible (canonical order)") {
     for (std::size_t i = 0; i < a.size() && identical; ++i)
         identical = a[i].position == b[i].position && a[i].normal == b[i].normal && a[i].weight == b[i].weight;
     CHECK(identical);
+}
+
+TEST_CASE("an erase clears the surface and its band through all depths, and restores exactly (CPU and Metal)") {
+    auto ctx = gpu::Context::create();
+    REQUIRE(ctx.has_value());
+    track_metal::MetalTsdfOptions opt;
+    opt.brick_capacity = 65536;
+    opt.table_size = 1u << 18;
+    auto gpu_vol = track_metal::MetalTsdfVolume::create(*ctx, {}, opt);
+    if (!gpu_vol) FAIL(gpu_vol.error().message);
+    TsdfVolume cpu_vol;
+
+    const SE3 pose0 = SE3::Identity();
+    const auto f0 = make_depth_frame(render_depth(pose0, kK), kK);
+    // A view from the camera (x right, y down, w = depth) on a 200 x 200 px screen; the lasso is its left half.
+    Eigen::Matrix4f vp = Eigen::Matrix4f::Zero();
+    vp(0, 0) = 1.0f;
+    vp(1, 1) = -1.0f;
+    vp(3, 2) = 1.0f;
+    LassoSelection left;
+    left.add({vp, Eigen::Vector2f(200, 200), {{0, 0}, {100, 0}, {100, 200}, {0, 200}}, false});
+
+    auto check = [&](Volume& v) {
+        v.integrate(f0, pose0);
+        const auto before = v.extract_points();
+        const auto erased = v.erase(left);
+        CHECK(erased.size() > 1000);
+        std::size_t on_left = 0, on_right = 0, right_before = 0;
+        for (const auto& p : v.extract_points()) (p.position.x() < -1 ? on_left : on_right) += 1;
+        for (const auto& p : before) right_before += p.position.x() > 1;
+        CHECK(on_left == 0);
+        CHECK(on_right >= right_before);
+        // Tracking's view: no surface left of the image centre (the whole band went, not just the zero layer).
+        const auto rc = v.raycast(pose0, kK);
+        rc.ensure_cpu();
+        int valid_left = 0, valid_right = 0;
+        for (int y = 0; y < kK.height; ++y)
+            for (int x = 0; x < kK.width; ++x)
+                if (rc.valid(x, y)) (x < static_cast<int>(kK.cx) - 4 ? valid_left : valid_right) += 1;
+        CHECK(valid_left == 0);
+        CHECK(valid_right > 10000);
+        v.restore(erased);
+        // The same surface again (compared as sorted sets: extraction order is not guaranteed).
+        auto sorted = [](std::vector<SurfacePoint> pts) {
+            std::ranges::sort(pts, [](const SurfacePoint& a, const SurfacePoint& b) {
+                return std::tie(a.position.x(), a.position.y(), a.position.z()) < std::tie(b.position.x(), b.position.y(), b.position.z());
+            });
+            return pts;
+        };
+        const auto a = sorted(before), b = sorted(v.extract_points());
+        REQUIRE(a.size() == b.size());
+        std::size_t moved = 0;
+        for (std::size_t i = 0; i < a.size(); ++i) moved += (a[i].position - b[i].position).norm() > 1e-4f;
+        CHECK(moved == 0);
+        return erased.size();
+    };
+    const auto n_cpu = check(cpu_vol);
+    const auto n_gpu = check(**gpu_vol);
+    CHECK(std::abs(static_cast<double>(n_gpu) - static_cast<double>(n_cpu)) < 0.02 * static_cast<double>(n_cpu));
 }

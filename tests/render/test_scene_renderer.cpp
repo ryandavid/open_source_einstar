@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "einstar/gpu/context.hpp"
+#include "einstar/core/lasso.hpp"
 #include "einstar/render/scene_renderer.hpp"
 
 using namespace einstar;
@@ -148,4 +149,29 @@ TEST_CASE("the scanner model draws at its pose and hides without one") {
     CHECK(shell_pixels() > 2000);
     (*renderer)->set_scanner_pose(std::nullopt);
     CHECK(shell_pixels() == 0);
+}
+
+TEST_CASE("model points in the selection are highlighted") {
+    auto ctx = gpu::Context::create();
+    REQUIRE(ctx.has_value());
+    auto renderer = render::SceneRenderer::create(*ctx, MTL::PixelFormatBGRA8Unorm, MTL::PixelFormatDepth32Float);
+    if (!renderer) FAIL(renderer.error().message);
+    (*renderer)->set_model_points(red_patch());
+    render::ViewCamera cam;
+    cam.target = {0, 0, 300};
+    cam.distance = 300;
+    // A lasso over the top half of the screen, drawn in this very view.
+    LassoSelection top;
+    top.add({cam.projection(1.0f) * cam.view(), Eigen::Vector2f(W, H), {{0, 0}, {W, 0}, {W, H / 2}, {0, H / 2}}, false});
+    (*renderer)->set_selection(top);
+    const auto px = render_offscreen(**ctx, **renderer, cam);
+    auto at = [&](int x, int y) { return &px[static_cast<std::size_t>(y * W + x) * 4]; };  // BGRA
+    const auto* upper = at(W / 2, H / 2 - 20);
+    const auto* lower = at(W / 2, H / 2 + 20);
+    CHECK(upper[2] > 200);  // red mixed towards the highlight: green and blue come up
+    CHECK(upper[1] > 50);
+    CHECK(lower[2] > 200);  // plain red
+    CHECK(lower[1] < 30);
+    (*renderer)->set_selection(LassoSelection{});
+    CHECK(render_offscreen(**ctx, **renderer, cam)[static_cast<std::size_t>(((H / 2 - 20) * W + W / 2) * 4 + 1)] < 30);
 }

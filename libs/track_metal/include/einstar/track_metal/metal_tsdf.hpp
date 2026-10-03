@@ -36,6 +36,8 @@ public:
     [[nodiscard]] std::uint32_t frame_counter() const override { return frame_; }
     [[nodiscard]] const track::TsdfParams& params() const override { return params_; }
     void clear() override;
+    track::ErasedVoxels erase(const LassoSelection& selection) override;
+    void restore(const track::ErasedVoxels& erased) override;
 
     [[nodiscard]] bool pool_exhausted() const;
 

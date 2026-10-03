@@ -28,10 +28,25 @@ Alongside the frames:
   marker algorithms can be re-run on the scan. The writer drops raw frames rather than growing
   memory if the disk falls behind, and the HUD counts them.
 - `GMRK`: the global-marker map in use.
+- `ERAS` / `UNDO`: a paused scan's lasso delete and its undo. An erase holds the lasso strokes (each a
+  screen polygon with the view it was drawn in; everything that projects inside it, front to back, is
+  selected; later strokes add or subtract). It applies to every frame before it in the file: reading a
+  tracked frame drops the depth whose point, at the frame's live pose, the selection contains; frames
+  live tracking lost get it at the pose processing recovers for them. Frames after it are untouched,
+  so rescanning an erased area brings it back. The writer flushes before an erase, so it always follows
+  the frames it covers.
 
 Readers skip record types they do not know, so new kinds can be added without breaking old files or
 old readers. Records are length-prefixed, so a file truncated by a crash still loads up to its last
 complete record. `einstar-cli inspect <file>` summarises a session file.
+
+**Editing a paused scan.** The live volume clears the selected voxels (the surface and its truncation
+band, so tracking no longer aligns to them either) and keeps them for undo until the next frame is
+fused; the same erase goes to the recording as above, so processing never sees the deleted data. The
+selection test is shared by the CPU, the live volume and the renderer's highlight
+(`core/lasso.hpp`, `lasso.metal.inc`): each stroke is rasterised once into a pixel mask. Markers are
+not edited. After a delete, a remnant cut off from the rest of the surface may be dropped by the process
+step's clean-up of small pieces.
 
 A new file starts whenever the tracker's world frame restarts: Clear model (which also deletes the
 discarded recording), a new marker capture, or loading or discarding a global-marker map. Pausing

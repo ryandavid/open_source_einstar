@@ -4,8 +4,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <set>
+#include <thread>
 
 #include "einstar/pipeline/scan_pipeline.hpp"
 #include "einstar/session/session.hpp"
@@ -95,5 +98,91 @@ TEST_CASE("live recording keeps every frame that reaches the host") {
             CHECK(std::equal(img.pixels().begin(), img.pixels().end(), orig.begin(), orig.end()));
         }
     }
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("a paused scan's erase leaves the live model and the recording, and undo puts it back") {
+    const RigCalibration rig = e2e::einstar_like_rig();
+    const auto setup = e2e::make_scene();
+    const auto dir = std::filesystem::temp_directory_path() / "einstar_test_erase";
+    std::filesystem::remove_all(dir);
+    pipeline::ScanPipelineParams pp;
+    pp.queue_capacity = 16;
+    pipeline::ScanPipeline pipe(std::make_unique<pipeline::StereoFrontend>(rig), pp, [](pipeline::LiveUpdate&&) {});
+    pipe.set_recording_directory(dir.string());
+    for (std::uint32_t id = 10; id < 18; ++id) {
+        usb::FrameGroup g;
+        g.frame_id = id;
+        g.timestamp = static_cast<std::uint64_t>(id) * 68000;
+        for (int sensor = 0; sensor < 2; ++sensor) {
+            usb::StreamFrame f;
+            f.sensor = sensor;
+            f.frame_id = id;
+            e2e::render_sensor(setup, rig, e2e::truth_pose(id), sensor, id * 3 + static_cast<std::uint32_t>(sensor), f.pixels);
+            g.sensors[static_cast<std::size_t>(sensor)] = std::move(f);
+        }
+        pipe.push(std::move(g));
+    }
+    pipe.start();
+    const auto path = pipe.flush_recording();  // every frame processed: the scan is paused
+    REQUIRE_FALSE(path.empty());
+
+    // An edit's result arrives on the worker: wait for it by counting polls (no wall-clock deadline).
+    auto run = [&](auto&& issue) {
+        std::atomic<bool> got{false};
+        pipeline::EditResult out;
+        issue([&](pipeline::EditResult r) {
+            out = std::move(r);
+            got = true;
+        });
+        for (int polls = 0; !got && polls < 20000; ++polls) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        REQUIRE(got);
+        return out;
+    };
+    // The lasso: world x < 0 (the first frame's camera looks along +z), through all depths.
+    Eigen::Matrix4f vp = Eigen::Matrix4f::Identity();
+    vp(0, 0) = vp(1, 1) = 0.001f;
+    vp(2, 2) = 0.0f;
+    LassoSelection west;
+    west.add({vp, Eigen::Vector2f(200, 200), {{0, 0}, {100, 0}, {100, 200}, {0, 200}}, false});
+
+    const auto none = run([&](auto done) { pipe.erase(LassoSelection{}, std::move(done)); });
+    const std::size_t full = none.model.size();
+    CHECK(none.erased_voxels == 0);
+    REQUIRE(full > 10000);
+    const auto first = run([&](auto done) { pipe.erase(west, std::move(done)); });
+    CHECK(first.erased_voxels > 0);
+    CHECK(first.undo_depth == 1);
+    CHECK(first.model.size() < full * 8 / 10);
+    CHECK(first.model.size() > full * 2 / 10);
+    for (const auto& p : first.model.points) CHECK(p.px > -1.0f);  // (CPU volume only: the GPU model stays on the GPU)
+    const auto undone = run([&](auto done) { pipe.undo_erase(std::move(done)); });
+    CHECK(undone.undo_depth == 0);
+    CHECK(undone.model.size() == full);
+    const auto again = run([&](auto done) { pipe.erase(west, std::move(done)); });
+    CHECK(again.model.size() == first.model.size());
+    pipe.stop();
+
+    // The recording keeps the second erase (the first was undone), over every frame recorded before it.
+    auto r = session::SessionReader::open(path);
+    REQUIRE(r.has_value());
+    REQUIRE((*r)->erasures().size() == 1);
+    CHECK((*r)->erasures()[0].frames_before == (*r)->frame_count());
+    const auto& k = (*r)->header().depth_intrinsics;
+    std::size_t west_depth = 0, east_depth = 0;
+    for (std::size_t i = 0; i < (*r)->frame_count(); ++i) {
+        const auto f = (*r)->read(i);
+        REQUIRE(f.has_value());
+        if (!f->accepted()) continue;
+        for (int v = 0; v < f->depth.height(); ++v)
+            for (int u = 0; u < f->depth.width(); ++u) {
+                const float z = f->depth(u, v);
+                if (z <= 0) continue;
+                const Vec3 p = f->T_world_camera * Vec3((u - k.cx) * z / k.fx, (v - k.cy) * z / k.fy, z);
+                (p.x() < -1 ? west_depth : east_depth) += 1;
+            }
+    }
+    CHECK(west_depth == 0);
+    CHECK(east_depth > 10000);
     std::filesystem::remove_all(dir);
 }

@@ -13,6 +13,10 @@
 //   DROP  a frame that reached the host but has no FRAM (live queue overflow, no depth)
 //   RAWI  optional raw IR images of one trigger (row delta-coded 8-bit, zstd)
 //   GMRK  a global-marker map in use from that point on
+//   ERAS  an erase (a paused scan's lasso delete): removes, from every frame before it in the file, the
+//         depth whose point (at the frame's live pose) the selection contains; it follows every frame
+//         submitted before it (the writer flushes first)
+//   UNDO  cancels an erase
 // Readers skip record types they do not know, so new kinds can be added without breaking old
 // files or old readers. A reader tolerates a truncated last record (e.g. after a crash).
 
@@ -35,6 +39,7 @@
 #include "einstar/core/camera.hpp"
 #include "einstar/core/error.hpp"
 #include "einstar/core/image.hpp"
+#include "einstar/core/lasso.hpp"
 #include "einstar/core/se3.hpp"
 #include "einstar/markers/marker_map.hpp"
 #include "einstar/track/frame.hpp"
@@ -141,6 +146,13 @@ struct FrameRecord {
     [[nodiscard]] track::DepthFrame depth_frame(const track::Intrinsics& k) const;
 };
 
+// An erase in effect (not undone): frames [0, frames_before) lose the depth the selection contains.
+struct SessionErase {
+    std::uint32_t id = 0;
+    std::size_t frames_before = 0;
+    LassoSelection selection;
+};
+
 // Depth / confidence of a frame from its CPU images or GPU buffers.
 void capture_depth(const track::DepthFrame& frame, ImageF32& depth, ImageF32& confidence);
 
@@ -154,6 +166,9 @@ public:
     void write_global_markers(const std::vector<markers::MapMarker>& map);
     void write_device(const DeviceRecord& device);
     void write_dropped(const DroppedFrame& frame);
+    // Edits: an erase covers every frame submitted before it (waits until they are on disk first).
+    void write_erase(std::uint32_t id, const LassoSelection& selection);
+    void write_undo(std::uint32_t id);
     // Raw images are compressed on the writer thread. Returns false (and drops the frame) when more
     // than `max_raw_backlog` are waiting, so a slow disk cannot grow memory without bound.
     bool write_raw(RawFrame frame, std::size_t max_raw_backlog = 48);
@@ -192,8 +207,13 @@ public:
     [[nodiscard]] std::size_t frame_count() const { return frames_.size(); }
     // Metadata only (no depth): cheap, all frames.
     [[nodiscard]] const FrameRecord& meta(std::size_t i) const { return frames_[i]; }
-    // Full frame including depth (decompressed on demand; thread-safe).
+    // Full frame including depth (decompressed on demand; thread-safe). The session's erases are applied
+    // to a tracked frame at its live pose (what the lasso was drawn against).
     [[nodiscard]] Result<FrameRecord> read(std::size_t i) const;
+    // Erases in effect (undone ones dropped), and applying them to frame i at a given pose (a frame
+    // live tracking lost, at the pose processing recovered for it).
+    [[nodiscard]] const std::vector<SessionErase>& erasures() const { return erasures_; }
+    void apply_erasures(std::size_t i, FrameRecord& frame, const SE3& T_world_camera) const;
     // The last global-marker map recorded (empty if none).
     [[nodiscard]] const std::vector<markers::MapMarker>& global_markers() const { return global_markers_; }
     [[nodiscard]] const std::optional<DeviceRecord>& device() const { return device_; }
@@ -218,6 +238,7 @@ private:
     std::vector<markers::MapMarker> global_markers_;
     std::optional<DeviceRecord> device_;
     std::vector<DroppedFrame> dropped_;
+    std::vector<SessionErase> erasures_;
     struct RawBlock {
         std::uint64_t index = 0;
         double timestamp_s = 0;

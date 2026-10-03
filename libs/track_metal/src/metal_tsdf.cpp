@@ -14,6 +14,7 @@ namespace einstar::track_metal {
 namespace {
 
 constexpr const char* kSource =
+#include "einstar/core/lasso.metal.inc"
 #include "tsdf_kernels.metal.inc"
     ;
 
@@ -77,7 +78,7 @@ std::uint32_t hash_key(std::uint32_t key, std::uint32_t mask) {
 struct MetalTsdfVolume::Impl {
     std::shared_ptr<gpu::Context> ctx;
     MetalTsdfOptions opt;
-    Ref<MTL::ComputePipelineState> init_voxels, allocate, integrate, raycast, extract, extract_render;
+    Ref<MTL::ComputePipelineState> init_voxels, allocate, integrate, raycast, extract, extract_render, erase_voxels, restore_voxels;
     mutable std::size_t render_capacity = 0;
     Ref<MTL::Buffer> keys, values, coords, brick_count, stamps, visible_count, visible, voxels, last_update, occupancy;
     Ref<MTL::Buffer> observations;  // one byte per voxel when counted, else a placeholder
@@ -154,7 +155,8 @@ Result<std::unique_ptr<MetalTsdfVolume>> MetalTsdfVolume::create(std::shared_ptr
     if (!lib) return std::unexpected(lib.error());
     for (auto [name, slot] : {std::pair{"init_voxels", &im->init_voxels}, std::pair{"allocate", &im->allocate},
                               std::pair{"integrate", &im->integrate}, std::pair{"raycast", &im->raycast},
-                              std::pair{"extract", &im->extract}, std::pair{"extract_render", &im->extract_render}}) {
+                              std::pair{"extract", &im->extract}, std::pair{"extract_render", &im->extract_render},
+                              std::pair{"erase_voxels", &im->erase_voxels}, std::pair{"restore_voxels", &im->restore_voxels}}) {
         auto p = im->ctx->compute_pipeline(*lib, name);
         if (!p) return std::unexpected(p.error());
         *slot = std::move(*p);
@@ -414,6 +416,95 @@ MetalTsdfVolume::RenderPoints MetalTsdfVolume::extract_render_points(float min_w
         im.render_capacity = found + found / 4;  // grow and retry once
     }
     return out;
+}
+
+track::ErasedVoxels MetalTsdfVolume::erase(const LassoSelection& selection) {
+    auto& im = *impl_;
+    track::ErasedVoxels out;
+    const std::uint32_t bricks = im.count();
+    if (selection.empty() || bricks == 0) return out;
+    const auto& strokes = selection.gpu_strokes();
+    const auto& masks = selection.mask_bytes();
+    auto stroke_buf = im.ctx->mirrored_buffer(strokes.size() * sizeof(GpuLassoStroke));
+    auto mask_buf = im.ctx->mirrored_buffer(std::max<std::size_t>(masks.size(), 16));
+    if (!stroke_buf || !mask_buf) return out;
+    std::memcpy(stroke_buf->contents(), strokes.data(), strokes.size() * sizeof(GpuLassoStroke));
+    std::memcpy(mask_buf->contents(), masks.data(), masks.size());
+    gpu::Context::cpu_modified(stroke_buf.get());
+    gpu::Context::cpu_modified(mask_buf.get());
+    const VolumeArgs a = im.args(params_, frame_);
+    const auto stroke_count = static_cast<std::uint32_t>(strokes.size());
+    // Pass 0 counts, pass 1 records and clears (nothing else touches the volume in between).
+    auto pass = [&](MTL::Buffer* coords_out, MTL::Buffer* values_out, std::uint32_t write) {
+        *static_cast<std::uint32_t*>(im.ext_count->contents()) = 0;
+        gpu::Context::cpu_modified(im.ext_count.get());
+        im.run("tsdf/erase", [&](MTL::ComputeCommandEncoder* enc) {
+            enc->setComputePipelineState(im.erase_voxels.get());
+            enc->setBuffer(im.voxels.get(), 0, 0);
+            enc->setBuffer(im.coords.get(), 0, 1);
+            enc->setBuffer(stroke_buf.get(), 0, 2);
+            enc->setBuffer(mask_buf.get(), 0, 3);
+            enc->setBuffer(coords_out, 0, 4);
+            enc->setBuffer(values_out, 0, 5);
+            enc->setBuffer(im.ext_count.get(), 0, 6);
+            enc->setBytes(&a, sizeof(a), 7);
+            enc->setBytes(&stroke_count, sizeof(stroke_count), 8);
+            enc->setBytes(&write, sizeof(write), 9);
+            enc->dispatchThreadgroups(MTL::Size(bricks, 1, 1), MTL::Size(8, 8, 8));
+        }, write ? std::initializer_list<MTL::Buffer*>{im.ext_count.get(), coords_out, values_out}
+                 : std::initializer_list<MTL::Buffer*>{im.ext_count.get()});
+        return *static_cast<std::uint32_t*>(im.ext_count->contents());
+    };
+    const std::uint32_t found = pass(mask_buf.get(), mask_buf.get(), 0);  // (outputs unused when counting)
+    if (found == 0) return out;
+    auto coords_out = im.ctx->mirrored_buffer(found * 16ull);
+    auto values_out = im.ctx->mirrored_buffer(found * 8ull);
+    if (!coords_out || !values_out) return out;
+    const std::uint32_t n = std::min(found, pass(coords_out.get(), values_out.get(), 1));
+    const auto* c = static_cast<const std::int32_t*>(coords_out->contents());
+    const auto* v = static_cast<const float*>(values_out->contents());
+    out.voxel.reserve(n);
+    out.sdf.reserve(n);
+    out.weight.reserve(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        out.voxel.emplace_back(c[4 * i], c[4 * i + 1], c[4 * i + 2]);
+        out.sdf.push_back(v[2 * i]);
+        out.weight.push_back(v[2 * i + 1]);
+    }
+    return out;
+}
+
+void MetalTsdfVolume::restore(const track::ErasedVoxels& erased) {
+    auto& im = *impl_;
+    if (erased.size() == 0) return;
+    const auto n = static_cast<std::uint32_t>(erased.size());
+    auto coords_in = im.ctx->mirrored_buffer(n * 16ull);
+    auto values_in = im.ctx->mirrored_buffer(n * 8ull);
+    if (!coords_in || !values_in) return;
+    auto* c = static_cast<std::int32_t*>(coords_in->contents());
+    auto* v = static_cast<float*>(values_in->contents());
+    for (std::size_t i = 0; i < n; ++i) {
+        c[4 * i] = erased.voxel[i].x();
+        c[4 * i + 1] = erased.voxel[i].y();
+        c[4 * i + 2] = erased.voxel[i].z();
+        c[4 * i + 3] = 0;
+        v[2 * i] = erased.sdf[i];
+        v[2 * i + 1] = erased.weight[i];
+    }
+    gpu::Context::cpu_modified(coords_in.get());
+    gpu::Context::cpu_modified(values_in.get());
+    const VolumeArgs a = im.args(params_, frame_);
+    im.run("tsdf/restore", [&](MTL::ComputeCommandEncoder* enc) {
+        enc->setComputePipelineState(im.restore_voxels.get());
+        enc->setBuffer(im.keys.get(), 0, 0);
+        enc->setBuffer(im.values.get(), 0, 1);
+        enc->setBuffer(im.voxels.get(), 0, 2);
+        enc->setBuffer(coords_in.get(), 0, 3);
+        enc->setBuffer(values_in.get(), 0, 4);
+        enc->setBytes(&a, sizeof(a), 5);
+        enc->setBytes(&n, sizeof(n), 6);
+        enc->dispatchThreads(MTL::Size(n, 1, 1), MTL::Size(std::min<NS::UInteger>(n, 256), 1, 1));
+    });
 }
 
 std::vector<track::BrickCoord> MetalTsdfVolume::bricks_updated_since(std::uint32_t frame) const {

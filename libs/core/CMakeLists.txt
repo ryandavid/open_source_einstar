@@ -1,4 +1,4 @@
-add_library(einstar_core src/log.cpp)
+add_library(einstar_core src/log.cpp src/lasso.cpp)
 add_library(einstar::core ALIAS einstar_core)
 target_include_directories(einstar_core PUBLIC include)
 target_link_libraries(einstar_core PUBLIC Eigen3::Eigen)

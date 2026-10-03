@@ -173,6 +173,31 @@ void markers_step(AppState& state, WorkflowUi& ui) {
     ImGui::EndDisabled();
 }
 
+// Paused: delete points with a lasso (AppState editing).
+void edit_section(AppState& state) {
+    ImGui::SeparatorText("Edit");
+    ImGui::TextWrapped("Shift-drag in the view to select, Option-drag to deselect. A lasso takes everything inside it, "
+                       "front to back.");
+    const auto st = state.edit_status();
+    const bool selected = !state.selection().empty();
+    ImGui::BeginDisabled(!selected || st.busy);
+    if (ImGui::Button("Delete selected")) state.delete_selection();
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(state.selection().strokes().empty());
+    if (ImGui::Button("Clear selection")) state.clear_selection();
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(st.undo_depth == 0 || st.busy);
+    if (ImGui::Button(st.undo_depth > 1 ? std::format("Undo ({})", st.undo_depth).c_str() : "Undo")) state.undo_delete();
+    ImGui::EndDisabled();
+    if (!st.message.empty()) ImGui::TextDisabled("%s", st.message.c_str());
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    ImGui::TextWrapped("Delete / Backspace deletes, Esc clears, Cmd+Z undoes until you resume. Rescanning a deleted "
+                       "area brings it back.");
+    ImGui::PopStyleColor();
+}
+
 void scan_step(AppState& state, WorkflowUi& ui) {
     const auto hud = state.hud();
     const bool scanning = state.scanning();
@@ -188,6 +213,7 @@ void scan_step(AppState& state, WorkflowUi& ui) {
     if (!path.empty())
         ImGui::TextWrapped("Recording %s (%llu frames)", std::filesystem::path(path).filename().c_str(),
                            static_cast<unsigned long long>(hud.recorded_frames));
+    if (!scanning && hud.recorded_frames > 0) edit_section(state);
     ImGui::Separator();
     ImGui::BeginDisabled(scanning || hud.recorded_frames == 0);
     if (big_button("Finish: process the scan", kGreen)) enter_step(state, ui, Step::process);

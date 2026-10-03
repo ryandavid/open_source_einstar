@@ -563,7 +563,66 @@ void ScanPipeline::run(std::stop_token st) {
     }
 }
 
+ModelSnapshot ScanPipeline::snapshot_model() {
+    ModelSnapshot m;
+    if (const auto* mv = dynamic_cast<const track_metal::MetalTsdfVolume*>(&tracker_.volume())) {
+        auto rp = mv->extract_render_points();
+        m.buffer = std::move(rp.buffer);
+        m.buffer_count = rp.count;
+    } else {
+        cache_.update(tracker_.volume());
+        m.points = cache_.flatten();
+    }
+    stats_.model_points = m.size();
+    return m;
+}
+
+void ScanPipeline::erase(LassoSelection selection, std::function<void(EditResult)> done) {
+    post([this, sel = std::move(selection), on_done = std::move(done)] {
+        EditResult r;
+        if (!reset_requested_ && !sel.empty()) {
+            auto voxels = tracker_.volume().erase(sel);
+            r.erased_voxels = voxels.size();
+            if (!voxels.voxel.empty()) {
+                const std::uint32_t id = next_edit_id_++;
+                {
+                    std::lock_guard lock(recorder_mutex_);
+                    if (recorder_) recorder_->write_erase(id, sel);
+                }
+                edits_.push_back({id, std::move(voxels)});
+                cache_.clear();  // (CPU path) every brick may have changed
+                log::info("edit: erased {} voxels (erase {})", r.erased_voxels, id);
+            }
+        }
+        r.undo_depth = edits_.size();
+        r.model = snapshot_model();
+        if (on_done) on_done(std::move(r));
+    });
+}
+
+void ScanPipeline::undo_erase(std::function<void(EditResult)> done) {
+    post([this, on_done = std::move(done)] {
+        EditResult r;
+        if (!edits_.empty()) {
+            auto e = std::move(edits_.back());
+            edits_.pop_back();
+            tracker_.volume().restore(e.voxels);
+            r.erased_voxels = e.voxels.size();
+            {
+                std::lock_guard lock(recorder_mutex_);
+                if (recorder_) recorder_->write_undo(e.id);
+            }
+            cache_.clear();
+            log::info("edit: undid erase {} ({} voxels)", e.id, r.erased_voxels);
+        }
+        r.undo_depth = edits_.size();
+        r.model = snapshot_model();
+        if (on_done) on_done(std::move(r));
+    });
+}
+
 void ScanPipeline::process(usb::FrameGroup&& group) {
+    edits_.clear();  // frames fuse into erased space from here on: an undo would overwrite them
     if (reset_requested_.exchange(false)) {
         // Clearing the model keeps an optimised global-marker map (it describes the scene, not the scan).
         tracker_.reset(true);
@@ -676,16 +735,10 @@ void ScanPipeline::process(usb::FrameGroup&& group) {
     stats_.mean_depth_mm = zn ? static_cast<float>(zsum / zn) : 0.0f;
 
     if (r.integrated && model_clock_.elapsed_ms() > params_.model_refresh_s * 1000.0) {
-        if (const auto* mv = dynamic_cast<const track_metal::MetalTsdfVolume*>(&tracker_.volume())) {
-            auto rp = mv->extract_render_points();
-            up.model_buffer = std::move(rp.buffer);
-            up.model_buffer_count = rp.count;
-            stats_.model_points = rp.count;
-        } else {
-            cache_.update(tracker_.volume());
-            up.model = cache_.flatten();
-            stats_.model_points = cache_.size();
-        }
+        auto m = snapshot_model();
+        up.model_buffer = std::move(m.buffer);
+        up.model_buffer_count = m.buffer_count;
+        up.model = std::move(m.points);
         up.model_changed = true;
         model_clock_.reset();
     }

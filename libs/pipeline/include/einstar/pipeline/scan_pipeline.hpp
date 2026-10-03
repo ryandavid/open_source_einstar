@@ -111,6 +111,21 @@ private:
     std::vector<render::PointVertex> full_;
 };
 
+// The whole live model for display: a GPU buffer of render::PointVertex (Metal volume) or a CPU copy.
+struct ModelSnapshot {
+    gpu::Ref<MTL::Buffer> buffer;
+    std::size_t buffer_count = 0;
+    std::vector<render::PointVertex> points;
+    [[nodiscard]] std::size_t size() const { return buffer ? buffer_count : points.size(); }
+};
+
+// The outcome of a paused scan's edit.
+struct EditResult {
+    std::size_t erased_voxels = 0;  // by this erase (or put back by this undo)
+    std::size_t undo_depth = 0;     // erases that can still be undone
+    ModelSnapshot model;            // the live model now
+};
+
 struct ScanPipelineParams {
     track::TrackerParams tracker;
     std::size_t queue_capacity = 16;  // ~1 s at 14.7 Hz: rides out stalls without dropping frames
@@ -151,6 +166,13 @@ public:
     void optimize_global_markers(std::function<void(const GlobalMarkerReport&)> done = {});
     void clear_global_markers();
     void set_global_markers(std::vector<markers::MapMarker> map);  // e.g. loaded from disk
+    // Paused-scan edits (commands on the worker; `done` is called there). `erase` clears everything the
+    // selection contains from the live model and records it in the session, where processing removes it
+    // from the frames recorded so far -- later frames are untouched, so rescanning brings surface back.
+    // `undo_erase` reverts the last erase; erases are final once the next frame is processed.
+    void erase(LassoSelection selection, std::function<void(EditResult)> done);
+    void undo_erase(std::function<void(EditResult)> done);
+
     // Alignment used while scanning surfaces (geometry falls back to hybrid while a global map is set).
     void set_surface_mode(track::AlignMode mode);
 
@@ -189,6 +211,7 @@ private:
     void fill_marker_overlays(const track::TrackResult& r, const DepthOutput& depth, LiveUpdate& up) const;
     void record(const track::TrackResult& r, const DepthOutput& depth);
     void restart_recording(bool delete_current);  // world frame restarted
+    [[nodiscard]] ModelSnapshot snapshot_model();  // the whole live model (refreshes the CPU cache)
     session::SessionWriter* ensure_recorder();    // creates the session file on first use (recorder_mutex_ held)
     void record_dropped(const usb::FrameGroup& group, std::string reason);
 
@@ -199,6 +222,12 @@ private:
     std::unique_ptr<track_metal::MetalIcp> gpu_icp_;
     std::unique_ptr<class GpuOverlay> overlay_;
     ModelPointCache cache_;
+    struct Edit {
+        std::uint32_t id;
+        track::ErasedVoxels voxels;
+    };
+    std::vector<Edit> edits_;  // erases that can be undone (until the next frame)
+    std::uint32_t next_edit_id_ = 1;
 
     ScanPhase phase_ = ScanPhase::surface;
     track::AlignMode surface_mode_;
