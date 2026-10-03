@@ -35,6 +35,8 @@ struct WorkflowUi {
     WorkflowUi();
 };
 
+// Opens a step (as clicking its header does): the scanner's phase and alignment follow it.
+void enter_step(AppState& state, WorkflowUi& ui, WorkflowUi::Step step);
 // The workflow panel (left). Also tells `state` whether the scanner's start / pause button may start
 // or pause the scanner in the current step.
 void draw_workflow(AppState& state, WorkflowUi& ui, render::RenderSettings& settings);

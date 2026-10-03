@@ -69,3 +69,17 @@ add_executable(debug_depth_errors pipeline/debug_depth_errors.cpp)
 einstar_target_defaults(debug_depth_errors)
 target_link_libraries(debug_depth_errors PRIVATE einstar::pipeline einstar::synth)
 
+if(EINSTAR_BUILD_APP)
+  einstar_add_test(test_agent agent/test_agent.cpp)
+  target_link_libraries(test_agent PRIVATE einstar::agent)
+  # The MCP server (Python, tools/mcp) driving both apps headless with the emulator, when uv is installed.
+  find_program(EINSTAR_UV uv)
+  if(EINSTAR_UV)
+    add_test(NAME einstar_mcp_e2e COMMAND ${EINSTAR_UV} run --directory ${PROJECT_SOURCE_DIR}/tools/mcp python tests/test_e2e.py)
+    set_tests_properties(einstar_mcp_e2e PROPERTIES ENVIRONMENT "EINSTAR_BUILD_DIR=${PROJECT_BINARY_DIR}")
+  endif()
+endif()
+# The MCP server's copy of the agent methods (tools/mcp/methods.json) matches the C++ table.
+einstar_add_test(test_agent_methods agent/test_agent_methods.cpp)
+target_link_libraries(test_agent_methods PRIVATE einstar::agent_protocol)
+target_compile_definitions(test_agent_methods PRIVATE EINSTAR_METHODS_JSON="${PROJECT_SOURCE_DIR}/tools/mcp/methods.json")

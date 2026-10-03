@@ -74,16 +74,20 @@ bool choice(const char* label, const char* help, bool selected) {
     return clicked;
 }
 
-void enter_step(AppState& state, WorkflowUi& ui, Step step) {
+}  // namespace
+
+void enter_step(AppState& state, WorkflowUi& ui, WorkflowUi::Step step) {
     ui.step = step;
     ui.confirm_discard = false;
     // The scanner's phase follows the step.
-    if (step == Step::markers) state.set_phase(pipeline::ScanPhase::global_markers);
-    if (step == Step::scan) {
+    if (step == WorkflowUi::Step::markers) state.set_phase(pipeline::ScanPhase::global_markers);
+    if (step == WorkflowUi::Step::scan) {
         state.set_phase(pipeline::ScanPhase::surface);
-        state.set_align_mode(ui.type == ScanType::surface ? track::AlignMode::geometry : track::AlignMode::hybrid);
+        state.set_align_mode(ui.type == WorkflowUi::ScanType::surface ? track::AlignMode::geometry : track::AlignMode::hybrid);
     }
 }
+
+namespace {
 
 // ---- the steps ----
 

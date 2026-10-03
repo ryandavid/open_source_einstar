@@ -3,10 +3,11 @@ add_executable(einstar-app MACOSX_BUNDLE
   einstar/main.mm
   einstar/app_state.cpp
   einstar/session.cpp
-  einstar/workflow.mm)
+  einstar/workflow.mm
+  einstar/agent_methods.cpp)
 set_target_properties(einstar-app PROPERTIES OUTPUT_NAME Einstar)
 target_include_directories(einstar-app PRIVATE einstar common)
-target_link_libraries(einstar-app PRIVATE einstar::render einstar::pipeline einstar::recon einstar::session einstar::device einstar::sim einstar::calib einstar::synth imgui glfw TBB::tbb
+target_link_libraries(einstar-app PRIVATE einstar::agent einstar::render einstar::pipeline einstar::recon einstar::session einstar::device einstar::sim einstar::calib einstar::synth imgui glfw TBB::tbb
   "-framework Cocoa" "-framework Metal" "-framework QuartzCore" "-framework ImageIO" "-framework CoreGraphics")
 target_compile_options(einstar-app PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
 einstar_target_defaults(einstar-app)
@@ -14,11 +15,12 @@ einstar_target_defaults(einstar-app)
 add_executable(einstar-calibrate MACOSX_BUNDLE
   einstar-calibrate/main.mm
   einstar-calibrate/calibration_controller.cpp
-  einstar-calibrate/board_view.cpp)
+  einstar-calibrate/board_view.cpp
+  einstar-calibrate/agent_methods.cpp)
 set_target_properties(einstar-calibrate PROPERTIES OUTPUT_NAME EinstarCalibration)
 target_include_directories(einstar-calibrate PRIVATE einstar-calibrate common)
 target_compile_definitions(einstar-calibrate PRIVATE EINSTAR_CALIBRATION_FIXTURE="${PROJECT_SOURCE_DIR}/tests/fixtures/calibration/einstar_e10")
-target_link_libraries(einstar-calibrate PRIVATE einstar::render_types einstar::calibrate einstar::device einstar::sim einstar::calib einstar::synth imgui glfw TBB::tbb
+target_link_libraries(einstar-calibrate PRIVATE einstar::agent einstar::render_types einstar::calibrate einstar::device einstar::sim einstar::calib einstar::synth imgui glfw TBB::tbb
   "-framework Cocoa" "-framework Metal" "-framework QuartzCore" "-framework ImageIO" "-framework CoreGraphics")
 target_compile_options(einstar-calibrate PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
 einstar_target_defaults(einstar-calibrate)

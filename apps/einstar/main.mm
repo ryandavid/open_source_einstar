@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cmath>
 #include <optional>
+#include <unistd.h>
 #include <thread>
 #include <cstdlib>
 #include <cstring>
@@ -36,6 +37,8 @@
 #include "einstar/core/timing.hpp"
 #include "einstar/gpu/context.hpp"
 #include "einstar/render/scene_renderer.hpp"
+#include "agent_methods.hpp"
+#include "einstar/agent/server.hpp"
 #include "upright_image.hpp"
 
 using namespace einstar;
@@ -137,7 +140,15 @@ int main(int argc, char** argv) {
     bool snapshot_markers = false;
     bool snapshot_idle = false;
     int snapshot_edit = 0;  // 1 select, 2 delete
+    // --mcp[=<socket>] [--visible]: agent control (libs/agent, einstar-mcp). The window is hidden unless
+    // --visible; scans record into a temporary folder unless EINSTAR_SCAN_DIR says otherwise.
+    std::optional<std::string> mcp_socket;
+    bool mcp_visible = false;
     for (int i = 1; i < argc; ++i) {
+        const std::string_view a = argv[i];
+        if (a == "--mcp") mcp_socket = std::format("/tmp/einstar_scan_{}.sock", ::getpid());
+        if (a.starts_with("--mcp=")) mcp_socket = std::string(a.substr(6));
+        if (a == "--visible") mcp_visible = true;
         if (std::string_view(argv[i]) == "--edit" && i + 1 < argc) snapshot_edit = std::string_view(argv[i + 1]) == "delete" ? 2 : 1;
         if (std::string_view(argv[i]) == "--snapshot" && i + 1 < argc) {
             snapshot_path = argv[i + 1];
@@ -155,7 +166,11 @@ int main(int argc, char** argv) {
         return 1;
     }
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    if (snapshot_path) glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+    // Headless (a snapshot, or an agent without --visible): rendered offscreen, paced like a display.
+    const bool offscreen_mode = snapshot_path || (mcp_socket && !mcp_visible);
+    if (offscreen_mode) glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+    if (mcp_socket && !std::getenv("EINSTAR_SCAN_DIR"))
+        setenv("EINSTAR_SCAN_DIR", (std::filesystem::temp_directory_path() / "einstar_agent_scans").c_str(), 1);
     GLFWwindow* window = glfwCreateWindow(1600, 1000, "Einstar", nullptr, nullptr);
     if (!window) return 1;
 
@@ -165,6 +180,7 @@ int main(int argc, char** argv) {
     CAMetalLayer* layer = [CAMetalLayer layer];
     layer.device = device;
     layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    if (mcp_socket) layer.framebufferOnly = NO;  // screenshots copy the drawable
     nswin.contentView.layer = layer;
     nswin.contentView.wantsLayer = YES;
 
@@ -219,6 +235,19 @@ int main(int argc, char** argv) {
         std::atomic<int> frames{0};
     };
     auto view_gpu = std::make_shared<ViewGpuTime>();
+    std::unique_ptr<agent::Server> agent;
+    if (mcp_socket) {
+        agent = std::make_unique<agent::Server>(agent::App::scan, "scan");
+        agent->set_visible(mcp_visible);
+        app::register_scan_agent(*agent, {state, workflow, camera, settings});
+        std::string why;
+        if (!agent->start(*mcp_socket, why)) {
+            std::println(stderr, "--mcp: {}", why);
+            return 1;
+        }
+        std::println("AGENT_READY {} {}", *mcp_socket, ::getpid());
+        std::fflush(stdout);
+    }
     if (snapshot_path && !snapshot_idle) {
         // Headless runs record into a temporary directory, never the user's scans.
         const auto tmp = std::filesystem::temp_directory_path() / "einstar_snapshot_scans";
@@ -235,7 +264,7 @@ int main(int argc, char** argv) {
         }
         state.start_scan();
     }
-    while (!glfwWindowShouldClose(window)) {
+    while (!glfwWindowShouldClose(window) && !(agent && agent->quit_requested())) {
         @autoreleasepool {
             glfwPollEvents();
             int fb_w = 0, fb_h = 0;
@@ -291,13 +320,14 @@ int main(int argc, char** argv) {
 
             ImGuiIO& io = ImGui::GetIO();
             // Camera navigation when the mouse is over the 3D view.
-            double mx, my;
-            glfwGetCursorPos(window, &mx, &my);
+            // (ImGui's input, not GLFW's: an agent's synthetic input arrives there too.)
+            const bool mouse_valid = ImGui::IsMousePosValid(&io.MousePos);
+            const double mx = mouse_valid ? io.MousePos.x : mouse.last_x, my = mouse_valid ? io.MousePos.y : mouse.last_y;
             // Lasso (a paused scan): Shift-drag adds to the selection, Option-drag removes from it; the
             // drag draws instead of orbiting. On release the outline, in framebuffer px with this view's
             // projection, becomes a stroke.
             {
-                const bool l_down = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+                const bool l_down = io.MouseDown[0];
                 const ImVec2 at(static_cast<float>(mx), static_cast<float>(my));
                 if (lasso.active && l_down) {
                     const ImVec2 last = lasso.points.back();
@@ -334,9 +364,8 @@ int main(int argc, char** argv) {
                 fg->AddLine(lasso.points.back(), lasso.points.front(), (col & 0x00FFFFFFu) | (90u << IM_COL32_A_SHIFT), 1.0f);
             }
             if (!io.WantCaptureMouse) {
-                const bool l = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
-                const bool r = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS ||
-                               glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_MIDDLE) == GLFW_PRESS;
+                const bool l = io.MouseDown[0];
+                const bool r = io.MouseDown[1] || io.MouseDown[2];
                 const bool moved = mx != mouse.last_x || my != mouse.last_y;
                 // Turning or moving the view by hand leaves "Follow scanner"; zooming keeps it.
                 if (l && mouse.rotating && moved && !lasso.active) {
@@ -371,7 +400,7 @@ int main(int argc, char** argv) {
             (*renderer)->set_scanner_pose(scanner_pose);
 
             id<CAMetalDrawable> drawable = nil;
-            if (snapshot_path) {
+            if (offscreen_mode) {
                 if (!offscreen || int(offscreen.width) != fb_w || int(offscreen.height) != fb_h) {
                     MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
                                                                                                 width:NSUInteger(fb_w)
@@ -395,6 +424,7 @@ int main(int argc, char** argv) {
 
             ImGui_ImplMetal_NewFrame(pass);
             ImGui_ImplGlfw_NewFrame();
+            if (agent) agent->pump();  // the agent's requests and synthetic input, before the frame
             ImGui::NewFrame();
 
             // ---- Workflow panel: connect, scan type, (markers), scan, process ----
@@ -503,6 +533,17 @@ int main(int argc, char** argv) {
             ImGui::Render();
             ImGui_ImplMetal_RenderDrawData(ImGui::GetDrawData(), cmd, enc);
             [enc endEncoding];
+            // A screenshot for the agent: this frame's pixels, copied before it is presented.
+            id<MTLBuffer> capture_buf = nil;
+            id<MTLTexture> target_tex = pass.colorAttachments[0].texture;
+            if (agent && agent->capture_wanted()) {
+                capture_buf = [device newBufferWithLength:target_tex.width * target_tex.height * 4 options:MTLResourceStorageModeShared];
+                id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+                [blit copyFromTexture:target_tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                           sourceSize:MTLSizeMake(target_tex.width, target_tex.height, 1) toBuffer:capture_buf destinationOffset:0
+                destinationBytesPerRow:target_tex.width * 4 destinationBytesPerImage:target_tex.width * target_tex.height * 4];
+                [blit endEncoding];
+            }
             if (drawable) [cmd presentDrawable:drawable];
             if (snapshot_path) {
                 // GPU time of the view (reported with the snapshot: it shares the GPU with the scan).
@@ -512,7 +553,17 @@ int main(int argc, char** argv) {
                 }];
             }
             [cmd commit];
-            if (snapshot_path) {
+            if (capture_buf) {
+                [cmd waitUntilCompleted];
+                agent::Frame frame;
+                frame.width = static_cast<int>(target_tex.width);
+                frame.height = static_cast<int>(target_tex.height);
+                frame.scale = io.DisplayFramebufferScale.x;
+                const auto* bytes = static_cast<const std::uint8_t*>(capture_buf.contents);
+                frame.bgra.assign(bytes, bytes + capture_buf.length);
+                agent->provide_capture(std::move(frame));
+            }
+            if (offscreen_mode) {
                 // Headless: no display to pace the loop, so pace it like a 60 Hz display (unpaced, it
                 // floods the GPU with view renders and starves the scan).
                 std::this_thread::sleep_until(next_view_frame);

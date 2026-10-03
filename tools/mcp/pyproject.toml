@@ -1,0 +1,19 @@
+[project]
+name = "einstar-mcp"
+version = "0.1.0"
+description = "MCP server that runs the Einstar apps under agent control (docs/agent.md)"
+requires-python = ">=3.11"
+dependencies = [
+    # 2.x renamed FastMCP; this server uses the low-level Server (tools from methods.json schemas).
+    "mcp>=2.0.0,<3",
+]
+
+[project.scripts]
+einstar-mcp = "einstar_mcp.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/einstar_mcp"]

@@ -1,0 +1,1137 @@
+[
+  {
+    "app": "any",
+    "description": "The methods this running app answers (names only).",
+    "kind": "read_only",
+    "name": "rpc.methods",
+    "params": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "app": "any",
+    "description": "The app: its name, pid, frames drawn, window size in points, the framebuffer scale, and whether its window is visible.",
+    "kind": "read_only",
+    "name": "app.info",
+    "params": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "app": "any",
+    "description": "The app's log since a cursor: pass the returned next_seq as since_seq to get only what is new. `dropped` > 0 means the ring wrapped and records were lost before they were read.",
+    "kind": "read_only",
+    "name": "app.logs",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "grep": {
+          "description": "Only records containing this text.",
+          "type": "string"
+        },
+        "level": {
+          "description": "Minimum level.",
+          "enum": [
+            "trace",
+            "debug",
+            "info",
+            "warn",
+            "error"
+          ],
+          "type": "string"
+        },
+        "limit": {
+          "description": "At most this many records (default 200).",
+          "type": "integer"
+        },
+        "since_seq": {
+          "description": "Return records with seq >= this (0: from the oldest kept).",
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "app": "any",
+    "description": "Quits the app (as closing its window would); answers before it goes.",
+    "kind": "read_only",
+    "name": "app.quit",
+    "params": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "app": "any",
+    "description": "Waits until the app has drawn this many more frames (default 1).",
+    "kind": "read_only",
+    "name": "frame.wait",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "frames": {
+          "description": "Frames to wait for (1-600).",
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "app": "any",
+    "description": "Every ImGui window and item drawn in the last frame: ref, window, label, rect [x, y, w, h] in window points, and state (checkable/checked, openable/opened, inputable, disabled, visible). Static text is not an item: use the app's own state methods or a screenshot to read it.",
+    "kind": "read_only",
+    "name": "ui.snapshot",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "interactive_only": {
+          "description": "Only items that take input (default false).",
+          "type": "boolean"
+        },
+        "window": {
+          "description": "Only items of this window (its name).",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "app": "any",
+    "description": "Resolves a target to one item (its ref, window, label, rect and state).",
+    "kind": "read_only",
+    "name": "ui.find",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "target": {
+          "description": "An ImGui item: its ref from ui.snapshot ('#1a2b3c4d', stable while the item exists), 'Window/Label' (the window's name and the item's visible label), or a bare label. Matching nothing or more than one item is an error that lists the candidates.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "any",
+    "description": "A PNG of the next frame drawn: the whole window, an item's rect (target) or a rect in points. Returns png_base64, scale (image px per point), logical_rect [x, y, w, h] in points and image_size; an image pixel (px, py) is the point (logical_rect.x + px / scale, logical_rect.y + py / scale).",
+    "kind": "read_only",
+    "name": "ui.screenshot",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "max_size": {
+          "description": "Downscale so the longer side is at most this many px (default 1600).",
+          "type": "integer"
+        },
+        "rect": {
+          "description": "[x, y, w, h] in window points.",
+          "items": {
+            "type": "number"
+          },
+          "maxItems": 4,
+          "minItems": 4,
+          "type": "array"
+        },
+        "target": {
+          "description": "An ImGui item: its ref from ui.snapshot ('#1a2b3c4d', stable while the item exists), 'Window/Label' (the window's name and the item's visible label), or a bare label. Matching nothing or more than one item is an error that lists the candidates.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "app": "any",
+    "description": "Waits until an item exists (or is gone, or is enabled), checking each frame. Errors with `timeout` if it does not happen within timeout_ms.",
+    "kind": "read_only",
+    "name": "ui.wait_for",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "description": "What to wait for (default exists).",
+          "enum": [
+            "exists",
+            "gone",
+            "enabled"
+          ],
+          "type": "string"
+        },
+        "target": {
+          "description": "An ImGui item: its ref from ui.snapshot ('#1a2b3c4d', stable while the item exists), 'Window/Label' (the window's name and the item's visible label), or a bare label. Matching nothing or more than one item is an error that lists the candidates.",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "description": "How long to wait (default 5000).",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "any",
+    "description": "Clicks an item (at its centre, or at x, y within it) or a point in the window. Synthesised through ImGui's input queue, so it reaches the 3D view as well as widgets.",
+    "kind": "mutating",
+    "name": "input.click",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "button": {
+          "description": "Default left.",
+          "enum": [
+            "left",
+            "right",
+            "middle"
+          ],
+          "type": "string"
+        },
+        "double": {
+          "description": "A double click.",
+          "type": "boolean"
+        },
+        "modifiers": {
+          "description": "Modifier keys held during the action (alt = Option, super = Cmd).",
+          "items": {
+            "enum": [
+              "shift",
+              "ctrl",
+              "alt",
+              "super"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "target": {
+          "description": "An ImGui item: its ref from ui.snapshot ('#1a2b3c4d', stable while the item exists), 'Window/Label' (the window's name and the item's visible label), or a bare label. Matching nothing or more than one item is an error that lists the candidates.",
+          "type": "string"
+        },
+        "x": {
+          "description": "Window points (with a target: points from the item's top left).",
+          "type": "number"
+        },
+        "y": {
+          "description": "Window points (with a target: points from the item's top left).",
+          "type": "number"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "app": "any",
+    "description": "Moves the mouse to a point in the window (hover).",
+    "kind": "mutating",
+    "name": "input.move",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "x": {
+          "description": "Window points.",
+          "type": "number"
+        },
+        "y": {
+          "description": "Window points.",
+          "type": "number"
+        }
+      },
+      "required": [
+        "x",
+        "y"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "any",
+    "description": "Presses at `from`, moves in steps to `to` and releases: orbiting (left) or panning (right) the 3D view, a slider, or with modifiers a lasso in the scanning app (shift: select).",
+    "kind": "mutating",
+    "name": "input.drag",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "button": {
+          "description": "Default left.",
+          "enum": [
+            "left",
+            "right",
+            "middle"
+          ],
+          "type": "string"
+        },
+        "from": {
+          "description": "[x, y] window points.",
+          "items": {
+            "type": "number"
+          },
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array"
+        },
+        "modifiers": {
+          "description": "Modifier keys held during the action (alt = Option, super = Cmd).",
+          "items": {
+            "enum": [
+              "shift",
+              "ctrl",
+              "alt",
+              "super"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "path": {
+          "description": "Instead of from/to: every [x, y] point of the drag in order (e.g. a lasso outline).",
+          "items": {
+            "items": {
+              "type": "number"
+            },
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "steps": {
+          "description": "Intermediate moves between from and to (default 12).",
+          "type": "integer"
+        },
+        "to": {
+          "description": "[x, y] window points.",
+          "items": {
+            "type": "number"
+          },
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "app": "any",
+    "description": "Scrolls the mouse wheel at a point (zooms the 3D view).",
+    "kind": "mutating",
+    "name": "input.scroll",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "dx": {
+          "description": "Horizontal wheel steps.",
+          "type": "number"
+        },
+        "dy": {
+          "description": "Vertical wheel steps (positive: up / zoom in).",
+          "type": "number"
+        },
+        "x": {
+          "description": "Window points (default: where the mouse is).",
+          "type": "number"
+        },
+        "y": {
+          "description": "Window points (default: where the mouse is).",
+          "type": "number"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "app": "any",
+    "description": "Presses and releases a key (ImGui key names: 'Escape', 'Delete', 'Backspace', 'Enter', 'Z', 'Space', 'F1', ...).",
+    "kind": "mutating",
+    "name": "input.key",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "key": {
+          "description": "ImGui key name.",
+          "type": "string"
+        },
+        "modifiers": {
+          "description": "Modifier keys held during the action (alt = Option, super = Cmd).",
+          "items": {
+            "enum": [
+              "shift",
+              "ctrl",
+              "alt",
+              "super"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "any",
+    "description": "Types text into the focused text field.",
+    "kind": "mutating",
+    "name": "input.type",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "text": {
+          "description": "The text.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "scan",
+    "description": "Everything about the scanning app now: connection, workflow step and scan type, whether it is scanning, the HUD (tracking, fps, frames, model points, markers, distance), the recording, processing, editing and view state.",
+    "kind": "read_only",
+    "name": "scan.state",
+    "params": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "app": "scan",
+    "description": "Connects the scanner over USB, or the built-in emulator (a simulated scanner and scene, no hardware).",
+    "kind": "mutating",
+    "name": "device.connect",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "emulator": {
+          "description": "Use the emulator instead of a scanner.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "emulator"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "scan",
+    "description": "Disconnects (stops scanning).",
+    "kind": "mutating",
+    "name": "device.disconnect",
+    "params": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "app": "scan",
+    "description": "Opens a workflow step (as clicking its header). Not while scanning.",
+    "kind": "mutating",
+    "name": "workflow.goto",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "step": {
+          "description": "The step.",
+          "enum": [
+            "connect",
+            "scan_type",
+            "markers",
+            "scan",
+            "process"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "step"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "scan",
+    "description": "The scan type: hybrid (surface + markers, the default), surface (shape only) or global_markers (capture and optimise a marker map first). Not while scanning.",
+    "kind": "mutating",
+    "name": "scan.set_type",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "description": "The type.",
+          "enum": [
+            "hybrid",
+            "surface",
+            "global_markers"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "scan",
+    "description": "Starts or resumes scanning (opens the scan step).",
+    "kind": "mutating",
+    "name": "scan.start",
+    "params": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "app": "scan",
+    "description": "Pauses scanning; the model and recording are kept.",
+    "kind": "mutating",
+    "name": "scan.pause",
+    "params": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "app": "scan",
+    "description": "A new scan: clears the model and starts a new recording.",
+    "kind": "mutating",
+    "name": "scan.new",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "discard": {
+          "description": "Delete the current recording (default false: it is kept).",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "app": "scan",
+    "description": "Reads, and with any field given changes, the scanner's settings.",
+    "kind": "mutating",
+    "name": "scan.settings",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "brightness": {
+          "description": "Brightness level (sets exposure and gain).",
+          "type": "integer"
+        },
+        "exposure": {
+          "description": "Exposure.",
+          "type": "integer"
+        },
+        "gain": {
+          "description": "Gain.",
+          "type": "integer"
+        },
+        "laser_percent": {
+          "description": "Projector power 0-100.",
+          "type": "integer"
+        },
+        "record_raw_ir": {
+          "description": "Also record raw IR images.",
+          "type": "boolean"
+        },
+        "strobe": {
+          "description": "Strobe.",
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "app": "scan",
+    "description": "Bundle-adjusts the captured global markers into a fixed map (markers step, paused).",
+    "kind": "mutating",
+    "name": "markers.optimize",
+    "params": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "app": "scan",
+    "description": "Discards the global markers (and their map).",
+    "kind": "mutating",
+    "name": "markers.clear",
+    "params": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "app": "scan",
+    "description": "Saves the global-marker map.",
+    "kind": "mutating",
+    "name": "markers.save",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "description": "File to write.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "scan",
+    "description": "Loads a global-marker map.",
+    "kind": "mutating",
+    "name": "markers.load",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "description": "File to read.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "scan",
+    "description": "Processes the recorded scan into a mesh (in the background; poll process.status). Not while scanning.",
+    "kind": "mutating",
+    "name": "process.run",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "optimize_poses": {
+          "description": "Loop closure / pose graph (default true).",
+          "type": "boolean"
+        },
+        "resolution_mm": {
+          "description": "Voxel size (default 0.5).",
+          "enum": [
+            "0.3",
+            "0.5",
+            "1.0"
+          ],
+          "type": "string"
+        },
+        "simplify": {
+          "description": "Simplify within 0.02 mm (default true).",
+          "type": "boolean"
+        },
+        "smoothing": {
+          "description": "Smoothing iterations 0-10 (default 0).",
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "app": "scan",
+    "description": "Processing: running, stage, fraction, done, summary.",
+    "kind": "read_only",
+    "name": "process.status",
+    "params": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "app": "scan",
+    "description": "Cancels processing.",
+    "kind": "mutating",
+    "name": "process.cancel",
+    "params": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "app": "scan",
+    "description": "Exports the processed mesh (.stl, .ply or .obj by extension).",
+    "kind": "mutating",
+    "name": "process.export",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "description": "File to write.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "scan",
+    "description": "The 3D view's camera (target, distance, orientation as a quaternion [w, x, y, z], eye, forward) and options.",
+    "kind": "read_only",
+    "name": "view.get",
+    "params": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "app": "scan",
+    "description": "Moves the 3D view's camera (leaves follow mode) and/or changes its options. Orientation takes camera axes (x right, y down, z forward) to world axes.",
+    "kind": "mutating",
+    "name": "view.set",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "distance": {
+          "description": "Eye to target, mm.",
+          "type": "number"
+        },
+        "follow": {
+          "description": "Follow the scanner.",
+          "type": "boolean"
+        },
+        "lighting": {
+          "description": "Shading.",
+          "type": "boolean"
+        },
+        "orbit": {
+          "description": "[dx, dy] radians, as a left-drag would.",
+          "items": {
+            "type": "number"
+          },
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array"
+        },
+        "orientation": {
+          "description": "Quaternion [w, x, y, z].",
+          "items": {
+            "type": "number"
+          },
+          "maxItems": 4,
+          "minItems": 4,
+          "type": "array"
+        },
+        "point_size_mm": {
+          "description": "Splat size.",
+          "type": "number"
+        },
+        "reset": {
+          "description": "Back to the default view first.",
+          "type": "boolean"
+        },
+        "show_mesh": {
+          "description": "Processed mesh.",
+          "type": "boolean"
+        },
+        "show_points": {
+          "description": "Live points.",
+          "type": "boolean"
+        },
+        "show_scanner": {
+          "description": "The scanner model.",
+          "type": "boolean"
+        },
+        "target": {
+          "description": "World mm.",
+          "items": {
+            "type": "number"
+          },
+          "maxItems": 3,
+          "minItems": 3,
+          "type": "array"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "app": "scan",
+    "description": "Adds a lasso stroke to the selection (paused scans): a polygon in window points, as seen in the current view; everything inside it, front to back, is selected (subtract: removed from the selection).",
+    "kind": "mutating",
+    "name": "edit.select",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "polygon": {
+          "description": "[[x, y], ...] window points.",
+          "items": {
+            "items": {
+              "type": "number"
+            },
+            "type": "array"
+          },
+          "minItems": 3,
+          "type": "array"
+        },
+        "subtract": {
+          "description": "Deselect instead.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "polygon"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "scan",
+    "description": "Clears the selection.",
+    "kind": "mutating",
+    "name": "edit.clear",
+    "params": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "app": "scan",
+    "description": "Deletes the selection from the live model and the recording (processing never sees it); undoable until scanning resumes. Answers once done.",
+    "kind": "mutating",
+    "name": "edit.delete",
+    "params": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "app": "scan",
+    "description": "Undoes the last delete. Answers once done.",
+    "kind": "mutating",
+    "name": "edit.undo",
+    "params": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "app": "scan",
+    "description": "Selection strokes, undoable deletes, the last message.",
+    "kind": "read_only",
+    "name": "edit.status",
+    "params": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "app": "calibration",
+    "description": "The calibration app now: connection, the 25-view plan with what is captured, the active group, the live view (distance, tilts, roll, offset, hints, whether in position and steady), lighting, and the solve.",
+    "kind": "read_only",
+    "name": "calib.state",
+    "params": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "app": "calibration",
+    "description": "Connects the scanner, or the emulator (a simulated scanner and board).",
+    "kind": "mutating",
+    "name": "calib.connect",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "emulator": {
+          "description": "Use the emulator.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "emulator"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "calibration",
+    "description": "Disconnects.",
+    "kind": "mutating",
+    "name": "calib.disconnect",
+    "params": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "app": "calibration",
+    "description": "Selects the orientation group to capture next: 0 face-on, 1 top edge near, 2 bottom edge near, 3 right edge near, 4 left edge near.",
+    "kind": "mutating",
+    "name": "calib.group",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "group": {
+          "description": "0-4.",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "group"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "calibration",
+    "description": "Turns capturing automatically when steady on or off.",
+    "kind": "mutating",
+    "name": "calib.auto_capture",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "on": {
+          "description": "On.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "on"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "calibration",
+    "description": "Captures the current view now (as the Capture now button).",
+    "kind": "mutating",
+    "name": "calib.capture",
+    "params": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "app": "calibration",
+    "description": "Clears one capture, or all of them (a new session).",
+    "kind": "mutating",
+    "name": "calib.clear",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "index": {
+          "description": "Plan index 0-24 (omit: all).",
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "app": "calibration",
+    "description": "Loads a folder of captures (imageLeftN / imageRightN).",
+    "kind": "mutating",
+    "name": "calib.load_folder",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "description": "Folder.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "calibration",
+    "description": "Loads a reference calibration to compare with.",
+    "kind": "mutating",
+    "name": "calib.load_reference",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "description": "File.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "calibration",
+    "description": "Solves the stereo calibration from the captures (background; poll calib.state).",
+    "kind": "mutating",
+    "name": "calib.solve",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "keep_factory_distortion": {
+          "description": "Keep the factory distortion (default false).",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "app": "calibration",
+    "description": "Saves the solved calibration (returns the path).",
+    "kind": "mutating",
+    "name": "calib.save",
+    "params": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "app": "calibration",
+    "description": "What writing to the scanner would do: the gates (all must pass), the backup path.",
+    "kind": "read_only",
+    "name": "calib.plan_write",
+    "params": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "app": "calibration",
+    "description": "Writes the solved calibration into the scanner's flash (stream paused, current pages backed up first, read back and verified). Real hardware: this replaces the scanner's calibration.",
+    "kind": "mutating",
+    "name": "calib.write",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "confirm": {
+          "description": "Must be true.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "confirm"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "calibration",
+    "description": "Puts a calibration backup back into the scanner's flash.",
+    "kind": "mutating",
+    "name": "calib.restore",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "confirm": {
+          "description": "Must be true.",
+          "type": "boolean"
+        },
+        "path": {
+          "description": "Backup file (flash-backup-*.bin).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "confirm"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "calibration",
+    "description": "Reads, and with any field given changes, the lighting.",
+    "kind": "mutating",
+    "name": "calib.lighting",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "exposure": {
+          "description": "300-8000.",
+          "type": "integer"
+        },
+        "gain": {
+          "description": "Gain % 16-800.",
+          "type": "integer"
+        },
+        "ring_light": {
+          "description": "0-9000.",
+          "type": "integer"
+        },
+        "white_leds": {
+          "description": "0-9000.",
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "app": "calibration",
+    "description": "Shows a tab of the main view.",
+    "kind": "mutating",
+    "name": "calib.tab",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "tab": {
+          "description": "The tab.",
+          "enum": [
+            "live",
+            "captures",
+            "results"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab"
+      ],
+      "type": "object"
+    }
+  }
+]

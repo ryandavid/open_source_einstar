@@ -160,6 +160,13 @@ cmake -B build && cmake --build build -j && ctest --test-dir build --output-on-f
   `-DEINSTAR_BUILD_FIRMWARE=ON` to build it with everything else, into `firmware/` in the build directory. See
   `firmware/README.md`.
 
+## Agent control
+
+Both apps can be driven headless by an agent (e.g. Claude Code) through `einstar-mcp`, an MCP server (Python,
+run with `uv`) registered in `.mcp.json`: build the apps, launch them, connect the emulator or the scanner,
+scan, edit, process, calibrate, take screenshots, click widgets and read the app's state and log. See
+`docs/agent.md`.
+
 ## Safety
 
 Commands that write the scanner's flash, update its firmware, reboot it or erase its boot image can't be sent

@@ -73,4 +73,7 @@ if(EINSTAR_BUILD_APP)
   target_include_directories(imgui SYSTEM PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
   target_link_libraries(imgui PUBLIC glfw "-framework Metal" "-framework QuartzCore" "-framework Cocoa")
   target_compile_options(imgui PRIVATE -fobjc-arc -w)
+  # Items are reported to hooks as they are drawn (the agent's UI inspector, libs/agent); public, so every
+  # file including ImGui's headers sees the same context layout.
+  target_compile_definitions(imgui PUBLIC IMGUI_ENABLE_TEST_ENGINE)
 endif()

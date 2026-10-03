@@ -24,17 +24,21 @@
 #include <cstring>
 #include <filesystem>
 #include <format>
+#include <optional>
 #include <print>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_metal.h"
 
+#include "agent_methods.hpp"
 #include "board_view.hpp"
+#include "einstar/agent/server.hpp"
 #include "calibration_controller.hpp"
 #include "einstar/core/timing.hpp"
 #include "upright_image.hpp"
@@ -499,8 +503,15 @@ int main(int argc, char** argv) {
     bool snapshot_write = false;
     std::string snapshot_tab;
     std::string load_dir, reference_path;  // --load <captures dir> [--reference <calibration>]: offline
+    // --mcp[=<socket>] [--visible]: agent control (libs/agent, einstar-mcp). The window is hidden unless
+    // --visible; captures go to a temporary folder unless EINSTAR_CALIBRATION_DIR says otherwise.
+    std::optional<std::string> mcp_socket;
+    bool mcp_visible = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view a = argv[i];
+        if (a == "--mcp") mcp_socket = std::format("/tmp/einstar_calibration_{}.sock", ::getpid());
+        if (a.starts_with("--mcp=")) mcp_socket = std::string(a.substr(6));
+        if (a == "--visible") mcp_visible = true;
         if (a == "--snapshot" && i + 1 < argc) {
             snapshot_path = argv[i + 1];
             if (i + 2 < argc && argv[i + 2][0] != '-') snapshot_seconds = std::atof(argv[i + 2]);
@@ -521,7 +532,11 @@ int main(int argc, char** argv) {
         return 1;
     }
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    if (snapshot_path) glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+    // Headless (a snapshot, or an agent without --visible): rendered offscreen, paced like a display.
+    const bool offscreen_mode = snapshot_path || (mcp_socket && !mcp_visible);
+    if (offscreen_mode) glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+    if (mcp_socket && !std::getenv("EINSTAR_CALIBRATION_DIR"))
+        setenv("EINSTAR_CALIBRATION_DIR", (std::filesystem::temp_directory_path() / "einstar_agent_calibration").c_str(), 1);
     GLFWwindow* window = glfwCreateWindow(1560, 980, "Einstar Calibration", nullptr, nullptr);
     if (!window) return 1;
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -530,6 +545,7 @@ int main(int argc, char** argv) {
     CAMetalLayer* layer = [CAMetalLayer layer];
     layer.device = device;
     layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    if (mcp_socket) layer.framebufferOnly = NO;  // screenshots copy the drawable
     nswin.contentView.layer = layer;
     nswin.contentView.wantsLayer = YES;
 
@@ -570,8 +586,21 @@ int main(int argc, char** argv) {
     bool write_confirmed = false;
     std::string write_result, restore_path;
     app::BoardView board_view;
+    std::unique_ptr<agent::Server> agent;
+    if (mcp_socket) {
+        agent = std::make_unique<agent::Server>(agent::App::calibration, "calibration");
+        agent->set_visible(mcp_visible);
+        app::register_calibration_agent(*agent, {ctl, tab_request, error});
+        std::string why;
+        if (!agent->start(*mcp_socket, why)) {
+            std::println(stderr, "--mcp: {}", why);
+            return 1;
+        }
+        std::println("AGENT_READY {} {}", *mcp_socket, ::getpid());
+        std::fflush(stdout);
+    }
 
-    while (!glfwWindowShouldClose(window)) {
+    while (!glfwWindowShouldClose(window) && !(agent && agent->quit_requested())) {
         @autoreleasepool {
             glfwPollEvents();
             int fb_w = 0, fb_h = 0;
@@ -587,7 +616,7 @@ int main(int argc, char** argv) {
             tex_right.upload(device, live.right);
 
             id<CAMetalDrawable> drawable = nil;
-            if (snapshot_path) {
+            if (offscreen_mode) {
                 if (!offscreen || int(offscreen.width) != fb_w || int(offscreen.height) != fb_h) {
                     MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:NSUInteger(fb_w) height:NSUInteger(fb_h) mipmapped:NO];
                     d.usage = MTLTextureUsageRenderTarget;
@@ -604,6 +633,7 @@ int main(int argc, char** argv) {
             id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
             ImGui_ImplMetal_NewFrame(pass);
             ImGui_ImplGlfw_NewFrame();
+            if (agent) agent->pump();  // the agent's requests and synthetic input, before the frame
             ImGui::NewFrame();
             ImGuiIO& io = ImGui::GetIO();
             const float panel_w = 420;
@@ -903,8 +933,30 @@ int main(int argc, char** argv) {
             ImGui::Render();
             ImGui_ImplMetal_RenderDrawData(ImGui::GetDrawData(), cmd, enc);
             [enc endEncoding];
+            // A screenshot for the agent: this frame's pixels, copied before it is presented.
+            id<MTLBuffer> capture_buf = nil;
+            id<MTLTexture> target_tex = pass.colorAttachments[0].texture;
+            if (agent && agent->capture_wanted()) {
+                capture_buf = [device newBufferWithLength:target_tex.width * target_tex.height * 4 options:MTLResourceStorageModeShared];
+                id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+                [blit copyFromTexture:target_tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                           sourceSize:MTLSizeMake(target_tex.width, target_tex.height, 1) toBuffer:capture_buf destinationOffset:0
+                destinationBytesPerRow:target_tex.width * 4 destinationBytesPerImage:target_tex.width * target_tex.height * 4];
+                [blit endEncoding];
+            }
             if (drawable) [cmd presentDrawable:drawable];
             [cmd commit];
+            if (capture_buf) {
+                [cmd waitUntilCompleted];
+                agent::Frame frame;
+                frame.width = static_cast<int>(target_tex.width);
+                frame.height = static_cast<int>(target_tex.height);
+                frame.scale = io.DisplayFramebufferScale.x;
+                const auto* bytes = static_cast<const std::uint8_t*>(capture_buf.contents);
+                frame.bgra.assign(bytes, bytes + capture_buf.length);
+                agent->provide_capture(std::move(frame));
+            }
+            if (offscreen_mode && !snapshot_path) std::this_thread::sleep_for(std::chrono::milliseconds(16));  // headless agent: ~60 Hz
 
             if (snapshot_path) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(16));
