@@ -24,7 +24,73 @@ struct Active {
     double gate = 0;
 };
 
-double gate_of(const FitResult& f, const GrowOptions& o) { return std::max(o.gate_sigma * f.sigma, o.min_gate_mm); }
+// Candidates are judged by their centroid, which averages three vertices' noise: sigma (measured on
+// vertices) / sqrt(3).
+double gate_of(const FitResult& f, const GrowOptions& o) {
+    const double sigma = o.max_sigma_mm > 0 ? std::min(f.sigma, o.max_sigma_mm) : f.sigma;
+    return std::max(o.gate_sigma * sigma / std::numbers::sqrt3, o.min_gate_mm);
+}
+
+// A dab of a few triangles cannot pin down a curved surface's axis (normals of 0.5 mm triangles carry
+// degrees of noise), so seeds are widened by rings of neighbours to at least this many triangles.
+constexpr std::size_t kMinSeedTriangles = 40;
+
+void widen_small_seed(const MeshTopology& topo, std::vector<std::uint32_t>& seed, std::span<const std::uint8_t> blocked) {
+    if (seed.empty()) return;
+    std::vector<std::uint8_t> in(topo.triangle_count(), 0);
+    for (const auto t : seed) in[t] = 1;
+    for (int ring = 0; ring < 4 && seed.size() < kMinSeedTriangles; ++ring) {
+        const std::size_t n = seed.size();
+        for (std::size_t i = 0; i < n; ++i)
+            for (const auto nb : topo.neighbors(seed[i]))
+                if (nb != kNoTriangle && !in[nb] && (blocked.empty() || !blocked[nb])) {
+                    in[nb] = 1;
+                    seed.push_back(nb);
+                }
+    }
+}
+
+// Growth order decides who gets a triangle where two regions meet; afterwards each border triangle goes to
+// the neighbouring region whose surface it lies closer to (the first rows of a plane, tangent to a fillet,
+// to the plane), and the regions are refitted, a few rounds.
+void reassign_borders(const MeshTopology& topo, std::vector<Active>& active, std::vector<std::uint16_t>& owner, const GrowOptions& o,
+                      double cos_max) {
+    if (active.size() < 2) return;
+    for (int round = 0; round < 4; ++round) {
+        std::size_t moved = 0;
+        for (std::uint32_t t = 0; t < owner.size(); ++t) {
+            if (owner[t] == 0) continue;
+            const std::size_t a = owner[t] - 1u;
+            const Vec3 c = topo.centroid(t).cast<double>();
+            const Vec3 n = topo.normal(t).cast<double>();
+            double best = std::abs(signed_distance(active[a].fit.surface, c));
+            std::size_t to = a;
+            for (const auto nb : topo.neighbors(t)) {
+                if (nb == kNoTriangle || owner[nb] == 0 || owner[nb] - 1u == a) continue;
+                const std::size_t b = owner[nb] - 1u;
+                const double d = std::abs(signed_distance(active[b].fit.surface, c));
+                if (d < 0.7 * best && d < active[b].gate && std::abs(normal_at(active[b].fit.surface, c).dot(n)) >= cos_max) {
+                    best = d;
+                    to = b;
+                }
+            }
+            if (to != a) {
+                owner[t] = static_cast<std::uint16_t>(to + 1);
+                ++moved;
+            }
+        }
+        if (moved == 0) break;
+        for (auto& a : active) a.members.clear();
+        for (std::uint32_t t = 0; t < owner.size(); ++t)
+            if (owner[t] != 0) active[owner[t] - 1u].members.push_back(t);
+        for (auto& a : active) {
+            if (a.members.empty()) continue;
+            const RegionPoints pts = region_points(topo, a.members, o.max_fit_points);
+            if (pts.points.size() > static_cast<std::size_t>(parameter_count(kind_of(a.fit.surface)))) a.fit = refine_surface(a.fit.surface, pts.view(), o.fit);
+            a.gate = gate_of(a.fit, o);
+        }
+    }
+}
 
 }  // namespace
 
@@ -57,16 +123,44 @@ std::optional<FitResult> choose_seed_surface(const MeshTopology& topo, const Reg
 }
 
 RegionPoints region_points(const MeshTopology& topo, std::span<const std::uint32_t> triangles, std::size_t max_points) {
+    const recon::TriangleMesh& mesh = topo.mesh();
+    struct Corner {
+        std::uint32_t vertex;
+        std::uint32_t triangle;
+    };
+    std::vector<Corner> corners;
+    corners.reserve(triangles.size() * 3);
+    for (const auto t : triangles)
+        for (const auto v : mesh.triangles[t]) corners.push_back({v, t});
+    std::ranges::sort(corners, [](const Corner& a, const Corner& b) { return a.vertex < b.vertex; });
     RegionPoints out;
-    const std::size_t n = triangles.size();
-    const std::size_t stride = n > max_points && max_points > 0 ? (n + max_points - 1) / max_points : 1;
-    out.points.reserve(n / stride + 1);
-    for (std::size_t i = 0; i < n; i += stride) {
-        const std::uint32_t t = triangles[i];
-        if (topo.area(t) <= 0) continue;
-        out.points.push_back(topo.centroid(t).cast<double>());
-        out.normals.push_back(topo.normal(t).cast<double>());
-        out.weights.push_back(topo.area(t));
+    for (std::size_t i = 0; i < corners.size();) {
+        std::size_t j = i;
+        Vec3 n = Vec3::Zero();
+        double w = 0;
+        for (; j < corners.size() && corners[j].vertex == corners[i].vertex; ++j) {
+            const double a = topo.area(corners[j].triangle);
+            n += a * topo.normal(corners[j].triangle).cast<double>();
+            w += a / 3;
+        }
+        if (w > 0 && n.squaredNorm() > 0) {
+            out.points.push_back(mesh.vertices[corners[i].vertex].cast<double>());
+            out.normals.push_back(n.normalized());
+            out.weights.push_back(w);
+        }
+        i = j;
+    }
+    if (max_points > 0 && out.points.size() > max_points) {
+        const std::size_t stride = (out.points.size() + max_points - 1) / max_points;
+        std::size_t k = 0;
+        for (std::size_t i = 0; i < out.points.size(); i += stride, ++k) {
+            out.points[k] = out.points[i];
+            out.normals[k] = out.normals[i];
+            out.weights[k] = out.weights[i];
+        }
+        out.points.resize(k);
+        out.normals.resize(k);
+        out.weights.resize(k);
     }
     return out;
 }
@@ -122,7 +216,8 @@ GrowResult grow_regions(const MeshTopology& topo, std::span<const RegionSeed> se
     };
 
     for (std::size_t r = 0; r < seeds.size(); ++r) {
-        const RegionSeed& seed = seeds[r];
+        RegionSeed seed = seeds[r];
+        widen_small_seed(topo, seed.triangles, blocked);
         const RegionPoints pts = region_points(topo, seed.triangles, o.max_fit_points);
         std::optional<FitResult> fit;
         if (seed.surface) {
@@ -192,6 +287,8 @@ GrowResult grow_regions(const MeshTopology& topo, std::span<const RegionSeed> se
         if (!changed) break;
         run_queue();
     }
+
+    reassign_borders(topo, active, result.owner, o, cos_max);
 
     for (std::size_t r = 0; r < seeds.size(); ++r) {
         if (!result.regions[r].ok) continue;

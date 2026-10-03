@@ -106,15 +106,16 @@ public:
         return {d, face};
     }
 
-    // Whether a scanner would have seen the surface near p.
-    [[nodiscard]] bool observed(const Vec3& p, double band) const {
+    // Whether a scanner would have seen the space at p. Deep inside a hole it sees nothing, so the wall and
+    // floor there (whose surface needs the voxels on both sides) are missing, while the material around
+    // the hole is still seen.
+    [[nodiscard]] bool observed(const Vec3& p) const {
         if (p.z() < spec_.unseen_below_z) return false;
         for (const auto& hole : spec_.holes) {
             const Vec3 v = p - hole.entry;
             const double h = v.dot(hole.axis);
             const double rho = (v - h * hole.axis).norm();
-            if (rho < 0.5 * hole.diameter + band && h > spec_.hole_wall_depth * hole.diameter && h < hole.depth + band)
-                return false;
+            if (rho < 0.5 * hole.diameter && h > spec_.hole_wall_depth * hole.diameter && h < hole.depth) return false;
         }
         return true;
     }
@@ -150,7 +151,7 @@ public:
                                 const double d = field_(p).distance;
                                 const auto i = static_cast<std::size_t>((z * 8 + y) * 8 + x);
                                 sdf[i] = static_cast<float>(std::clamp(d / trunc, -1.0, 1.0));
-                                const bool seen = field_.observed(p, trunc);
+                                const bool seen = field_.observed(p);
                                 weight[i] = seen ? 1.0f : 0.0f;
                                 near |= seen && std::abs(d) < trunc;
                             }

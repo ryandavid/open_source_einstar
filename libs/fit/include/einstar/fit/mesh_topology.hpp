@@ -16,8 +16,10 @@ inline constexpr std::uint32_t kNoTriangle = 0xffffffffu;
 
 class MeshTopology {
 public:
+    // The mesh must outlive the topology and not change.
     explicit MeshTopology(const recon::TriangleMesh& mesh);
 
+    [[nodiscard]] const recon::TriangleMesh& mesh() const { return *mesh_; }
     [[nodiscard]] std::size_t triangle_count() const { return neighbors_.size(); }
     [[nodiscard]] std::size_t vertex_count() const { return vertex_offsets_.size() - 1; }
 
@@ -44,6 +46,7 @@ public:
     [[nodiscard]] std::vector<std::uint32_t> components(std::uint32_t& count) const;
 
 private:
+    const recon::TriangleMesh* mesh_;
     std::vector<std::array<std::uint32_t, 3>> neighbors_;
     std::vector<std::uint32_t> vertex_offsets_, vertex_triangles_;
     std::vector<Vec3f> normals_, centroids_;

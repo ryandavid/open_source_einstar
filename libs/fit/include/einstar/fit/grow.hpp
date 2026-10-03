@@ -19,9 +19,12 @@
 namespace einstar::fit {
 
 struct GrowOptions {
-    double gate_sigma = 3.0;     // a triangle joins within this many sigma of the surface...
+    double gate_sigma = 3.0;     // a triangle joins within this many sigma (of its centroid) of the surface...
     double min_gate_mm = 0.06;   // ...but never a narrower band than this
     double max_normal_angle_deg = 25;
+    // Cap on the sigma the gate is computed from (0: none). Without it a surface that does not fit (a
+    // plane on a fillet) widens its own gate as it takes worse triangles.
+    double max_sigma_mm = 0;
     std::size_t max_fit_points = 4000;
     FitOptions fit;
 };
@@ -59,7 +62,9 @@ struct RegionPoints;
 [[nodiscard]] std::vector<std::uint32_t> triangles_within(const MeshTopology& topo, std::uint32_t start, const Vec3f& center,
                                                           float radius);
 
-// Fit data of a set of triangles: centroids, normals and areas, evenly subsampled to at most max_points.
+// Fit data of a set of triangles: their vertices (on the surface, unlike centroids, which sit inside a
+// tight curve by the chord's sagitta), normals from the set's own triangles, and a third of each triangle's
+// area per corner; evenly subsampled to at most max_points.
 struct RegionPoints {
     std::vector<Vec3> points, normals;
     std::vector<double> weights;

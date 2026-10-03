@@ -85,7 +85,7 @@ TEST_CASE("seeded growth recovers whole faces of the flanged box") {
         {"box0 +x", {80, 3, 12}, {-1, 0, 0}, SurfaceKind::plane, 0.92},  // the first row of each fillet is within noise of the plane
         {"box1 +z", {40, -10, 50}, {0, 0, -1}, SurfaceKind::plane, 0.93},
         {"box1 -y", {-40, -80, 2}, {0, 1, 0}, SurfaceKind::plane, 0.88},  // a 4 mm strip, mostly edge
-        {"box0 fillet x+y+", {48.6f, 38.6f, 12}, {-1, -1, 0}, SurfaceKind::cylinder, 0.75},  // the planes' first rows lie within noise of it
+        {"box0 fillet x+y+", {48.6f, 38.6f, 12}, {-1, -1, 0}, SurfaceKind::cylinder, 0.70},  // the planes' first rows lie within noise of it
         {"hole0 wall", {-40.0f, -19, 6}, {-1, 0, -1}, SurfaceKind::cylinder, 0.85},
     };
     for (const Case& c : cases) {

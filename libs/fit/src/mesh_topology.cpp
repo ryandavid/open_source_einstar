@@ -12,7 +12,7 @@ std::uint64_t edge_key(std::uint32_t a, std::uint32_t b) {
 
 }  // namespace
 
-MeshTopology::MeshTopology(const recon::TriangleMesh& mesh) {
+MeshTopology::MeshTopology(const recon::TriangleMesh& mesh) : mesh_(&mesh) {
     const std::size_t nt = mesh.triangles.size(), nv = mesh.vertices.size();
     neighbors_.assign(nt, {kNoTriangle, kNoTriangle, kNoTriangle});
     normals_.resize(nt);
