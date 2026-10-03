@@ -4,11 +4,13 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <print>
 
 #include <unistd.h>
 
 #include "einstar/image/image.hpp"
 #include "einstar/model/document.hpp"
+#include "einstar/model/photo_geometry.hpp"
 #include "einstar/model/photo_render.hpp"
 
 using namespace einstar;
@@ -173,4 +175,92 @@ TEST_CASE("a photo library: imported, annotated, linked, saved with the model, u
     CHECK(!run(doc, "photo.list")["photos"][0]["annotations"][0].contains("value"));
     run(doc, "photo.annotation.delete", {{"annotation", "D1"}});
     CHECK(run(doc, "photo.list")["photos"][0]["annotations"].size() == 1);
+}
+
+TEST_CASE("a photo registered to the scan: its camera from matched points, the scan's reading of what is marked on it") {
+    TempDir tmp;
+    model::Document doc;
+    run(doc, "open_demo");
+    run(doc, "detect");
+    // A 1600 x 1200 photo, taken from above and to one side with a 28 mm equivalent lens.
+    const int W = 1600, H = 1200;
+    fit::PinholeCamera truth;
+    truth.focal = fit::focal_from_35mm(28, W, H);
+    truth.principal = Vec2(W / 2.0, H / 2.0);
+    const Vec3 eye(110, -150, 160), target(0, 0, 8);
+    const Vec3 z = (target - eye).normalized(), x = z.cross(Vec3::UnitZ()).normalized(), y = z.cross(x);
+    Mat3 R;
+    R.row(0) = x.transpose();
+    R.row(1) = y.transpose();
+    R.row(2) = z.transpose();
+    truth.T_camera_world.linear() = R;
+    truth.T_camera_world.translation() = -R * eye;
+    run(doc, "photo.import", {{"path", write_photo(tmp.path, "side.jpg", W, H).string()}});
+
+    // Points the user would match: where the camera sees the part through chosen pixels.
+    const auto seen_at = [&](const Vec2& px) {
+        const auto [o, d] = truth.ray(px);
+        const auto hit = doc.bvh().raycast(o.cast<float>(), d.cast<float>());
+        REQUIRE(hit);
+        return hit->point.cast<double>();
+    };
+    // Corners and edges of the part, located where the true camera sees them.
+    const std::vector<Vec3> corners = {{-50, -25, 4}, {50, -25, 4}, {50, 25, 4}, {-30, -20, 20}, {30, -20, 20}, {30, 20, 20}, {-30, 20, 20}, {50, -25, 1.5}};
+    json last;
+    for (std::size_t i = 0; i < corners.size(); ++i) {
+        // The scan's own point nearest the corner (the scan rounds edges), and where the photo shows it.
+        const Vec3 on = doc.bvh().closest(corners[i].cast<float>())->point.cast<double>();
+        const Vec2 px = *truth.project(on);
+        last = run(doc, "photo.correspond", {{"photo", "side"}, {"pixel", {px.x(), px.y()}}, {"point", {on.x(), on.y(), on.z()}}});
+        CHECK(last["registered"].get<bool>() == (i + 1 >= 6));
+    }
+    std::println("registered: {}", last["camera"].dump());
+    CHECK(last["camera"]["rms_px"].get<double>() < 0.5);
+    const auto& cam = *doc.state().photos[0].camera;
+    CHECK((model::pinhole_of(cam).center() - eye).norm() < 1.0);
+
+    // A dimension across the flange's front edge, and a hole's rim: the scan's reading and the suggested links.
+    const Vec2 a = *truth.project(seen_at(*truth.project(Vec3(-45, -25, 4)))), b = *truth.project(seen_at(*truth.project(Vec3(45, -25, 4))));
+    const json dim = run(doc, "photo.annotate", {{"photo", "side"}, {"kind", "dimension"}, {"points", {{a.x(), a.y()}, {b.x(), b.y()}}}, {"value", 90}});
+    REQUIRE(dim.contains("scan_value"));
+    CHECK(std::abs(dim["scan_value"].get<double>() - 90) < 1.0);
+    json rim = json::array();
+    for (const double t : {0.3, 2.2, 4.1}) {
+        const Vec2 q = *truth.project(Vec3(42 + 2.75 * std::cos(t), -19 + 2.75 * std::sin(t), 4));
+        rim.push_back({q.x(), q.y()});
+    }
+    const json dia = run(doc, "photo.annotate", {{"photo", "side"}, {"kind", "diameter"}, {"points", rim}, {"value", "5.5"}});
+    std::println("hole rim from the photo: scan {:.2f} mm, links {}", dia["scan_value"].get<double>(), dia["suggested_links"].dump());
+    CHECK(std::abs(dia["scan_value"].get<double>() - 5.5) < 0.6);
+    const std::string hole = [&] {
+        for (const auto& h : run(doc, "summary")["holes"])
+            if (std::hypot(h["center"][0].get<double>() - 42, h["center"][1].get<double>() + 19) < 1) return h["name"].get<std::string>();
+        return std::string();
+    }();
+    CHECK(std::ranges::find(dia["suggested_links"], json(hole)) != dia["suggested_links"].end());
+
+    // Projections both ways; the model drawn over the photo.
+    const Vec2 top = *truth.project(Vec3(0, -10, 20));
+    const json proj = run(doc, "photo.project", {{"photo", "side"}, {"point", {30, -20, 20}}, {"pixel", {top.x(), top.y()}}});
+    CHECK(proj["in_photo"]["visible"].get<bool>());
+    CHECK(!proj["on_scan"].is_null());
+    CHECK(model::overlay_lines(doc, doc.state().photos[0]).size() > 100);
+
+    // Background is not the part: no matching on it, and it hides nothing.
+    const std::string under = proj["on_scan"]["label"];
+    run(doc, "label.update", {{"label", under}, {"role", "ignore"}});
+    const auto bgv = proj["on_scan"]["point"].get<std::vector<double>>();
+    const Vec3 bg(bgv[0], bgv[1], bgv[2]);
+    const auto o = doc.apply("photo.correspond", {{"photo", "side"}, {"pixel", {top.x(), top.y()}}, {"point", {bg.x(), bg.y(), bg.z()}}});
+    CHECK(!o.ok);
+    CHECK(o.error.find("not the part") != std::string::npos);
+
+    // Saved and read back with its camera.
+    const auto path = tmp.path / "registered.emodel";
+    run(doc, "save", {{"path", path.string()}});
+    model::Document again;
+    run(again, "open", {{"path", path.string()}});
+    REQUIRE(again.state().photos[0].camera);
+    CHECK((model::pinhole_of(*again.state().photos[0].camera).center() - model::pinhole_of(cam).center()).norm() < 1e-9);
+    CHECK(again.state().photos[0].correspondences.size() == corners.size());
 }

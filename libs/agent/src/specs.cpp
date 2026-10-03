@@ -408,7 +408,28 @@ std::vector<MethodSpec> build() {
         object({{"photo", ref("A photo: its name or id.")}, {"max_size", integer("Longer side of the image, px (default 1600).")},
                 {"crop", {{"type", "array"}, {"items", {{"type", "number"}}}, {"minItems", 4}, {"maxItems", 4},
                           {"description", "[x, y, w, h] in photo pixels."}}},
-                {"annotations", boolean("Draw the annotations (default true).")}, {"grid", boolean("Draw a pixel grid (default false).")}},
+                {"annotations", boolean("Draw the annotations (default true).")}, {"grid", boolean("Draw a pixel grid (default false).")},
+                {"overlay", boolean("A registered photo: draw the model's edges (or the label boundaries) over it, to check the "
+                                    "registration and compare model and part (default false).")}},
+               {"photo"}));
+    add("model.photo.correspond", model, mutating,
+        "Matches a point of the part in a photo (pixel) to the same point on the scan (e.g. from model.raycast). With 6 "
+        "matched points (4 when EXIF gives the focal length) the photo's camera is solved, relative to the part only: "
+        "then annotations get the scan's own reading, links are suggested, and model.photo.get can draw the model over the "
+        "photo. Spread the points over the part, at corners and edges that are easy to place exactly. Points on scan "
+        "labelled ignore (not the part) are refused.",
+        object({{"photo", ref("A photo: its name or id.")}, {"pixel", point("[x, y] in photo pixels.")}, {"point", vec3("The same point on the scan, mm.")}},
+               {"photo", "pixel", "point"}));
+    add("model.photo.correspond.remove", model, mutating, "Removes a matched point (the camera is solved again).",
+        object({{"photo", ref("A photo: its name or id.")}, {"id", integer("The matched point's id.")}}, {"photo", "id"}));
+    add("model.photo.register", model, mutating,
+        "Solves the photo's camera again from its matched points; reports each point's error in px and which disagree with "
+        "the rest.",
+        object({{"photo", ref("A photo: its name or id.")}}, {"photo"}));
+    add("model.photo.project", model, read_only,
+        "For a registered photo: what a pixel shows on the part (a point and its label), and/or where a scan point appears in "
+        "the photo (and whether the part hides it there).",
+        object({{"photo", ref("A photo: its name or id.")}, {"pixel", point("[x, y] in photo pixels.")}, {"point", vec3("A point, mm.")}},
                {"photo"}));
     add("model.note.add", model, mutating,
         "Writes down a fact about the part that is not in the scan: material, finish, a thread, 'the bottom is flat', what it "

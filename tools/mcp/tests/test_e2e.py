@@ -141,6 +141,29 @@ def main() -> int:
         assert json.loads(seen.content[1].text)["annotations"] == ["D1 100.00 mm: flange length"]
         summary = result(m, "model_summary")
         assert summary["photos"][0]["annotation_count"] == 1 and summary["notes"][0]["text"] == "aluminium"
+        # Registered from points on the part (where a camera above and to the side would see them), then drawn over.
+        eye, target, focal = [89.0, -89.0, 100.0], [0.0, 0.0, 10.0], 300.0
+        fwd = [t - e for t, e in zip(target, eye)]
+        n = sum(v * v for v in fwd) ** 0.5
+        fwd = [v / n for v in fwd]
+        right = [fwd[1], -fwd[0], 0.0]  # fwd x up
+        n = sum(v * v for v in right) ** 0.5
+        right = [v / n for v in right]
+        down = [fwd[1] * right[2] - fwd[2] * right[1], fwd[2] * right[0] - fwd[0] * right[2], fwd[0] * right[1] - fwd[1] * right[0]]
+
+        def project(p):
+            d = [a - b for a, b in zip(p, eye)]
+            z = sum(a * b for a, b in zip(d, fwd))
+            return [160 + focal * sum(a * b for a, b in zip(d, right)) / z, 120 + focal * sum(a * b for a, b in zip(d, down)) / z]
+
+        reg = None
+        for x, y in [(-45, -20), (45, -20), (45, 20), (-20, -10), (20, 12), (-25, 15), (0, -15), (40, 0)]:
+            hit = result(m, "model_raycast", origin=[x, y, 100], direction=[0, 0, -1])
+            reg = result(m, "model_photo_correspond", photo="part", pixel=project(hit["point"]), point=hit["point"])
+        assert reg["registered"] and reg["camera"]["rms_px"] < 0.5, reg
+        assert "on_scan" in result(m, "model_photo_list", photo="part")["photos"][0]["annotations"][0]  # read on the scan now
+        over = ok(m, "model_photo_get", photo="part", overlay=True)
+        assert over.content[0].type == "image"
         assert result(m, "model_open", path=str(mesh))["scan"]["triangles"] > 1000
         assert m.call("model_grow", {}).is_error  # refused: nothing painted, said so
 

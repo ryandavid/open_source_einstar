@@ -222,6 +222,7 @@ int main(int argc, char** argv) {
     struct {
         bool rotating = false, panning = false;
         float last_x = 0, last_y = 0;
+        float press_x = 0, press_y = 0;
     } mouse;
     const recon::TriangleMesh* framed_scan = nullptr;  // the scan the view was last fitted to
     auto next_frame = std::chrono::steady_clock::now();
@@ -285,6 +286,12 @@ int main(int argc, char** argv) {
                 if (io.KeySuper && ImGui::IsKeyPressed(ImGuiKey_Z, false)) app.run(io.KeyShift ? "redo" : "undo", {});
                 if (ImGui::IsKeyPressed(ImGuiKey_F, false) && !io.KeySuper) app.frame(camera);
             }
+            // Matching a photo to the scan: a click (not a drag) on the scan gives the point.
+            if (over_view && photos.awaiting_scan_point() && !app.busy()) {
+                if (io.MouseClicked[0]) mouse.press_x = mx, mouse.press_y = my;
+                if (io.MouseReleased[0] && std::hypot(mx - mouse.press_x, my - mouse.press_y) < 4)
+                    if (const auto hit = app.doc.bvh().raycast(ray_origin, ray_dir)) photos.scan_point(app, hit->point.cast<double>());
+            }
             if (over_view && !app.stroking()) {
                 const bool l = io.MouseDown[0], r = io.MouseDown[1] || io.MouseDown[2];
                 const bool moved = mx != mouse.last_x || my != mouse.last_y;
@@ -326,7 +333,7 @@ int main(int argc, char** argv) {
             if (agent) agent->pump();
             ImGui::NewFrame();
             app.draw_ui(camera);
-            photos.draw(app);
+            photos.draw(app, camera);
 
             // The brush outline and the label under the cursor.
             if (over_view && app.doc.has_scan() && !app.busy()) {

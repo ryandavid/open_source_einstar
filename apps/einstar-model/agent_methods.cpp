@@ -8,6 +8,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include "einstar/model/photo_geometry.hpp"
 #include "einstar/model/photo_render.hpp"
 
 namespace einstar::modelapp {
@@ -92,6 +93,10 @@ void register_model_agent(agent::Server& server, ModelApp& app, render::ViewCame
         o.max_size = p.value("max_size", 1600);
         o.annotations = p.value("annotations", true);
         o.grid = p.value("grid", false);
+        if (p.value("overlay", false)) {
+            if (!photo->camera) return agent::error(ErrorCode::refused, "'" + photo->name + "' is not registered (model.photo.correspond)");
+            o.lines = model::overlay_lines(app.doc, *photo);
+        }
         if (p.contains("crop")) {
             const auto c = p["crop"].get<std::vector<double>>();
             if (c.size() != 4) throw agent::Server::BadParams("crop is [x, y, w, h]");

@@ -19,6 +19,7 @@
 #include "einstar/model/document.hpp"
 #include "einstar/model/io.hpp"
 #include "einstar/model/json.hpp"
+#include "einstar/model/photo_geometry.hpp"
 
 namespace einstar::model {
 
@@ -1134,7 +1135,27 @@ struct Document::Impl {
         }
         if (const auto c = annotation_circle(a)) j["circle"] = {{"center", {c->first.x(), c->first.y()}}, {"radius_px", c->second}};
         if (a.applied) j["applied_to"] = a.applied;
+        if (ph.camera) {
+            const auto scan = scan_reading(ph, a);
+            for (const auto& [k, v] : scan.items()) j[k] = v;
+        }
         return j;
+    }
+
+    // On a registered photo: where an annotation's points are on the part, what the scan measures there, and what
+    // it is likely about.
+    json scan_reading(const Photo& ph, const Annotation& a) const {
+        const ScanReading r = read_on_scan(d, ph, a);
+        json on = json::array();
+        for (const auto& h : r.hits)
+            on.push_back(h ? json{{"point", vec_to_json(h->point)}, {"label", h->label ? json(label_name(h->label)) : json(nullptr)}} : json(nullptr));
+        json out = {{"on_scan", on}};
+        if (r.value) out["scan_value"] = *r.value;
+        if (!r.suggested_links.empty()) {
+            out["suggested_links"] = json::array();
+            for (const int id : r.suggested_links) out["suggested_links"].push_back(link_name(id));
+        }
+        return out;
     }
     json photo_json(const Photo& ph, bool annotations) const {
         json j = {{"id", ph.id}, {"name", ph.name}, {"size", {ph.width, ph.height}}, {"mime", ph.blob ? ph.blob->mime : ""},
@@ -1149,8 +1170,13 @@ struct Document::Impl {
             for (const auto& a : ph.annotations) j["annotations"].push_back(annotation_summary(a));
         }
         if (!ph.correspondences.empty()) j["matched_points"] = ph.correspondences.size();
-        if (ph.camera) j["camera"] = {{"rms_px", ph.camera->rms_px}, {"focal_px", ph.camera->focal_px}};
+        if (ph.camera) j["camera"] = camera_json(ph);
         return j;
+    }
+    json camera_json(const Photo& ph) const {
+        const auto cam = pinhole_of(*ph.camera);
+        const Vec3 forward = cam.T_camera_world.linear().row(2).transpose();
+        return {{"rms_px", ph.camera->rms_px}, {"focal_px", ph.camera->focal_px}, {"position", vec_to_json(cam.center())}, {"looking", vec_to_json(forward)}};
     }
 
     std::string unique_photo_name(const std::string& base) const {
@@ -1312,6 +1338,118 @@ struct Document::Impl {
         const int id = a->id;
         std::erase_if(ph->annotations, [&](const Annotation& x) { return x.id == id; });
         return {{"deleted", id}};
+    }
+
+    // ---- registration: matched points, the photo's camera ----
+
+    // Solves the photo's camera from its matched points (cleared when there are too few). The report says how
+    // well each pair agrees.
+    json solve_camera(Photo& ph) const {
+        std::vector<Vec2> px;
+        std::vector<Vec3> pts;
+        for (const auto& c : ph.correspondences) {
+            px.push_back(c.pixel);
+            pts.push_back(c.point);
+        }
+        fit::CameraFitOptions o;
+        o.width = ph.width;
+        o.height = ph.height;
+        if (ph.exif.contains("focal_35mm")) o.focal_prior = fit::focal_from_35mm(ph.exif["focal_35mm"].get<double>(), ph.width, ph.height);
+        const int need = fit::min_camera_pairs(o.focal_prior.has_value());
+        json report = {{"pairs", ph.correspondences.size()}};
+        const auto fit = static_cast<int>(px.size()) >= need ? fit::fit_camera(px, pts, o) : std::nullopt;
+        if (!fit) {
+            ph.camera.reset();
+            report["registered"] = false;
+            report["note"] = static_cast<int>(px.size()) < need
+                                 ? std::format("{} more matched point{} needed ({}: {})", need - static_cast<int>(px.size()),
+                                               need - static_cast<int>(px.size()) == 1 ? "" : "s", need, o.focal_prior ? "the focal length is known from EXIF" : "no focal length in EXIF")
+                                 : std::string("no camera explains these points: check them");
+            return report;
+        }
+        PhotoCamera cam;
+        cam.focal_px = fit->camera.focal;
+        cam.principal = fit->camera.principal;
+        cam.k1 = fit->camera.k1;
+        cam.T_camera_world = fit->camera.T_camera_world;
+        // The error of the points that agree (an outlier says so separately).
+        double ss = 0;
+        int inliers = 0, outliers = 0;
+        for (std::size_t i = 0; i < fit->residuals.size(); ++i)
+            if (fit->outlier[i]) {
+                ++outliers;
+            } else {
+                ss += fit->residuals[i] * fit->residuals[i];
+                ++inliers;
+            }
+        cam.rms_px = inliers ? std::sqrt(ss / inliers) : fit->rms_px;
+        ph.camera = cam;
+        report["outliers"] = outliers;
+        report["registered"] = true;
+        report["camera"] = camera_json(ph);
+        report["points"] = json::array();
+        for (std::size_t i = 0; i < ph.correspondences.size(); ++i)
+            report["points"].push_back({{"id", ph.correspondences[i].id}, {"residual_px", fit->residuals[i]}, {"outlier", static_cast<bool>(fit->outlier[i])}});
+        if (std::ranges::any_of(fit->outlier, [](bool b) { return b; }))
+            report["note"] = "some matched points disagree with the others (outlier: true): move or remove them";
+        return report;
+    }
+
+    json photo_correspond(const json& p) {
+        need_scan();
+        Photo& ph = photo_ref(need(p, "photo"));
+        const json& px = need(p, "pixel");
+        if (!px.is_array() || px.size() != 2) fail("pixel is [x, y] in photo pixels");
+        const Vec2 pixel(px[0].get<double>(), px[1].get<double>());
+        if (pixel.x() < 0 || pixel.y() < 0 || pixel.x() > ph.width || pixel.y() > ph.height) fail("the pixel is outside the photo");
+        // The point, on the part's scan.
+        const Vec3 want = vec_from_json(need(p, "point"));
+        const auto near = d.bvh().closest(want.cast<float>(), static_cast<float>(3 * d.voxel_mm()));
+        if (!near) fail(std::format("{} is not on the scan (model.raycast finds points on it)", vec_to_json(want).dump()));
+        if (is_background(d, near->triangle))
+            refuse(std::format("that point is on '{}', which is marked as not the part (ignore): match points on the part itself",
+                               label_name((*d.state_.region)[near->triangle])));
+        ph.correspondences.push_back({new_id(), pixel, near->point.cast<double>()});
+        json out = solve_camera(ph);
+        out["added"] = ph.correspondences.back().id;
+        return out;
+    }
+
+    json photo_correspond_remove(const json& p) {
+        Photo& ph = photo_ref(need(p, "photo"));
+        const int id = get<int>(p, "id");
+        if (!std::erase_if(ph.correspondences, [&](const Correspondence& c) { return c.id == id; })) fail(std::format("no matched point {}", id));
+        return solve_camera(ph);
+    }
+
+    json photo_register(const json& p) {
+        need_scan();
+        Photo& ph = photo_ref(need(p, "photo"));
+        return solve_camera(ph);
+    }
+
+    json photo_project(const json& p) const {
+        need_scan();
+        const json& ref = need(p, "photo");
+        const Photo* ph = nullptr;
+        for (const auto& x : d.state_.photos)
+            if ((ref.is_number_integer() && x.id == ref.get<int>()) || (ref.is_string() && x.name == ref.get<std::string>())) ph = &x;
+        if (!ph) fail(std::format("no photo {}", ref.dump()));
+        if (!ph->camera) refuse(std::format("'{}' is not registered: match points between it and the scan first (model.photo.correspond)", ph->name));
+        json out = json::object();
+        if (p.contains("pixel")) {
+            const auto& px = p["pixel"];
+            const auto hit = photo_to_scan(d, *ph, Vec2(px.at(0).get<double>(), px.at(1).get<double>()));
+            out["on_scan"] = hit ? json{{"point", vec_to_json(hit->point)}, {"label", hit->label ? json(label_name(hit->label)) : json(nullptr)}} : json(nullptr);
+        }
+        if (p.contains("point")) {
+            const auto at = scan_to_photo(d, *ph, vec_from_json(p["point"]));
+            out["in_photo"] = at ? json{{"pixel", {at->pixel.x(), at->pixel.y()}}, {"visible", at->visible},
+                                        {"inside", at->pixel.x() >= 0 && at->pixel.y() >= 0 && at->pixel.x() <= ph->width && at->pixel.y() <= ph->height}}
+                                 : json(nullptr);
+        }
+        if (out.empty()) fail("give 'pixel' and/or 'point'");
+        return out;
     }
 
     json photo_list(const json& p) const {
@@ -1803,6 +1941,10 @@ const std::map<std::string, CommandInfo, std::less<>>& table() {
         {"photo.annotation.update", {[](I& i, const json& p) { return i.photo_annotation_update(p); }, true}},
         {"photo.annotation.delete", {[](I& i, const json& p) { return i.photo_annotation_delete(p); }, true}},
         {"photo.list", {[](I& i, const json& p) { return i.photo_list(p); }, false}},
+        {"photo.correspond", {[](I& i, const json& p) { return i.photo_correspond(p); }, true}},
+        {"photo.correspond.remove", {[](I& i, const json& p) { return i.photo_correspond_remove(p); }, true}},
+        {"photo.register", {[](I& i, const json& p) { return i.photo_register(p); }, true}},
+        {"photo.project", {[](I& i, const json& p) { return i.photo_project(p); }, false}},
         {"note.add", {[](I& i, const json& p) { return i.note_add(p); }, true}},
         {"note.update", {[](I& i, const json& p) { return i.note_update(p); }, true}},
         {"note.delete", {[](I& i, const json& p) { return i.note_delete(p); }, true}},

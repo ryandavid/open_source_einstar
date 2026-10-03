@@ -108,6 +108,32 @@ assembly. They can be taken anywhere. Nothing assumes they show the scan's setti
 
   The agent annotates too, to keep what the user tells it attached to a picture.
 
+### Registering a photo to the scan
+
+*Match to scan* (`model.photo.correspond`) pairs a point of the part in the photo with the same point on the
+scan: click it in the photo, then on the scan in the 3D view. With 6 pairs, or 4 when EXIF gives the focal
+length, the photo's camera is solved, relative to the part only.
+- **Spread the points:** pick corners and edges that are easy to place exactly, spread over the part.
+- **Background is left out:** points on scan labelled `ignore` are refused, and that scan hides nothing. Label
+  leftover background `ignore` when a photo was taken somewhere else.
+- **How it's solved:** `fit::fit_camera` is a pinhole with one radial term and the principal point at the image
+  centre.
+  - It starts from views all round the part, each with a weak-perspective fit for roll, distance and offset.
+    This works with coplanar points and with 4 points.
+  - It then refines with Levenberg–Marquardt and a Huber loss.
+  - A pair the others disagree with is flagged as an outlier.
+
+**Once registered:**
+- The model's edges, or the label boundaries before a build, are drawn over the photo. `model.photo.get` can
+  draw them too, with `overlay`.
+- Each annotation reads on the scan:
+  - its points on the part;
+  - what the scan measures. A diameter is measured where its rim rays cross the face, because the scan rounds
+    rims;
+  - suggested links (the labels under its points, and a hole at its centre).
+- `model.photo.project` maps a pixel to a scan point and label, and a scan point back to a pixel.
+- The photo's camera is drawn in the 3D view, and *View from photo* takes the 3D view to it.
+
 ## When the scan changes
 
 The model keeps its own copy of the mesh, so a changed source cannot move the labels underneath it. When

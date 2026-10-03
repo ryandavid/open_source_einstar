@@ -8,6 +8,7 @@
 #include <memory>
 #include <vector>
 
+#include "einstar/render/view_camera.hpp"
 #include "model_app.hpp"
 
 namespace einstar::modelapp {
@@ -22,7 +23,12 @@ public:
     void import_files(ModelApp& app, const std::vector<std::filesystem::path>& files);
     // Cmd+V: image files copied in the Finder, or an image copied from Photos, a browser or a screenshot.
     void paste(ModelApp& app);
-    void draw(ModelApp& app);
+    // The windows, and over the 3D view: the matched points and the registered photos' cameras.
+    void draw(ModelApp& app, render::ViewCamera& camera);
+    // Matching points: a pixel has been picked in the photo and waits for its point on the scan (a click in the
+    // 3D view, given here).
+    [[nodiscard]] bool awaiting_scan_point() const;
+    void scan_point(ModelApp& app, const Vec3& point);
     // Opens a photo in the Photo window.
     void show(int photo_id);
 

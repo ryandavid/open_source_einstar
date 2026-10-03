@@ -2322,12 +2322,147 @@
           "description": "Longer side of the image, px (default 1600).",
           "type": "integer"
         },
+        "overlay": {
+          "description": "A registered photo: draw the model's edges (or the label boundaries) over it, to check the registration and compare model and part (default false).",
+          "type": "boolean"
+        },
         "photo": {
           "description": "A photo: its name or id.",
           "type": [
             "string",
             "integer"
           ]
+        }
+      },
+      "required": [
+        "photo"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Matches a point of the part in a photo (pixel) to the same point on the scan (e.g. from model.raycast). With 6 matched points (4 when EXIF gives the focal length) the photo's camera is solved, relative to the part only: then annotations get the scan's own reading, links are suggested, and model.photo.get can draw the model over the photo. Spread the points over the part, at corners and edges that are easy to place exactly. Points on scan labelled ignore (not the part) are refused.",
+    "kind": "mutating",
+    "name": "model.photo.correspond",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "photo": {
+          "description": "A photo: its name or id.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "pixel": {
+          "description": "[x, y] in photo pixels.",
+          "items": {
+            "type": "number"
+          },
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array"
+        },
+        "point": {
+          "description": "The same point on the scan, mm.",
+          "items": {
+            "type": "number"
+          },
+          "maxItems": 3,
+          "minItems": 3,
+          "type": "array"
+        }
+      },
+      "required": [
+        "photo",
+        "pixel",
+        "point"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Removes a matched point (the camera is solved again).",
+    "kind": "mutating",
+    "name": "model.photo.correspond.remove",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "description": "The matched point's id.",
+          "type": "integer"
+        },
+        "photo": {
+          "description": "A photo: its name or id.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        }
+      },
+      "required": [
+        "photo",
+        "id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Solves the photo's camera again from its matched points; reports each point's error in px and which disagree with the rest.",
+    "kind": "mutating",
+    "name": "model.photo.register",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "photo": {
+          "description": "A photo: its name or id.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        }
+      },
+      "required": [
+        "photo"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "For a registered photo: what a pixel shows on the part (a point and its label), and/or where a scan point appears in the photo (and whether the part hides it there).",
+    "kind": "read_only",
+    "name": "model.photo.project",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "photo": {
+          "description": "A photo: its name or id.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "pixel": {
+          "description": "[x, y] in photo pixels.",
+          "items": {
+            "type": "number"
+          },
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array"
+        },
+        "point": {
+          "description": "A point, mm.",
+          "items": {
+            "type": "number"
+          },
+          "maxItems": 3,
+          "minItems": 3,
+          "type": "array"
         }
       },
       "required": [

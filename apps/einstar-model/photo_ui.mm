@@ -3,6 +3,7 @@
 #import <Metal/Metal.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <format>
@@ -15,6 +16,7 @@
 
 #include "dialogs.hpp"
 #include "einstar/image/image.hpp"
+#include "einstar/model/photo_geometry.hpp"
 #include "imgui.h"
 
 namespace einstar::modelapp {
@@ -46,9 +48,12 @@ struct Texture {
     int last_used = 0;
 };
 
-enum class Tool { select, dimension, diameter, angle, callout, note };
+enum class Tool { select, dimension, diameter, angle, callout, note, match };
 constexpr std::pair<Tool, const char*> kTools[] = {{Tool::select, "Select"},   {Tool::dimension, "Dimension"}, {Tool::diameter, "Diameter"},
-                                                   {Tool::angle, "Angle"},     {Tool::callout, "Callout"},     {Tool::note, "Note"}};
+                                                   {Tool::angle, "Angle"},     {Tool::callout, "Callout"},     {Tool::note, "Note"},
+                                                   {Tool::match, "Match to scan"}};
+constexpr ImU32 kMatch = IM_COL32(255, 80, 220, 255);
+constexpr ImU32 kResidual = IM_COL32(255, 60, 60, 255);
 
 model::AnnotationKind kind_of(Tool t) {
     switch (t) {
@@ -57,6 +62,7 @@ model::AnnotationKind kind_of(Tool t) {
         case Tool::angle: return model::AnnotationKind::angle;
         case Tool::callout: return model::AnnotationKind::callout;
         case Tool::note:
+        case Tool::match:
         case Tool::select: return model::AnnotationKind::note;
     }
     return model::AnnotationKind::note;
@@ -69,6 +75,7 @@ int points_for(Tool t) {
         case Tool::angle: return 3;
         case Tool::callout: return 2;
         case Tool::note: return 1;
+        case Tool::match:
         case Tool::select: return 0;
     }
     return 0;
@@ -81,6 +88,7 @@ const char* hint_for(Tool t) {
         case Tool::callout: return "Click what it points at, then where its text goes.";
         case Tool::note: return "Click where the note goes.";
         case Tool::select: return "Click an annotation to select it; drag its points to move them. Delete removes it.";
+        case Tool::match: return "Click a point of the part, then the same point on the scan in the 3D view (6 points, spread out).";
     }
     return "";
 }
@@ -118,6 +126,17 @@ struct PhotoUi::Impl {
         std::set<int> links;
         std::string error;
     } edit;
+
+    // Registration.
+    std::optional<Vec2> match_pixel;  // picked in the photo, waiting for its point on the scan
+    bool overlay = true;
+    float overlay_alpha = 0.8f;
+    bool show_cameras = true;
+    struct OverlayCache {
+        int photo = 0;
+        std::uint64_t revision = ~0ull;
+        std::vector<std::pair<Vec2, Vec2>> lines;
+    } overlay_cache;
 
     char note_text[512] = {};
     char caption[512] = {};
@@ -321,9 +340,11 @@ struct PhotoUi::Impl {
         // Tools.
         for (const auto& [t, name] : kTools) {
             if (t != Tool::select) ImGui::SameLine();
+            if (t == Tool::match) ImGui::SameLine(0, 18);
             if (ImGui::RadioButton(name, tool == t)) {
                 tool = t;
                 pending.clear();
+                match_pixel.reset();
             }
         }
         ImGui::SameLine(0, 24);
@@ -384,6 +405,37 @@ struct PhotoUi::Impl {
             at = std::abs(d.x()) > std::abs(d.y()) ? Vec2(at.x(), pending.back().y()) : Vec2(pending.back().x(), at.y());
         }
 
+        // The model over the photo (registered photos).
+        if (overlay && ph.camera) {
+            if (overlay_cache.photo != ph.id || overlay_cache.revision != app.doc.revision()) {
+                overlay_cache = {ph.id, app.doc.revision(), model::overlay_lines(app.doc, ph)};
+            }
+            const ImU32 col = IM_COL32(0, 220, 255, static_cast<int>(255 * overlay_alpha));
+            for (const auto& [a, b] : overlay_cache.lines) dl->AddLine(iv(screen(a)), iv(screen(b)), col, 1.5f);
+        }
+        // Matched points: where they were clicked, and (registered) where the camera puts their scan points.
+        if (tool == Tool::match || !ph.camera) {
+            int k = 0;
+            for (const auto& c : ph.correspondences) {
+                ++k;
+                const Vec2 sp = screen(c.pixel);
+                if (ph.camera)
+                    if (const auto q = model::pinhole_of(*ph.camera).project(c.point)) {
+                        dl->AddLine(iv(sp), iv(screen(*q)), kResidual, 2);
+                        dl->AddCircleFilled(iv(screen(*q)), 3, kResidual);
+                    }
+                dl->AddCircle(iv(sp), 7, kShadow, 0, 4);
+                dl->AddCircle(iv(sp), 7, kMatch, 0, 2);
+                dl->AddText(ImVec2(static_cast<float>(sp.x()) + 9, static_cast<float>(sp.y()) - 18), kMatch, std::to_string(k).c_str());
+            }
+        }
+        if (match_pixel) {
+            const Vec2 sp = screen(*match_pixel);
+            dl->AddLine(ImVec2(static_cast<float>(sp.x()) - 12, static_cast<float>(sp.y())), ImVec2(static_cast<float>(sp.x()) + 12, static_cast<float>(sp.y())), kMatch, 2);
+            dl->AddLine(ImVec2(static_cast<float>(sp.x()), static_cast<float>(sp.y()) - 12), ImVec2(static_cast<float>(sp.x()), static_cast<float>(sp.y()) + 12), kMatch, 2);
+            dl->AddText(ImVec2(static_cast<float>(sp.x()) + 14, static_cast<float>(sp.y()) + 4), kMatch, "now click this point on the scan");
+        }
+
         // Annotations.
         const auto& annotations = ph.annotations;
         for (const auto& a : annotations) {
@@ -392,7 +444,7 @@ struct PhotoUi::Impl {
             draw_annotation(dl, a, pts, screen, a.id == selected);
         }
         // The annotation being made.
-        if (tool != Tool::select && hovered) {
+        if (tool != Tool::select && tool != Tool::match && hovered) {
             std::vector<Vec2> pts = pending;
             pts.push_back(at);
             for (std::size_t i = 0; i + 1 < pts.size(); ++i) dl->AddLine(iv(screen(pts[i])), iv(screen(pts[i + 1])), kPending, 2);
@@ -401,7 +453,9 @@ struct PhotoUi::Impl {
 
         // Clicks.
         if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-            if (tool != Tool::select) {
+            if (tool == Tool::match) {
+                match_pixel = at;
+            } else if (tool != Tool::select) {
                 pending.push_back(at);
                 if (static_cast<int>(pending.size()) == points_for(tool)) {
                     begin_edit(0, kind_of(tool), pending);
@@ -446,6 +500,7 @@ struct PhotoUi::Impl {
         if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) && !io.WantTextInput) {
             if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
                 pending.clear();
+                match_pixel.reset();
                 selected = 0;
             }
             if (selected && (ImGui::IsKeyPressed(ImGuiKey_Delete) || ImGui::IsKeyPressed(ImGuiKey_Backspace))) {
@@ -567,12 +622,18 @@ struct PhotoUi::Impl {
         ImGui::TextDisabled("%d x %d px%s", ph.width, ph.height,
                             ph.exif.contains("model") ? std::format(", {}", ph.exif["model"].get<std::string>()).c_str() : "");
 
+        draw_registration(app, ph);
+
         ImGui::SeparatorText("Marked on this photo");
         if (ph.annotations.empty()) ImGui::TextWrapped("Nothing yet: pick a tool above and click on the photo.");
         int remove = 0;
         for (const auto& a : ph.annotations) {
             ImGui::PushID(a.id);
-            if (ImGui::Selectable(model::annotation_summary(a).c_str(), selected == a.id, ImGuiSelectableFlags_AllowDoubleClick)) {
+            std::string line = model::annotation_summary(a);
+            if (ph.camera)
+                if (const auto r = model::read_on_scan(app.doc, ph, a); r.value)
+                    line += a.kind == model::AnnotationKind::angle ? std::format("  (scan {:.1f}\u00B0)", *r.value) : std::format("  (scan {:.2f})", *r.value);
+            if (ImGui::Selectable(line.c_str(), selected == a.id, ImGuiSelectableFlags_AllowDoubleClick)) {
                 selected = a.id;
                 if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) begin_edit(a.id, a.kind, a.points, &a);
             }
@@ -602,6 +663,121 @@ struct PhotoUi::Impl {
                 app.run("photo.annotation.delete", {{"annotation", selected}});
                 selected = 0;
             }
+        }
+    }
+
+    void draw_registration(ModelApp& app, const model::Photo& ph) {
+        ImGui::SeparatorText("Matched to the scan");
+        const bool focal_known = ph.exif.contains("focal_35mm");
+        const int need = fit::min_camera_pairs(focal_known);
+        if (ph.camera) {
+            ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1), "Registered: %.1f px rms over %zu points", ph.camera->rms_px, ph.correspondences.size());
+            ImGui::Checkbox("Model over photo", &overlay);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(80);
+            ImGui::SliderFloat("##alpha", &overlay_alpha, 0.1f, 1.0f, "%.1f");
+        } else {
+            ImGui::TextWrapped("%zu of %d points matched%s. Use 'Match to scan': corners and edges of the part, spread over it.",
+                               ph.correspondences.size(), need, focal_known ? " (focal length from EXIF)" : "");
+        }
+        if (!ph.correspondences.empty() && ImGui::TreeNode("points", "Matched points (%zu)", ph.correspondences.size())) {
+            int k = 0, remove = 0;
+            const auto cam = ph.camera ? std::optional(model::pinhole_of(*ph.camera)) : std::nullopt;
+            for (const auto& c : ph.correspondences) {
+                ++k;
+                ImGui::PushID(c.id);
+                if (ImGui::SmallButton("x")) remove = c.id;
+                ImGui::SameLine();
+                const auto q = cam ? cam->project(c.point) : std::nullopt;
+                const double off = q ? (*q - c.pixel).norm() : 0;
+                // Far off the camera that the rest agree on: probably not the same point in both.
+                if (q && off > std::max(8.0, 5 * ph.camera->rms_px)) ImGui::TextColored(ImVec4(1, 0.4f, 0.35f, 1), "%d   %.1f px off: not the same point?", k, off);
+                else if (q) ImGui::Text("%d   %.1f px off", k, off);
+                else ImGui::Text("%d", k);
+                ImGui::PopID();
+            }
+            if (remove) app.run("photo.correspond.remove", {{"photo", ph.id}, {"id", remove}});
+            ImGui::TreePop();
+        }
+        ImGui::Checkbox("Cameras in the 3D view", &show_cameras);
+        if (ph.camera) {
+            ImGui::SameLine();
+            if (ImGui::Button("View from photo")) view_from = ph.id;
+        }
+    }
+    int view_from = 0;  // a photo whose camera the 3D view should take
+
+    // Over the 3D view: the open photo's matched points, numbered, and every registered photo's camera.
+    void draw_scene(ModelApp& app, render::ViewCamera& camera) {
+        if (app.busy() || !app.doc.has_scan()) return;
+        if (view_from) {
+            if (const auto* ph = find(app, view_from); ph && ph->camera) {
+                const auto cam = model::pinhole_of(*ph->camera);
+                const Mat3 Rwc = cam.T_camera_world.linear().transpose();
+                const Vec3 fwd = Rwc.col(2);
+                Vec3 centroid = Vec3::Zero();
+                for (const auto& c : ph->correspondences) centroid += c.point;
+                if (!ph->correspondences.empty()) centroid /= static_cast<double>(ph->correspondences.size());
+                const double dist = std::max(10.0, (centroid - cam.center()).dot(fwd));
+                camera.orientation = render::Quatf(Rwc.cast<float>());
+                camera.distance = static_cast<float>(dist);
+                camera.target = (cam.center() + fwd * dist).cast<float>();
+                camera.fov_y = static_cast<float>(2 * std::atan(ph->height / (2 * cam.focal)));
+            }
+            view_from = 0;
+        }
+        const ImGuiIO& io = ImGui::GetIO();
+        const Eigen::Matrix4f vp = camera.projection(io.DisplaySize.x / std::max(io.DisplaySize.y, 1.0f)) * camera.view();
+        const auto to_screen = [&](const Vec3& w) -> std::optional<ImVec2> {
+            const Eigen::Vector4f c = vp * Eigen::Vector4f(static_cast<float>(w.x()), static_cast<float>(w.y()), static_cast<float>(w.z()), 1);
+            if (c.w() <= 1e-6f) return std::nullopt;
+            return ImVec2((c.x() / c.w() + 1) * 0.5f * io.DisplaySize.x, (1 - c.y() / c.w()) * 0.5f * io.DisplaySize.y);
+        };
+        ImDrawList* dl = ImGui::GetBackgroundDrawList();
+        if (const auto* ph = find(app, open_photo)) {
+            int k = 0;
+            for (const auto& c : ph->correspondences) {
+                ++k;
+                if (const auto s = to_screen(c.point)) {
+                    dl->AddCircle(*s, 7, kShadow, 0, 4);
+                    dl->AddCircle(*s, 7, kMatch, 0, 2);
+                    dl->AddText(ImVec2(s->x + 9, s->y - 18), kMatch, std::to_string(k).c_str());
+                }
+            }
+        }
+        if (!show_cameras) return;
+        for (const auto& ph : app.doc.state().photos) {
+            if (!ph.camera) continue;
+            // A small pyramid: the camera centre and its image's corners a short way out.
+            const auto cam = model::pinhole_of(*ph.camera);
+            const Vec3 c = cam.center();
+            const double depth = 25;
+            std::array<Vec3, 4> corner;
+            const std::array<Vec2, 4> px = {Vec2(0, 0), Vec2(ph.width, 0), Vec2(ph.width, ph.height), Vec2(0, ph.height)};
+            for (std::size_t i = 0; i < 4; ++i) {
+                const auto [o, d] = cam.ray(px[i]);
+                const Vec3 fwd = cam.T_camera_world.linear().row(2).transpose();
+                corner[i] = o + d * (depth / std::max(1e-6, d.dot(fwd)));
+            }
+            const ImU32 col = ph.id == open_photo ? kMatch : IM_COL32(200, 200, 255, 200);
+            const auto sc = to_screen(c);
+            for (std::size_t i = 0; i < 4; ++i) {
+                const auto a = to_screen(corner[i]), b = to_screen(corner[(i + 1) % 4]);
+                if (a && b) dl->AddLine(*a, *b, col, 1.5f);
+                if (a && sc) dl->AddLine(*sc, *a, col, 1.0f);
+            }
+            if (sc) dl->AddText(ImVec2(sc->x + 6, sc->y + 4), col, ph.name.c_str());
+        }
+    }
+
+    void scan_point(ModelApp& app, const Vec3& point) {
+        if (!match_pixel || !open_photo) return;
+        const auto o = app.run("photo.correspond", {{"photo", open_photo}, {"pixel", {match_pixel->x(), match_pixel->y()}}, {"point", {point.x(), point.y(), point.z()}}});
+        if (o.ok) {
+            match_pixel.reset();
+            if (o.result.contains("note")) app.set_status("matched: " + o.result["note"].get<std::string>(), false);
+            else if (o.result.value("registered", false))
+                app.set_status(std::format("registered: {:.1f} px rms", o.result["camera"]["rms_px"].get<double>()), false);
         }
     }
 
@@ -653,6 +829,24 @@ struct PhotoUi::Impl {
         }
         enter |= ImGui::InputTextWithHint("Text", "what it is, e.g. 'flange width', 'M6 thread'", edit.text, sizeof(edit.text),
                                           ImGuiInputTextFlags_EnterReturnsTrue);
+        // On a registered photo: what the scan says, and what it is likely about.
+        if (const auto* ph = find(app, open_photo); ph && ph->camera) {
+            model::Annotation probe;
+            probe.kind = edit.kind;
+            probe.points = edit.points;
+            const auto r = model::read_on_scan(app.doc, *ph, probe);
+            if (r.value)
+                ImGui::TextColored(ImVec4(0.4f, 0.9f, 1, 1), "The scan measures %s", edit.kind == model::AnnotationKind::angle
+                                                                                         ? std::format("{:.1f}\u00B0", *r.value).c_str()
+                                                                                         : std::format("{:.2f} mm", *r.value).c_str());
+            if (!r.suggested_links.empty()) {
+                std::string names;
+                for (const int id : r.suggested_links) names += (names.empty() ? "" : ", ") + entity_name(app, id);
+                ImGui::TextDisabled("Under its points: %s", names.c_str());
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Link them")) edit.links.insert(r.suggested_links.begin(), r.suggested_links.end());
+            }
+        }
         // What it is about.
         const auto& s = app.doc.state();
         std::string about;
@@ -709,11 +903,15 @@ void PhotoUi::import_files(ModelApp& app, const std::vector<std::filesystem::pat
 void PhotoUi::paste(ModelApp& app) { impl_->paste(app); }
 void PhotoUi::show(int photo_id) { impl_->open(photo_id); }
 
-void PhotoUi::draw(ModelApp& app) {
+void PhotoUi::draw(ModelApp& app, render::ViewCamera& camera) {
     ++impl_->frame;
     impl_->draw_library(app);
     impl_->draw_photo(app);
+    impl_->draw_scene(app, camera);
     impl_->trim();
 }
+
+bool PhotoUi::awaiting_scan_point() const { return impl_->open_photo && impl_->tool == Tool::match && impl_->match_pixel.has_value(); }
+void PhotoUi::scan_point(ModelApp& app, const Vec3& point) { impl_->scan_point(app, point); }
 
 }  // namespace einstar::modelapp
