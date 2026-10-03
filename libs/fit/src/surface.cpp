@@ -1,6 +1,7 @@
 #include "einstar/fit/surface.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <numbers>
 
@@ -39,6 +40,7 @@ int parameter_count(SurfaceKind kind) {
         case SurfaceKind::cone: return 6;
         case SurfaceKind::sphere: return 4;
         case SurfaceKind::torus: return 7;
+        case SurfaceKind::freeform: return 0;
     }
     return 0;
 }
@@ -58,8 +60,34 @@ Surface perturbed(const Surface& s, std::span<const double> d) {
                           [&](const Torus& t) -> Surface {
                               return Torus{t.center + Vec3(d[2], d[3], d[4]), rotate_axis(t.axis, d[0], d[1]), t.major + d[5], t.minor + d[6]};
                           },
+                          [&](const Freeform& f) -> Surface { return f; },
                       },
                       s);
+}
+
+double Freeform::height(double x, double y, Vec2* gradient) const {
+    // Uniform cubic B-spline basis on the cell holding (x, y), and its derivative.
+    const auto basis = [](double t, std::array<double, 4>& b, std::array<double, 4>& db) {
+        const double t2 = t * t, t3 = t2 * t, s = 1 - t;
+        b = {s * s * s / 6, (3 * t3 - 6 * t2 + 4) / 6, (-3 * t3 + 3 * t2 + 3 * t + 1) / 6, t3 / 6};
+        db = {-s * s / 2, (9 * t2 - 12 * t) / 6, (-9 * t2 + 6 * t + 3) / 6, t2 / 2};
+    };
+    const double tu = std::clamp((x - u0) / du, 0.0, static_cast<double>(nu - 3)), tv = std::clamp((y - v0) / dv, 0.0, static_cast<double>(nv - 3));
+    const int cu = std::min(static_cast<int>(tu), nu - 4), cv = std::min(static_cast<int>(tv), nv - 4);
+    std::array<double, 4> bu, dbu, bv, dbv;
+    basis(tu - cu, bu, dbu);
+    basis(tv - cv, bv, dbv);
+    double h = 0, hx = 0, hy = 0;
+    const auto& H = *heights;
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j) {
+            const double c = H[static_cast<std::size_t>((cu + i) * nv + cv + j)];
+            h += bu[static_cast<std::size_t>(i)] * bv[static_cast<std::size_t>(j)] * c;
+            hx += dbu[static_cast<std::size_t>(i)] * bv[static_cast<std::size_t>(j)] * c;
+            hy += bu[static_cast<std::size_t>(i)] * dbv[static_cast<std::size_t>(j)] * c;
+        }
+    if (gradient) *gradient = Vec2(hx / du, hy / dv);
+    return h;
 }
 
 Surface scaled(const Surface& s, double k) {
@@ -69,6 +97,15 @@ Surface scaled(const Surface& s, double k) {
                           [&](const Cone& c) -> Surface { return Cone{k * c.apex, c.axis, c.half_angle}; },
                           [&](const Sphere& sp) -> Surface { return Sphere{k * sp.center, k * sp.radius}; },
                           [&](const Torus& t) -> Surface { return Torus{k * t.center, t.axis, k * t.major, k * t.minor}; },
+                          [&](const Freeform& f) -> Surface {
+                              Freeform out = f;
+                              out.frame.translation() *= k;
+                              out.u0 *= k, out.v0 *= k, out.du *= k, out.dv *= k;
+                              auto h = std::make_shared<std::vector<double>>(*f.heights);
+                              for (double& x : *h) x *= k;
+                              out.heights = std::move(h);
+                              return out;
+                          },
                       },
                       s);
 }
@@ -87,6 +124,7 @@ std::string_view kind_name(SurfaceKind k) {
         case SurfaceKind::cone: return "cone";
         case SurfaceKind::sphere: return "sphere";
         case SurfaceKind::torus: return "torus";
+        case SurfaceKind::freeform: return "freeform";
     }
     return "?";
 }
@@ -103,6 +141,14 @@ double signed_distance(const Surface& s, const Vec3& p) {
                           [&](const Torus& t) {
                               const AxisCoords a = axis_coords(t.center, t.axis, p);
                               return std::hypot(a.rho - t.major, a.h) - t.minor;
+                          },
+                          [&](const Freeform& f) {
+                              // Height above the surface, scaled to the distance along its normal (exact at the
+                              // surface, first-order near it).
+                              const Vec3 q = f.frame.inverse() * p;
+                              Vec2 g;
+                              const double h = f.height(q.x(), q.y(), &g);
+                              return (q.z() - h) / std::sqrt(1 + g.squaredNorm());
                           },
                       },
                       s);
@@ -127,6 +173,12 @@ Vec3 normal_at(const Surface& s, const Vec3& p) {
                               const double n = q.norm();
                               return n > 1e-12 ? Vec3(q / n) : a.radial;
                           },
+                          [&](const Freeform& f) {
+                              const Vec3 q = f.frame.inverse() * p;
+                              Vec2 g;
+                              (void)f.height(q.x(), q.y(), &g);
+                              return Vec3(f.frame.linear() * Vec3(-g.x(), -g.y(), 1.0).normalized());
+                          },
                       },
                       s);
 }
@@ -144,6 +196,11 @@ Surface transformed(const Surface& s, const SE3& T) {
                           [&](const Cone& c) -> Surface { return Cone{T * c.apex, R * c.axis, c.half_angle}; },
                           [&](const Sphere& sp) -> Surface { return Sphere{T * sp.center, sp.radius}; },
                           [&](const Torus& t) -> Surface { return Torus{T * t.center, R * t.axis, t.major, t.minor}; },
+                          [&](const Freeform& f) -> Surface {
+                              Freeform out = f;
+                              out.frame = T * f.frame;
+                              return out;
+                          },
                       },
                       s);
 }

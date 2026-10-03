@@ -20,6 +20,9 @@ namespace einstar::fit {
 struct PartBox {
     Vec3 min = Vec3::Zero(), max = Vec3::Ones();
     double fillet = 0;  // radius on every edge (0: sharp)
+    // A freeform top: z = max.z + dome (1 - u^2)(1 - v^2) over the box's footprint (u, v from -1 to 1), meeting the
+    // sides at an angle. 0: flat. (With a dome, fillets are not supported.)
+    double dome = 0;
 };
 
 struct PartHole {
@@ -76,5 +79,9 @@ struct SyntheticPart {
 //   x = 0:   4.5 mm through hole, countersunk 9 mm at 90 degrees;
 //   x = 18:  5 mm blind hole 8 mm deep (to the shoulder) with a 118 degree drill point.
 [[nodiscard]] PartSpec hole_forms_spec();
+
+// A 50 x 30 x 10 mm block whose top is a 4 mm high dome (a freeform face), scanned all round. Its volume is
+// 15000 + 4 x 25 x 15 x 16 / 9 = 17666.67 mm^3.
+[[nodiscard]] PartSpec domed_block_spec();
 
 }  // namespace einstar::fit

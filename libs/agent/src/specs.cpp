@@ -271,6 +271,16 @@ std::vector<MethodSpec> build() {
         "Finds faces on the unlabelled scan automatically: planes first, then cylinders, cones, spheres and tori. Labels them "
         "('plane 1', 'cylinder 2', ...), sorts out fillets (cylinders along the edge of two planes), hole walls and fillet "
         "corners, and finds the holes in the planes. Rename the labels to meaningful names afterwards.");
+    add("model.freeform", model, mutating,
+        "Makes a label a freeform face (a smooth B-spline surface) for a region no plane, cylinder, cone, sphere or torus "
+        "describes, e.g. a domed or sculpted top. Fitted to the label's region, or to its paint taken out over the "
+        "connected unlabelled scan up to sharp creases. Freeform faces are held as fitted (no constraints on them).",
+        object({{"label", kLabel},
+                {"extend", boolean("Take in the connected unlabelled scan first (default: when the label has no region).")},
+                {"crease_deg", num("Edges sharper than this stop the extension (default 20).")},
+                {"spacing_mm", num("Control point spacing (default: about 12 across the region).")},
+                {"smoothness", num("Bending against fit (default 0.02).")}},
+               {"label"}));
     add("model.find_holes", model, mutating,
         "Finds round holes in a plane label (openings in its region): centre, axis, diameter (from the wall if scanned, else "
         "from the opening), through or blind.",

@@ -329,3 +329,47 @@ TEST_CASE("the measurements reveal a scan 0.4% too large; scaling corrects it") 
     CHECK(!again["scale"]["significant"].get<bool>());
     CHECK(std::abs(run(doc, "summary")["scan"]["scale_applied"].get<double>() - scale["factor"].get<double>()) < 1e-12);
 }
+
+TEST_CASE("a freeform face: a domed top fitted as a B-spline, built into the solid and exported") {
+    const fit::SyntheticPart part = fit::make_synthetic_part(fit::domed_block_spec());
+    model::Document doc;
+    doc.set_scan(part.mesh, model::ScanSource{{}, "demo", 0, 0, {}});
+    run(doc, "label.create", {{"name", "top"}});
+    run(doc, "paint", {{"label", "top"}, {"point", {0, 0, 15}}, {"radius", 3.0}});
+    Stopwatch sw;
+    const json ff = run(doc, "freeform", {{"label", "top"}});
+    std::println("freeform: {} triangles, sigma {:.4f} rms {:.4f} mm, grid {} in {:.0f} ms", ff["triangles"].get<int>(), ff["sigma_mm"].get<double>(),
+                 ff["rms_mm"].get<double>(), ff["fit"]["control_grid"].dump(), sw.elapsed_ms());
+    CHECK(ff["rms_mm"].get<double>() < 0.04);
+    // The dome stops at the block's edges: about its footprint's share of the scan.
+    const auto top_truth = std::ranges::count(part.triangle_face, std::ranges::find(part.faces, std::string("box0 +z"), &fit::TruthFace::name)->id);
+    CHECK(std::abs(ff["triangles"].get<double>() - static_cast<double>(top_truth)) < 0.05 * static_cast<double>(top_truth));
+
+    run(doc, "detect");
+    const json s = run(doc, "summary");
+    const auto faces = std::ranges::count_if(s["labels"], [](const json& l) { return l["role"] == "face"; });
+    CHECK(faces == 6);  // the dome, four sides, the bottom
+
+    const json built = run(doc, "build");
+    for (const auto& line : built["log"]) std::println("  {}", line.get<std::string>());
+    REQUIRE(built["ok"].get<bool>());
+    CHECK(built["closed"].get<bool>());
+    const double volume = 50 * 30 * 10 + 4.0 * 25 * 15 * 16 / 9;
+    std::println("domed block: volume {:.2f} vs {:.2f} ({:+.3f}%), deviation p95 {:.4f}", built["volume_mm3"].get<double>(), volume,
+                 100 * (built["volume_mm3"].get<double>() / volume - 1), built["deviation"]["overall"]["p95_mm"].get<double>());
+    CHECK(std::abs(built["volume_mm3"].get<double>() - volume) < 0.003 * volume);
+    CHECK(built["deviation"]["overall"]["p95_mm"].get<double>() < 0.1);
+
+    const auto step = std::filesystem::temp_directory_path() / "einstar_domed.step";
+    CHECK(run(doc, "export_step", {{"path", step.string()}})["read_back"]["valid"].get<bool>());
+    const brep::StepSummary summary = brep::read_step(step);
+    CHECK(summary.surface_kinds.contains("other"));  // the B-spline
+    CHECK(std::ranges::count(summary.face_names, std::string("top")) == 1);
+
+    // Saved and read back with its control heights.
+    const auto path = std::filesystem::temp_directory_path() / "einstar_domed.emodel";
+    run(doc, "save", {{"path", path.string()}});
+    model::Document again;
+    run(again, "open", {{"path", path.string()}});
+    CHECK(std::abs(run(again, "build")["volume_mm3"].get<double>() - built["volume_mm3"].get<double>()) < 1e-6);
+}

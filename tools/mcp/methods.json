@@ -1465,6 +1465,44 @@
   },
   {
     "app": "model",
+    "description": "Makes a label a freeform face (a smooth B-spline surface) for a region no plane, cylinder, cone, sphere or torus describes, e.g. a domed or sculpted top. Fitted to the label's region, or to its paint taken out over the connected unlabelled scan up to sharp creases. Freeform faces are held as fitted (no constraints on them).",
+    "kind": "mutating",
+    "name": "model.freeform",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "crease_deg": {
+          "description": "Edges sharper than this stop the extension (default 20).",
+          "type": "number"
+        },
+        "extend": {
+          "description": "Take in the connected unlabelled scan first (default: when the label has no region).",
+          "type": "boolean"
+        },
+        "label": {
+          "description": "A label: its name or id.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "smoothness": {
+          "description": "Bending against fit (default 0.02).",
+          "type": "number"
+        },
+        "spacing_mm": {
+          "description": "Control point spacing (default: about 12 across the region).",
+          "type": "number"
+        }
+      },
+      "required": [
+        "label"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
     "description": "Finds round holes in a plane label (openings in its region): centre, axis, diameter (from the wall if scanned, else from the opening), through or blind.",
     "kind": "mutating",
     "name": "model.find_holes",

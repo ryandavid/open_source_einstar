@@ -45,6 +45,10 @@
 #include <XCAFApp_Application.hxx>
 #include <XCAFDoc_DocumentTool.hxx>
 #include <XCAFDoc_ShapeTool.hxx>
+#include <Geom_BSplineSurface.hxx>
+#include <TColStd_Array1OfInteger.hxx>
+#include <TColStd_Array1OfReal.hxx>
+#include <TColgp_Array2OfPnt.hxx>
 #include <gp_Ax3.hxx>
 #include <gp_Cone.hxx>
 #include <gp_Cylinder.hxx>
@@ -101,6 +105,27 @@ TopoDS_Face extended_face(const fit::Surface& s, const Vec3& center, double reac
                           [&](const fit::Sphere& sp) -> TopoDS_Face { return BRepBuilderAPI_MakeFace(gp_Sphere(frame(sp.center, Vec3::UnitZ()), sp.radius)).Face(); },
                           [&](const fit::Torus& t) -> TopoDS_Face {
                               return BRepBuilderAPI_MakeFace(gp_Torus(frame(t.center, t.axis), t.major, t.minor)).Face();
+                          },
+                          [&](const fit::Freeform& f) -> TopoDS_Face {
+                              // The same spline: uniform knots, poles at the Greville points (fit::Freeform). Its
+                              // extent is the fitted one (the fit already reaches past the data).
+                              TColgp_Array2OfPnt poles(1, f.nu, 1, f.nv);
+                              for (int i = 0; i < f.nu; ++i)
+                                  for (int j = 0; j < f.nv; ++j)
+                                      poles(i + 1, j + 1) = to_pnt(f.frame * Vec3(f.u0 + (i - 1) * f.du, f.v0 + (j - 1) * f.dv,
+                                                                                (*f.heights)[static_cast<std::size_t>(i * f.nv + j)]));
+                              TColStd_Array1OfReal uk(1, f.nu + 4), vk(1, f.nv + 4);
+                              TColStd_Array1OfInteger um(1, f.nu + 4), vm(1, f.nv + 4);
+                              for (int k = 0; k < f.nu + 4; ++k) {
+                                  uk(k + 1) = f.u0 + (k - 3) * f.du;
+                                  um(k + 1) = 1;
+                              }
+                              for (int k = 0; k < f.nv + 4; ++k) {
+                                  vk(k + 1) = f.v0 + (k - 3) * f.dv;
+                                  vm(k + 1) = 1;
+                              }
+                              const Handle(Geom_BSplineSurface) surf = new Geom_BSplineSurface(poles, uk, vk, um, vm, 3, 3);
+                              return BRepBuilderAPI_MakeFace(surf, 1e-7).Face();
                           },
                       },
                       s);

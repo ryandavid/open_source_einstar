@@ -73,7 +73,8 @@ std::optional<int> radius_index(SurfaceKind k) {
         case SurfaceKind::sphere: return 3;
         case SurfaceKind::torus: return 6;
         case SurfaceKind::plane:
-        case SurfaceKind::cone: return std::nullopt;
+        case SurfaceKind::cone:
+        case SurfaceKind::freeform: return std::nullopt;
     }
     return std::nullopt;
 }
@@ -129,23 +130,26 @@ std::string check(const Constraint& c, const SolveInput& in) {
     for (const int d : inv.datums)
         if (!datum_ok(d)) return std::format("no datum {}", d);
     const auto kind = [&](int f) { return kind_of(in.features[static_cast<std::size_t>(f)].surface); };
-    const auto has_direction = [&](int f) { return kind(f) != SurfaceKind::sphere; };
+    const auto has_direction = [&](int f) { return kind(f) != SurfaceKind::sphere && kind(f) != SurfaceKind::freeform; };
     const auto is_plane = [&](int f) { return kind(f) == SurfaceKind::plane; };
     return std::visit(Overloaded{
                           [&](const Aligned& a) -> std::string {
                               if (a.axis < 0 || a.axis > 2) return "axis must be 0, 1 or 2";
-                              return has_direction(a.feature) ? "" : "a sphere has no direction";
+                              return has_direction(a.feature) ? "" : "a sphere or freeform face has no direction";
                           },
-                          [&](const Offset& o) -> std::string { return o.axis < 0 || o.axis > 2 ? "axis must be 0, 1 or 2" : ""; },
+                          [&](const Offset& o) -> std::string {
+                              if (o.axis < 0 || o.axis > 2) return "axis must be 0, 1 or 2";
+                              return kind(o.feature) == SurfaceKind::freeform ? "a freeform face has no position to offset" : "";
+                          },
                           [&](const Parallel& p) -> std::string {
-                              return has_direction(p.a) && has_direction(p.b) ? "" : "a sphere has no direction";
+                              return has_direction(p.a) && has_direction(p.b) ? "" : "a sphere or freeform face has no direction";
                           },
                           [&](const Perpendicular& p) -> std::string {
-                              return has_direction(p.a) && has_direction(p.b) ? "" : "a sphere has no direction";
+                              return has_direction(p.a) && has_direction(p.b) ? "" : "a sphere or freeform face has no direction";
                           },
                           [&](const Angle& p) -> std::string {
                               if (p.degrees < 0 || p.degrees > 90) return "angle must be within 0..90 degrees";
-                              return has_direction(p.a) && has_direction(p.b) ? "" : "a sphere has no direction";
+                              return has_direction(p.a) && has_direction(p.b) ? "" : "a sphere or freeform face has no direction";
                           },
                           [&](const Coplanar& p) -> std::string { return is_plane(p.a) && is_plane(p.b) ? "" : "coplanar needs two planes"; },
                           [&](const Coaxial& p) -> std::string {
@@ -582,6 +586,7 @@ std::optional<Vec3> direction_of(const Surface& s) {
                           [](const Cone& c) -> std::optional<Vec3> { return c.axis; },
                           [](const Torus& t) -> std::optional<Vec3> { return t.axis; },
                           [](const Sphere&) -> std::optional<Vec3> { return std::nullopt; },
+                          [](const Freeform&) -> std::optional<Vec3> { return std::nullopt; },
                       },
                       s);
 }
@@ -593,6 +598,7 @@ Vec3 position_of(const Surface& s) {
                           [](const Cone& c) { return c.apex; },
                           [](const Sphere& sp) { return sp.center; },
                           [](const Torus& t) { return t.center; },
+                          [](const Freeform& f) { return Vec3(f.frame.translation()); },
                       },
                       s);
 }

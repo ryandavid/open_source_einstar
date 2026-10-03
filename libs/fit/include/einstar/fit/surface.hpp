@@ -2,9 +2,11 @@
 
 // Analytic surfaces fitted to scan regions: the faces a CAD model is made of.
 
+#include <memory>
 #include <span>
 #include <string_view>
 #include <variant>
+#include <vector>
 
 #include "einstar/core/se3.hpp"
 
@@ -44,9 +46,26 @@ struct Torus {
     double minor = 1;           // tube radius
 };
 
-using Surface = std::variant<Plane, Cylinder, Cone, Sphere, Torus>;
+// A freeform face: a height field over a plane, a uniform bicubic B-spline. In the frame's coordinates the surface
+// is z = h(x, y) over x in [u0, u0 + (nu - 3) du], y in [v0, v0 + (nv - 3) dv]; h's nu x nv control heights sit
+// over the uniform knots u0 + (i - 3) du (so the spline is exactly OpenCASCADE's non-clamped bicubic B-spline with
+// those knots, its poles at the Greville points). Its normal is the frame's +z side. Not a solver parameter: a
+// freeform face is fitted once to its region and then held.
+struct Freeform {
+    SE3 frame = SE3::Identity();
+    double u0 = 0, v0 = 0, du = 1, dv = 1;
+    int nu = 4, nv = 4;
+    std::shared_ptr<const std::vector<double>> heights;  // nu * nv, index i * nv + j
 
-enum class SurfaceKind { plane, cylinder, cone, sphere, torus };
+    // Height and its gradient at frame coordinates (x, y), clamped to the domain.
+    [[nodiscard]] double height(double x, double y, Vec2* gradient = nullptr) const;
+    [[nodiscard]] double u_max() const { return u0 + (nu - 3) * du; }
+    [[nodiscard]] double v_max() const { return v0 + (nv - 3) * dv; }
+};
+
+using Surface = std::variant<Plane, Cylinder, Cone, Sphere, Torus, Freeform>;
+
+enum class SurfaceKind { plane, cylinder, cone, sphere, torus, freeform };
 
 [[nodiscard]] SurfaceKind kind_of(const Surface& s);
 [[nodiscard]] std::string_view kind_name(SurfaceKind k);
@@ -66,6 +85,7 @@ enum class SurfaceKind { plane, cylinder, cone, sphere, torus };
 //   cone      [axis tilt u, axis tilt v, apex x, apex y, apex z, half angle]
 //   sphere    [centre x, y, z, radius]
 //   torus     [axis tilt u, axis tilt v, centre x, y, z, major radius, minor radius]
+//   freeform  [] (held as fitted)
 // where (u, v) is a basis perpendicular to the current direction (any_perpendicular, and direction x it).
 [[nodiscard]] int parameter_count(SurfaceKind kind);
 [[nodiscard]] Surface perturbed(const Surface& s, std::span<const double> delta);

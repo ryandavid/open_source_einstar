@@ -89,6 +89,7 @@ std::optional<Surface> initial_estimate(SurfaceKind kind, const PointSet& d) {
     const std::size_t n = d.points.size();
     const bool has_normals = d.normals.size() == n;
     switch (kind) {
+        case SurfaceKind::freeform: return std::nullopt;  // fitted on its own (fit_freeform)
         case SurfaceKind::plane: {
             if (n < 3) return std::nullopt;
             const Vec3 c = weighted_centroid(d);
@@ -317,6 +318,7 @@ std::optional<FitResult> fit_best(std::span<const SurfaceKind> kinds, const Poin
                                          },
                                          [&](const Torus& t) { return sagitta_scale / std::max(t.minor, 1e-9) < bend_min; },
                                          [](const Plane&) { return false; },
+                                         [](const Freeform&) { return false; },
                                      },
                                      r->surface);
         if (!flat) candidates.push_back(std::move(*r));

@@ -108,7 +108,7 @@ void ModelApp::open(const std::filesystem::path& path, bool fine) {
 }
 
 bool ModelApp::is_slow(std::string_view command) {
-    for (const char* c : {"detect", "grow", "solve", "build", "find_holes", "export_step"})
+    for (const char* c : {"detect", "grow", "solve", "build", "find_holes", "export_step", "freeform"})
         if (command == c) return true;
     return false;
 }
@@ -452,6 +452,9 @@ void ModelApp::draw_ui(render::ViewCamera& camera) {
             if (ImGui::Button("Find holes")) start("find_holes", {{"label", l->id}});
             ImGui::SameLine();
             if (ImGui::Button("As fillet")) run("fillet.add", {{"label", l->id}});
+            ImGui::SameLine();
+            if (ImGui::Button("Freeform")) start("freeform", {{"label", l->id}});
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("A smooth freeform face over the label's region (or its paint, taken out to sharp edges).");
             ImGui::SameLine();
             if (ImGui::Button("Frame")) frame(camera, l->name);
             ImGui::SameLine();

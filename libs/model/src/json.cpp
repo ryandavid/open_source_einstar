@@ -45,8 +45,19 @@ nlohmann::json surface_to_json(const fit::Surface& s) {
                               return nlohmann::json{{"kind", "torus"}, {"center", vec_to_json(t.center)}, {"axis", dir(t.axis)}, {"major", t.major},
                                                     {"minor", t.minor}};
                           },
+                          [&](const fit::Freeform& f) {
+                              return nlohmann::json{{"kind", "freeform"}, {"frame", frame_to_json(f.frame)}, {"u0", f.u0}, {"v0", f.v0}, {"du", f.du},
+                                                    {"dv", f.dv}, {"nu", f.nu}, {"nv", f.nv}, {"heights", *f.heights}};
+                          },
                       },
                       s);
+}
+
+nlohmann::json surface_summary_json(const fit::Surface& s) {
+    if (const auto* f = std::get_if<fit::Freeform>(&s))
+        return {{"kind", "freeform"}, {"control_grid", {f->nu, f->nv}}, {"spacing_mm", f->du}, {"origin", vec_to_json(f->frame.translation())},
+                {"normal", {f->frame.linear()(0, 2), f->frame.linear()(1, 2), f->frame.linear()(2, 2)}}};
+    return surface_to_json(s);
 }
 
 fit::Surface surface_from_json(const nlohmann::json& j) {
@@ -58,6 +69,21 @@ fit::Surface surface_from_json(const nlohmann::json& j) {
     if (kind == "sphere") return fit::Sphere{vec_from_json(j.at("center")), j.at("radius").get<double>()};
     if (kind == "torus")
         return fit::Torus{vec_from_json(j.at("center")), vec_from_json(j.at("axis")).normalized(), j.at("major").get<double>(), j.at("minor").get<double>()};
+    if (kind == "freeform") {
+        fit::Freeform f;
+        f.frame = frame_from_json(j.at("frame"));
+        f.u0 = j.at("u0");
+        f.v0 = j.at("v0");
+        f.du = j.at("du");
+        f.dv = j.at("dv");
+        f.nu = j.at("nu");
+        f.nv = j.at("nv");
+        auto h = std::make_shared<std::vector<double>>(j.at("heights").get<std::vector<double>>());
+        if (f.nu < 4 || f.nv < 4 || h->size() != static_cast<std::size_t>(f.nu * f.nv))
+            throw nlohmann::json::type_error::create(302, "a freeform surface's heights do not match its grid", &j);
+        f.heights = std::move(h);
+        return f;
+    }
     throw nlohmann::json::type_error::create(302, "unknown surface kind '" + kind + "'", &j);
 }
 
@@ -66,7 +92,8 @@ std::vector<fit::SurfaceKind> kinds_from_json(const nlohmann::json& j) {
     for (const auto& k : j) {
         const auto name = k.get<std::string>();
         bool found = false;
-        for (const auto kind : {fit::SurfaceKind::plane, fit::SurfaceKind::cylinder, fit::SurfaceKind::cone, fit::SurfaceKind::sphere, fit::SurfaceKind::torus})
+        for (const auto kind : {fit::SurfaceKind::plane, fit::SurfaceKind::cylinder, fit::SurfaceKind::cone, fit::SurfaceKind::sphere, fit::SurfaceKind::torus,
+                                fit::SurfaceKind::freeform})
             if (fit::kind_name(kind) == name) {
                 out.push_back(kind);
                 found = true;

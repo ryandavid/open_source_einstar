@@ -164,13 +164,13 @@ struct Document::Impl {
         }
         if (counts) j["triangles"] = (*counts)[static_cast<std::size_t>(l.id)];
         if (painted) j["painted"] = (*painted)[static_cast<std::size_t>(l.id)];
-        if (l.given) j["given"] = surface_to_json(*l.given);
+        if (l.given) j["given"] = surface_summary_json(*l.given);
         if (l.fit) {
-            j["fit"] = surface_to_json(*l.fit);
+            j["fit"] = surface_summary_json(*l.fit);
             j["sigma_mm"] = l.sigma;
             j["rms_mm"] = l.rms;
         }
-        if (const auto it = d.state_.solved.find(l.id); it != d.state_.solved.end()) j["solved"] = surface_to_json(it->second);
+        if (const auto it = d.state_.solved.find(l.id); it != d.state_.solved.end()) j["solved"] = surface_summary_json(it->second);
         return j;
     }
 
@@ -466,7 +466,7 @@ struct Document::Impl {
         std::vector<std::uint8_t> blocked(region.size(), 0);
         for (const auto& l : d.state_.labels) {
             if (!only.empty() && !only.contains(l.id)) continue;
-            if (l.role == Role::ignore || l.given) continue;
+            if (l.role == Role::ignore || l.given || (l.fit && fit::kind_of(*l.fit) == fit::SurfaceKind::freeform)) continue;
             auto painted = triangles_of(l.id, true);
             if (painted.empty()) continue;
             ids.push_back(l.id);
@@ -493,7 +493,7 @@ struct Document::Impl {
                 d.state_.solved.erase(l.id);
             }
             json j = {{"label", l.name}, {"triangles", g.regions[i].triangles.size()}, {"ok", g.regions[i].ok}};
-            if (g.regions[i].ok) j["fit"] = surface_to_json(*l.fit);
+            if (g.regions[i].ok) j["fit"] = surface_summary_json(*l.fit);
             out.push_back(j);
         }
         set_region(std::move(region));
@@ -704,6 +704,61 @@ struct Document::Impl {
             out.push_back(hole_json(h));
         }
         return out;
+    }
+
+    // A freeform face on a label: fitted to its region (or its paint). With `extend` (default when it has no
+    // region yet) the region first takes in the unlabelled scan connected to it up to sharp creases, so "the rest of
+    // this curved top" is one stroke and one command.
+    json freeform(const json& p) {
+        need_scan();
+        Label& l = label_ref(need(p, "label"));
+        auto tris = triangles_of(l.id);
+        const bool extend = opt<bool>(p, "extend").value_or(tris.empty());
+        if (tris.empty()) tris = triangles_of(l.id, true);
+        if (tris.empty()) refuse(std::format("'{}' has no paint or region: paint a few mm of the face first", l.name));
+        auto region = region_copy();
+        auto paint = paint_copy();
+        if (extend) {
+            // Stops at creases, and where the surface turns more than 70 degrees from the seed's own facing (a
+            // freeform face is a height field; the scan rounds sharp edges over a few triangles, each step small).
+            const double crease = std::cos(opt<double>(p, "crease_deg").value_or(20.0) * std::numbers::pi / 180);
+            const auto& topo = d.topology();
+            Vec3f facing = Vec3f::Zero();
+            for (const auto t : tris) facing += topo.area(t) * topo.normal(t);
+            facing.normalize();
+            const float max_tilt = std::cos(70.0f * std::numbers::pi_v<float> / 180);
+            std::vector<std::uint8_t> in(region.size(), 0);
+            for (const auto t : tris) in[t] = 1;
+            std::vector<std::uint32_t> stack(tris.begin(), tris.end());
+            while (!stack.empty()) {
+                const auto t = stack.back();
+                stack.pop_back();
+                for (const auto n : topo.neighbors(t)) {
+                    if (n == fit::kNoTriangle || in[n] || (region[n] != 0 && region[n] != l.id) || (paint[n] != 0 && paint[n] != l.id)) continue;
+                    if (topo.normal(t).dot(topo.normal(n)) < crease || topo.normal(n).dot(facing) < max_tilt) continue;
+                    in[n] = 1;
+                    tris.push_back(n);
+                    stack.push_back(n);
+                }
+            }
+            std::ranges::sort(tris);
+        }
+        const fit::RegionPoints pts = fit::region_points(d.topology(), tris, 30000);
+        fit::FreeformOptions fo;
+        if (const auto sp = opt<double>(p, "spacing_mm")) fo.spacing_mm = *sp;
+        if (const auto sm = opt<double>(p, "smoothness")) fo.smoothness = *sm;
+        std::string why;
+        const auto r = fit::fit_freeform(pts.view(), fo, &why);
+        if (!r) refuse(why);
+        for (const auto t : tris) region[t] = static_cast<std::uint16_t>(l.id);
+        set_region(std::move(region));
+        l.fit = r->surface;
+        l.sigma = r->sigma;
+        l.rms = r->rms;
+        l.role = Role::face;
+        l.kinds = {fit::SurfaceKind::freeform};
+        d.state_.solved.erase(l.id);
+        return {{"label", l.name}, {"triangles", tris.size()}, {"fit", surface_summary_json(r->surface)}, {"sigma_mm", r->sigma}, {"rms_mm", r->rms}};
     }
 
     json find_holes(const json& p) {
@@ -1339,6 +1394,7 @@ const std::map<std::string, CommandInfo, std::less<>>& table() {
         {"grow", {[](I& i, const json& p) { return i.grow(p); }, true}},
         {"detect", {[](I& i, const json& p) { return i.detect(p); }, true}},
         {"find_holes", {[](I& i, const json& p) { return i.find_holes(p); }, true}},
+        {"freeform", {[](I& i, const json& p) { return i.freeform(p); }, true}},
         {"hole.update", {[](I& i, const json& p) { return i.hole_update(p); }, true}},
         {"hole.delete", {[](I& i, const json& p) { return i.hole_delete(p); }, true}},
         {"fillet.add", {[](I& i, const json& p) { return i.fillet_add(p); }, true}},

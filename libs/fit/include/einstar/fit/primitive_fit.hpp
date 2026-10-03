@@ -8,6 +8,7 @@
 
 #include <optional>
 #include <span>
+#include <string>
 #include <vector>
 
 #include "einstar/fit/surface.hpp"
@@ -46,6 +47,19 @@ struct PointSet {
 // inlier rms is clearly (20%) lower. Curved fits that bend the data's extent by less than 3 sigma (a plane
 // fitted as a huge cylinder) and degenerate cones are not considered.
 [[nodiscard]] std::optional<FitResult> fit_best(std::span<const SurfaceKind> kinds, const PointSet& data, const FitOptions& options = {});
+
+struct FreeformOptions {
+    double spacing_mm = 0;      // between control heights (0: about 12 spans across the data, at least 1.5 mm)
+    double margin_mm = 0;       // the surface reaches past the data, to meet its neighbours (0: a fifth of the
+                                // extent, at least 5 mm)
+    double smoothness = 0.02;   // bending energy against the data
+    int iterations = 4;         // robust reweighting rounds
+};
+
+// A freeform face (a height field over the data's best-fit plane, see Freeform) fitted to oriented points: least
+// squares with a bending term, so it stays smooth between and beyond the points; Tukey-reweighted. Fails (with the
+// reason) where the region folds over itself (no single height over its plane).
+[[nodiscard]] std::optional<FitResult> fit_freeform(const PointSet& data, const FreeformOptions& options = {}, std::string* why = nullptr);
 
 // Robust scale: 1.4826 * median(|r|).
 [[nodiscard]] double robust_sigma(std::span<const double> residuals);

@@ -30,7 +30,23 @@ struct BoxEval {
     int face;  // index within the box
 };
 
+BoxEval eval_box_flat(const PartBox& b, const Vec3& p);
+
+// A box with a domed top: the box raised by the dome's height, cut by the dome's height field.
 BoxEval eval_box(const PartBox& b, const Vec3& p) {
+    if (b.dome <= 0) return eval_box_flat(b, p);
+    PartBox high = b;
+    high.max.z() += b.dome;
+    const BoxEval e = eval_box_flat(high, p);
+    const Vec3 c = 0.5 * (b.min + b.max), h = 0.5 * (b.max - b.min);
+    const double u = std::clamp((p.x() - c.x()) / h.x(), -1.0, 1.0), v = std::clamp((p.y() - c.y()) / h.y(), -1.0, 1.0);
+    const double f = b.max.z() + b.dome * (1 - u * u) * (1 - v * v);
+    const Vec2 g(b.dome * -2 * u / h.x() * (1 - v * v), b.dome * (1 - u * u) * -2 * v / h.y());
+    const double d = (p.z() - f) / std::sqrt(1 + g.squaredNorm());
+    return d > e.distance ? BoxEval{d, plane_index(2, 1)} : e;
+}
+
+BoxEval eval_box_flat(const PartBox& b, const Vec3& p) {
     const Vec3 c = 0.5 * (b.min + b.max), h = 0.5 * (b.max - b.min);
     const double r = b.fillet;
     std::array<int, 3> s{};
@@ -336,6 +352,13 @@ PartSpec hole_forms_spec() {
     drilled.point_angle_deg = 118;
     spec.holes = {cb, cs, drilled};
     spec.hole_wall_depth = 4;  // a careful scan: the holes seen to the bottom
+    return spec;
+}
+
+PartSpec domed_block_spec() {
+    PartSpec spec;
+    PartBox block{Vec3(-25, -15, 0), Vec3(25, 15, 10), 0.0, 4.0};
+    spec.boxes.push_back(block);
     return spec;
 }
 
