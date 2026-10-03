@@ -329,11 +329,16 @@ std::vector<MethodSpec> build() {
                {"datum"}));
     add("model.solve", model, mutating,
         "Fits every face together under the constraints. Per constraint: satisfied / redundant / conflict / invalid, and what "
-        "it costs (how far it moved surfaces off the scan); per label: rms, movement from its own best fit, uncertainty.");
+        "it costs (how far it moved surfaces off the scan); per label: rms, movement from its own best fit, uncertainty; "
+        "and 'scale': what the measured lengths say about the scan's scale (a factor, and whether it is significant).");
     add("model.build", model, mutating,
         "Builds the solid from the faces, holes and fillets, then measures the scan's deviation from it (see model.deviation). "
         "Says when the faces do not enclose the part (add the missing face where the scan is open).",
         object({{"tolerance_mm", num("Deviation tolerance (default 0.1).")}, {"deflection_mm", num("Tessellation accuracy (default 0.02).")}}));
+    add("model.scale", model, mutating,
+        "Scales the scan and everything modelled on it (a calibration correction), e.g. by the factor model.solve's "
+        "'scale' check suggests from the user's measurements. Clears the undo history.",
+        object({{"factor", num("0.9-1.1.")}}, {"factor"}));
     add("model.export_step", model, read_only, "Writes the built solid as STEP (AP242, mm, faces named after labels) and reads it back to check.",
         object({{"path", str("The .step file.")}}, {"path"}));
     add("model.view", model, mutating,

@@ -55,7 +55,8 @@ struct Hole {
     int id = 0;
     std::string name;
     int host = 0;                  // the plane label it opens in
-    Vec3 center = Vec3::Zero();    // on the host face
+    Vec3 center = Vec3::Zero();    // on the host face (where the last solve put it)
+    Vec3 measured_center = Vec3::Zero();  // as found in the scan
     Vec3 axis = -Vec3::UnitZ();    // into the material
     double measured_diameter = 0;  // from the scan
     std::optional<double> diameter;  // set by the user (a caliper reading); overrides the measurement
@@ -120,6 +121,7 @@ struct ScanSource {
     std::uintmax_t size = 0;
     std::int64_t mtime = 0;
     json process;                // process settings used (estr)
+    double scale = 1.0;          // applied to the mesh since it was loaded (model.scale)
 };
 
 struct Built {
@@ -148,6 +150,9 @@ public:
 
     // --- the scan ---
     void set_scan(recon::TriangleMesh mesh, ScanSource source);
+    // Scales the scan and everything modelled on it about the origin (a calibration correction). The undo history is
+    // cleared: earlier steps hold unscaled geometry.
+    void scale_scan(double factor);
     [[nodiscard]] bool has_scan() const { return mesh_ != nullptr; }
     [[nodiscard]] const recon::TriangleMesh& mesh() const { return *mesh_; }
     [[nodiscard]] const fit::MeshTopology& topology() const { return *topo_; }

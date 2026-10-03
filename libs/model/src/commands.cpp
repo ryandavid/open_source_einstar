@@ -186,6 +186,7 @@ struct Document::Impl {
                        {"path", d.source_.path.string()},
                        {"triangles", d.mesh().triangles.size()},
                        {"voxel_mm", d.voxel_mm()},
+                       {"scale_applied", d.source_.scale},
                        {"bounds", {{"min", vec_to_json(box.min().cast<double>())}, {"max", vec_to_json(box.max().cast<double>())}}}};
         std::vector<std::uint32_t> counts(65536, 0), painted(65536, 0);
         std::size_t unlabelled = 0;
@@ -660,7 +661,7 @@ struct Document::Impl {
                 h.name = unique_name(std::format("hole {}", d.state_.holes.size() + 1));
             }
             h.host = host_id;
-            h.center = c.center;
+            h.center = h.measured_center = c.center;
             h.axis = c.axis;
             h.measured_diameter = c.diameter;
             h.wall_seen = c.wall_diameter.has_value();
@@ -1129,11 +1130,89 @@ struct Document::Impl {
             if (f.direction_sd_deg > 0) j["direction_sd_deg"] = f.direction_sd_deg;
             report["labels"][label_name(label_of[i])] = j;
         }
+        report["scale"] = scale_check();
         d.state_.solve_report = report;
         json out = report;
         out["constraints"] = json::array();
         for (const auto& c : d.state_.constraints) out["constraints"].push_back(constraint_json(c));
         return out;
+    }
+
+    // What the user's measurements say about the scan's scale: each measured length against what the scan alone
+    // gives (free fits, not the solved surfaces the measurements were forced onto), and the least-squares factor of
+    // all of them. Long lengths weigh most; small diameters carry the mesher's slight bias.
+    json scale_check() const {
+        struct Pair {
+            int constraint;
+            double measured, scanned;
+        };
+        std::vector<Pair> pairs;
+        const auto fitted = [&](int id) -> std::optional<fit::Surface> {
+            if (const Label* l = d.label(id)) return l->fit;
+            for (const auto& h : d.state_.holes)
+                if (h.id == id) {
+                    if (const Label* wall = d.label(h.wall_label); wall && wall->fit) return wall->fit;
+                    return fit::Surface(fit::Cylinder{h.measured_center, h.axis, 0.5 * h.measured_diameter});
+                }
+            return std::nullopt;
+        };
+        for (const auto& c : d.state_.constraints) {
+            const auto& s = c.spec;
+            const std::string type = s["type"];
+            if (!s.contains("value")) continue;
+            const double m = s["value"].get<double>();
+            if (type == "diameter" && s.contains("hole")) {
+                for (const auto& h : d.state_.holes)
+                    if (h.id == s["hole"].get<int>()) pairs.push_back({c.id, m, h.measured_diameter});
+            } else if (type == "diameter" || type == "radius") {
+                const auto f = fitted(s["label"].get<int>());
+                const auto* cyl = f ? std::get_if<fit::Cylinder>(&*f) : nullptr;
+                if (cyl) pairs.push_back({c.id, m, (type == "diameter" ? 2 : 1) * cyl->radius});
+            } else if (type == "distance") {
+                const auto a = fitted(s["a"].get<int>()), b = fitted(s["b"].get<int>());
+                if (a && b && std::holds_alternative<fit::Plane>(*a) && std::holds_alternative<fit::Plane>(*b)) {
+                    const auto& pa = std::get<fit::Plane>(*a);
+                    pairs.push_back({c.id, m, std::abs(pa.normal.dot(fit::position_of(*b)) - pa.offset)});
+                }
+            } else if (type == "axis_distance") {
+                const auto a = fitted(s["a"].get<int>()), b = fitted(s["b"].get<int>());
+                const auto da = a ? fit::direction_of(*a) : std::nullopt;
+                if (a && b && da) {
+                    Vec3 v = fit::position_of(*b) - fit::position_of(*a);
+                    v -= v.dot(*da) * *da;
+                    pairs.push_back({c.id, m, v.norm()});
+                }
+            }
+        }
+        if (pairs.empty()) return nullptr;
+        double ms = 0, ss = 0;
+        for (const auto& p : pairs) {
+            ms += p.measured * p.scanned;
+            ss += p.scanned * p.scanned;
+        }
+        const double k = ms / ss;
+        double res = 0;
+        for (const auto& p : pairs) res += std::pow(p.measured - k * p.scanned, 2);
+        const double sd = pairs.size() > 1 ? std::sqrt(res / static_cast<double>(pairs.size() - 1) / ss) : 0.0;
+        json out = {{"factor", k}, {"percent", 100 * (k - 1)}, {"sd_percent", 100 * sd}, {"measurements", json::array()}};
+        for (const auto& p : pairs)
+            out["measurements"].push_back({{"constraint", p.constraint}, {"measured", p.measured}, {"scanned", p.scanned},
+                                           {"implied_factor", p.measured / p.scanned}});
+        const bool significant = pairs.size() >= 2 && std::abs(k - 1) > std::max(3 * sd, 5e-4);
+        out["significant"] = significant;
+        out["advice"] = significant ? std::format("the measurements say the scan is {:.2f}% {}; model.scale {{\"factor\": {:.5f}}} corrects it "
+                                                  "(and suggests checking the scanner's calibration)",
+                                                  std::abs(100 * (k - 1)), k < 1 ? "large" : "small", k)
+                                    : std::string("the measurements agree with the scan's scale");
+        return out;
+    }
+
+    json scale(const json& p) {
+        need_scan();
+        const double k = get<double>(p, "factor");
+        if (!(k > 0.9 && k < 1.1)) fail("a scale correction is a factor between 0.9 and 1.1");
+        d.scale_scan(k);
+        return {{"scale", d.source_.scale}, {"note", "the scan and everything on it were scaled; the undo history was cleared"}};
     }
 
     json build(const json& p) {
@@ -1273,6 +1352,7 @@ const std::map<std::string, CommandInfo, std::less<>>& table() {
         {"square", {[](I& i, const json& p) { return i.square(p); }, true}},
         {"solve", {[](I& i, const json& p) { return i.solve(p); }, true}},
         {"build", {[](I& i, const json& p) { return i.build(p); }, true}},
+        {"scale", {[](I& i, const json& p) { return i.scale(p); }, false}},
         {"export_step", {[](I& i, const json& p) { return i.export_step(p); }, false}},
     };
     return t;

@@ -266,7 +266,8 @@ Result<void> Document::save(const std::filesystem::path& path) const {
                            {"kind", source_.kind},
                            {"size", source_.size},
                            {"mtime", source_.mtime},
-                           {"process", source_.process}};
+                           {"process", source_.process},
+                           {"scale", source_.scale}};
         put_record(f, tag("SCAN"), scan.dump());
         const auto& m = *mesh_;
         json mesh_header = {{"vertices", m.vertices.size()}, {"triangles", m.triangles.size()}};
@@ -297,7 +298,7 @@ Result<void> Document::save(const std::filesystem::path& path) const {
         for (const auto& h : state_.holes) {
             json j = {{"id", h.id}, {"name", h.name}, {"host", h.host}, {"center", vec_to_json(h.center)}, {"axis", {h.axis.x(), h.axis.y(), h.axis.z()}},
                       {"measured_diameter", h.measured_diameter}, {"wall_seen", h.wall_seen}, {"wall_label", h.wall_label},
-                      {"seen_depth", h.seen_depth}, {"rim", h.rim}};
+                      {"seen_depth", h.seen_depth}, {"rim", h.rim}, {"measured_center", vec_to_json(h.measured_center)}};
             if (h.diameter) j["diameter"] = *h.diameter;
             if (h.depth) j["depth"] = *h.depth;
             const auto put = [&](const char* key, const std::optional<double>& v) {
@@ -352,7 +353,7 @@ Result<void> Document::load(const std::filesystem::path& path) {
     try {
         const json scan = json::parse(records[tag("SCAN")]);
         ScanSource src{scan.value("path", ""), scan.value("kind", ""), scan.value("size", std::uintmax_t{0}), scan.value("mtime", std::int64_t{0}),
-                       scan.value("process", json::object())};
+                       scan.value("process", json::object()), scan.value("scale", 1.0)};
         // The mesh.
         const std::string& mp = records[tag("MESH")];
         const auto nul = mp.find('\0');
@@ -397,6 +398,7 @@ Result<void> Document::load(const std::filesystem::path& path) {
             h.wall_label = j.value("wall_label", 0);
             h.seen_depth = j.value("seen_depth", 0.0);
             h.rim = j.value("rim", std::vector<std::uint32_t>{});
+            h.measured_center = j.contains("measured_center") ? vec_from_json(j["measured_center"]) : h.center;
             if (j.contains("diameter")) h.diameter = j["diameter"].get<double>();
             if (j.contains("depth")) h.depth = j["depth"].get<double>();
             const auto take = [&](const char* key, std::optional<double>& v) {

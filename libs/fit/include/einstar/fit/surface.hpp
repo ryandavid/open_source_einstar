@@ -57,6 +57,8 @@ enum class SurfaceKind { plane, cylinder, cone, sphere, torus };
 [[nodiscard]] Vec3 project(const Surface& s, const Vec3& p);
 // Rigid motion of a surface: x' = T x.
 [[nodiscard]] Surface transformed(const Surface& s, const SE3& T);
+// The surface scaled about the origin: x' = k x.
+[[nodiscard]] Surface scaled(const Surface& s, double k);
 
 // Number of free parameters of a surface kind, and a small change of them (for fitting and solving):
 //   plane     [normal tilt u, normal tilt v, offset]

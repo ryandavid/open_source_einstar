@@ -301,3 +301,31 @@ TEST_CASE("hole forms through the document: detected, built, named in the STEP f
     for (const char* form : {"counterbore", "countersink", "point"})
         CHECK(std::ranges::any_of(summary.face_names, [&](const std::string& n) { return n.find(form) != std::string::npos; }));
 }
+
+TEST_CASE("the measurements reveal a scan 0.4% too large; scaling corrects it") {
+    fit::SyntheticPart part = fit::make_synthetic_part(fit::flanged_box_spec());
+    for (auto& v : part.mesh.vertices) v *= 1.004f;  // a scanner whose calibration is a little off
+    model::Document doc;
+    doc.set_scan(part.mesh, model::ScanSource{{}, "demo", 0, 0, {}});
+    squared_demo(doc);
+    run(doc, "label.update", {{"label", label_along(doc, {-80, 3, 12}, {1, 0, 0})}, {"name", "left"}});
+    json s = run(doc, "summary");
+    // What the user measured on the part.
+    run(doc, "constraint.add", {{"type", "distance"}, {"a", "right"}, {"b", "left"}, {"value", 60.0}});
+    run(doc, "constraint.add", {{"type", "axis_distance"}, {"a", hole_near(s, 42, -19)["name"]}, {"b", hole_near(s, 42, 19)["name"]}, {"value", 38.0}});
+    run(doc, "constraint.add", {{"type", "axis_distance"}, {"a", hole_near(s, 42, -19)["name"]}, {"b", hole_near(s, -42, -19)["name"]}, {"value", 84.0}});
+    run(doc, "constraint.add", {{"type", "diameter"}, {"hole", hole_near(s, 0, 0)["name"]}, {"value", 8.0}});
+    const json solved = run(doc, "solve");
+    const json& scale = solved["scale"];
+    std::println("scale check: {}", scale.dump());
+    REQUIRE(scale.is_object());
+    CHECK(std::abs(scale["factor"].get<double>() - 1 / 1.004) < 5e-4);
+    CHECK(scale["significant"].get<bool>());
+
+    run(doc, "scale", {{"factor", scale["factor"]}});
+    const json again = run(doc, "solve");
+    std::println("after scaling: {}", again["scale"].dump());
+    CHECK(std::abs(again["scale"]["factor"].get<double>() - 1) < 5e-4);
+    CHECK(!again["scale"]["significant"].get<bool>());
+    CHECK(std::abs(run(doc, "summary")["scan"]["scale_applied"].get<double>() - scale["factor"].get<double>()) < 1e-12);
+}

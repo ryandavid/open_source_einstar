@@ -62,6 +62,17 @@ Surface perturbed(const Surface& s, std::span<const double> d) {
                       s);
 }
 
+Surface scaled(const Surface& s, double k) {
+    return std::visit(Overloaded{
+                          [&](const Plane& pl) -> Surface { return Plane{pl.normal, k * pl.offset}; },
+                          [&](const Cylinder& c) -> Surface { return Cylinder{k * c.point, c.axis, k * c.radius}; },
+                          [&](const Cone& c) -> Surface { return Cone{k * c.apex, c.axis, c.half_angle}; },
+                          [&](const Sphere& sp) -> Surface { return Sphere{k * sp.center, k * sp.radius}; },
+                          [&](const Torus& t) -> Surface { return Torus{k * t.center, t.axis, k * t.major, k * t.minor}; },
+                      },
+                      s);
+}
+
 Vec3 any_perpendicular(const Vec3& n) {
     const Vec3 a = std::abs(n.x()) < 0.9 ? Vec3::UnitX() : Vec3::UnitY();
     return n.cross(a).normalized();

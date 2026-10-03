@@ -1900,7 +1900,7 @@
   },
   {
     "app": "model",
-    "description": "Fits every face together under the constraints. Per constraint: satisfied / redundant / conflict / invalid, and what it costs (how far it moved surfaces off the scan); per label: rms, movement from its own best fit, uncertainty.",
+    "description": "Fits every face together under the constraints. Per constraint: satisfied / redundant / conflict / invalid, and what it costs (how far it moved surfaces off the scan); per label: rms, movement from its own best fit, uncertainty; and 'scale': what the measured lengths say about the scan's scale (a factor, and whether it is significant).",
     "kind": "mutating",
     "name": "model.solve",
     "params": {
@@ -1926,6 +1926,25 @@
           "type": "number"
         }
       },
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Scales the scan and everything modelled on it (a calibration correction), e.g. by the factor model.solve's 'scale' check suggests from the user's measurements. Clears the undo history.",
+    "kind": "mutating",
+    "name": "model.scale",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "factor": {
+          "description": "0.9-1.1.",
+          "type": "number"
+        }
+      },
+      "required": [
+        "factor"
+      ],
       "type": "object"
     }
   },

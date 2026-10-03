@@ -58,6 +58,44 @@ void Document::set_scan(recon::TriangleMesh mesh, ScanSource source) {
     ++revision_;
 }
 
+void Document::scale_scan(double k) {
+    if (!mesh_) return;
+    for (auto& v : mesh_->vertices) v *= static_cast<float>(k);
+    topo_ = std::make_unique<fit::MeshTopology>(*mesh_);
+    bvh_ = std::make_unique<fit::TriangleBvh>(*mesh_);
+    voxel_mm_ *= k;
+    source_.scale *= k;
+    const auto sized = [&](std::optional<double>& v) {
+        if (v) *v *= k;
+    };
+    for (auto& l : state_.labels) {
+        if (l.fit) l.fit = fit::scaled(*l.fit, k);
+        if (l.given) l.given = fit::scaled(*l.given, k);
+        l.sigma *= k;
+        l.rms *= k;
+    }
+    for (auto& [id, s] : state_.solved) s = fit::scaled(s, k);
+    for (auto& h : state_.holes) {
+        // Measured from the scan: scaled. Set by the user (a caliper reading): kept.
+        h.center *= k;
+        h.measured_center *= k;
+        h.measured_diameter *= k;
+        h.seen_depth *= k;
+        sized(h.depth);
+        sized(h.counterbore_diameter);
+        sized(h.counterbore_depth);
+        sized(h.countersink_diameter);
+    }
+    for (auto& f : state_.fillets) f.measured_radius *= k;
+    for (auto& x : state_.datums) x.frame.translation() *= k;
+    // Offsets in constraints are measurements: kept.
+    undo_.clear();
+    redo_.clear();
+    change_depth_ = 0;
+    built_.reset();
+    ++revision_;
+}
+
 const Label* Document::label(int id) const {
     const auto it = std::ranges::find(state_.labels, id, &Label::id);
     return it == state_.labels.end() ? nullptr : &*it;
