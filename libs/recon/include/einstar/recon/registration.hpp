@@ -3,6 +3,7 @@
 // Oriented point clouds and pairwise point-to-plane registration (fragment odometry and loop
 // closures for the pose graph).
 
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -33,6 +34,10 @@ public:
     [[nodiscard]] const Cloud& cloud() const { return *cloud_; }
     // Nearest point index within max_mm, or -1.
     [[nodiscard]] int nearest(const Vec3f& p, float max_mm) const;
+    // The k nearest point indices, nearest first (fewer if the cloud is smaller).
+    [[nodiscard]] std::vector<std::uint32_t> knn(const Vec3f& p, std::size_t k) const;
+    // Point indices within radius_mm, nearest first.
+    [[nodiscard]] std::vector<std::uint32_t> radius(const Vec3f& p, float radius_mm) const;
 
 private:
     struct Impl;

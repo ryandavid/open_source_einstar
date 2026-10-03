@@ -69,6 +69,9 @@ add_executable(debug_depth_errors pipeline/debug_depth_errors.cpp)
 einstar_target_defaults(debug_depth_errors)
 target_link_libraries(debug_depth_errors PRIVATE einstar::pipeline einstar::synth)
 
+einstar_add_test(test_fit fit/test_topology.cpp)
+target_link_libraries(test_fit PRIVATE einstar::fit)
+
 if(EINSTAR_BUILD_APP)
   einstar_add_test(test_agent agent/test_agent.cpp)
   target_link_libraries(test_agent PRIVATE einstar::agent)

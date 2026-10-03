@@ -48,6 +48,25 @@ int CloudIndex::nearest(const Vec3f& p, float max_mm) const {
     return rs.size() > 0 && d2 <= max_mm * max_mm ? static_cast<int>(idx) : -1;
 }
 
+std::vector<std::uint32_t> CloudIndex::knn(const Vec3f& p, std::size_t k) const {
+    k = std::min(k, cloud_->points.size());
+    std::vector<std::uint32_t> idx(k);
+    std::vector<float> d2(k);
+    if (k == 0) return idx;
+    idx.resize(impl_->tree.knnSearch(p.data(), k, idx.data(), d2.data()));
+    return idx;
+}
+
+std::vector<std::uint32_t> CloudIndex::radius(const Vec3f& p, float radius_mm) const {
+    std::vector<nanoflann::ResultItem<std::uint32_t, float>> found;
+    nanoflann::SearchParameters params;
+    params.sorted = true;
+    impl_->tree.radiusSearch(p.data(), radius_mm * radius_mm, found, params);
+    std::vector<std::uint32_t> idx(found.size());
+    for (std::size_t i = 0; i < found.size(); ++i) idx[i] = found[i].first;
+    return idx;
+}
+
 Cloud voxel_downsample(const Cloud& in, float voxel_mm) {
     struct Acc {
         Vec3f p = Vec3f::Zero(), n = Vec3f::Zero();
