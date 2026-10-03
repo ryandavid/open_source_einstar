@@ -78,6 +78,10 @@ public:
     void draw_ui(render::ViewCamera& camera);
 
     [[nodiscard]] const std::string& status() const { return status_; }
+    void set_status(std::string text, bool error = false) {
+        status_ = std::move(text);
+        status_error_ = error;
+    }
     [[nodiscard]] bool status_is_error() const { return status_error_; }
 
 private:

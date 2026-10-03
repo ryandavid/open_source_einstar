@@ -18,6 +18,8 @@
 #include <Metal/Metal.hpp>
 
 #include <chrono>
+#include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -33,15 +35,30 @@
 #include "imgui_impl_metal.h"
 
 #include "agent_methods.hpp"
+#include "dialogs.hpp"
 #include "einstar/agent/server.hpp"
 #include "einstar/gpu/context.hpp"
 #include "einstar/model/settings.hpp"
 #include "einstar/render/scene_renderer.hpp"
 #include "model_app.hpp"
+#include "photo_ui.hpp"
 
 using namespace einstar;
 
 namespace {
+
+// Files dropped on the window, taken by the main loop.
+std::vector<std::filesystem::path> g_dropped;
+void on_drop(GLFWwindow*, int count, const char** paths) {
+    for (int i = 0; i < count; ++i) g_dropped.emplace_back(paths[i]);
+}
+
+bool is_photo(const std::filesystem::path& p) {
+    std::string ext = p.extension().string();
+    if (!ext.empty()) ext.erase(0, 1);
+    for (auto& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return std::ranges::find(modelapp::photo_extensions(), ext) != modelapp::photo_extensions().end();
+}
 
 // The world ray under a window point.
 std::pair<Vec3f, Vec3f> ray_at(const render::ViewCamera& camera, float x, float y, float w, float h) {
@@ -139,6 +156,8 @@ int main(int argc, char** argv) {
     rs.show_scanner = false;
 
     modelapp::ModelApp app;
+    modelapp::PhotoUi photos((__bridge void*)device);
+    glfwSetDropCallback(window, on_drop);
     render::ViewCamera camera;
     std::unique_ptr<agent::Server> agent;
     if (mcp_socket) {
@@ -252,7 +271,17 @@ int main(int argc, char** argv) {
                 app.begin_stroke(io.KeyAlt && !io.KeyShift);
                 app.dab(ray_origin, ray_dir);
             }
+            // Dropped files: photos join the library, a scan or model is opened.
+            if (!g_dropped.empty() && !app.busy()) {
+                std::vector<std::filesystem::path> images;
+                for (const auto& f : g_dropped)
+                    if (is_photo(f)) images.push_back(f);
+                    else app.open(f);
+                photos.import_files(app, images);
+                g_dropped.clear();
+            }
             if (!io.WantTextInput && !app.busy()) {
+                if (io.KeySuper && ImGui::IsKeyPressed(ImGuiKey_V, false)) photos.paste(app);
                 if (io.KeySuper && ImGui::IsKeyPressed(ImGuiKey_Z, false)) app.run(io.KeyShift ? "redo" : "undo", {});
                 if (ImGui::IsKeyPressed(ImGuiKey_F, false) && !io.KeySuper) app.frame(camera);
             }
@@ -297,6 +326,7 @@ int main(int argc, char** argv) {
             if (agent) agent->pump();
             ImGui::NewFrame();
             app.draw_ui(camera);
+            photos.draw(app);
 
             // The brush outline and the label under the cursor.
             if (over_view && app.doc.has_scan() && !app.busy()) {

@@ -1170,12 +1170,13 @@ struct Document::Impl {
     }
 
     // Adds a photo from a file's bytes (kept as they are).
-    Photo& add_photo(std::string bytes, const std::string& name) {
+    Photo& add_photo(std::string bytes, const std::string& name, const std::string& caption) {
         const auto info = image::probe(bytes);
         if (!info) refuse(std::format("{}: {}", name, info.error().message));
         Photo ph;
         ph.id = new_id();
         ph.name = unique_photo_name(name.empty() ? "photo" : name);
+        ph.caption = caption;
         ph.width = info->width;
         ph.height = info->height;
         const auto& e = info->exif;
@@ -1198,23 +1199,20 @@ struct Document::Impl {
         if (p.contains("path")) paths.emplace_back(get<std::string>(p, "path"));
         if (p.contains("paths"))
             for (const auto& x : need(p, "paths")) paths.emplace_back(x.get<std::string>());
+        const std::string caption = opt<std::string>(p, "caption").value_or("");
         json out = json::array();
         for (const auto& path : paths) {
             std::ifstream f(path, std::ios::binary);
             if (!f) refuse("cannot read " + path.string());
             std::string bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-            out.push_back(photo_json(add_photo(std::move(bytes), opt<std::string>(p, "name").value_or(path.stem().string())), false));
+            out.push_back(photo_json(add_photo(std::move(bytes), opt<std::string>(p, "name").value_or(path.stem().string()), caption), false));
         }
         if (const auto data = opt<std::string>(p, "data_base64")) {
             auto bytes = base64_decode(*data);
             if (!bytes) fail("data_base64 is not base64");
-            out.push_back(photo_json(add_photo(std::move(*bytes), opt<std::string>(p, "name").value_or("photo")), false));
+            out.push_back(photo_json(add_photo(std::move(*bytes), opt<std::string>(p, "name").value_or("photo"), caption), false));
         }
         if (out.empty()) fail("give 'path', 'paths' or 'data_base64'");
-        if (const auto caption = opt<std::string>(p, "caption"))
-            for (auto& ph : d.state_.photos)
-                for (const auto& j : out)
-                    if (ph.id == j["id"].get<int>()) ph.caption = *caption;
         return {{"photos", out}};
     }
 

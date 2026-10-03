@@ -31,10 +31,11 @@ add_executable(einstar-model MACOSX_BUNDLE
   einstar-model/main.mm
   einstar-model/model_app.cpp
   einstar-model/dialogs.mm
+  einstar-model/photo_ui.mm
   einstar-model/agent_methods.cpp)
 set_target_properties(einstar-model PROPERTIES OUTPUT_NAME EinstarModel)
 target_include_directories(einstar-model PRIVATE einstar-model common)
-target_link_libraries(einstar-model PRIVATE einstar::agent einstar::render einstar::model imgui glfw
+target_link_libraries(einstar-model PRIVATE einstar::agent einstar::render einstar::model einstar::image imgui glfw
   "-framework Cocoa" "-framework Metal" "-framework QuartzCore" "-framework ImageIO" "-framework CoreGraphics"
   "-framework UniformTypeIdentifiers")
 target_compile_options(einstar-model PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
