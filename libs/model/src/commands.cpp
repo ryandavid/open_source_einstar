@@ -73,9 +73,19 @@ struct Document::Impl {
             if ((ref.is_number_integer() && x.id == ref.get<int>()) || (ref.is_string() && x.name == ref.get<std::string>())) return x;
         fail(std::format("no fillet {}", ref.dump()));
     }
+    // A label's or a hole's name (constraints may refer to either).
     std::string label_name(int id) const {
-        const Label* l = d.label(id);
-        return l ? l->name : std::format("#{}", id);
+        if (const Label* l = d.label(id)) return l->name;
+        for (const auto& h : d.state_.holes)
+            if (h.id == id) return h.name;
+        return std::format("#{}", id);
+    }
+    // A label or, where axes are meant, a hole: its id.
+    int entity_ref(const json& ref) {
+        if (d.find_label(ref)) return d.find_label(ref)->id;
+        for (const auto& h : d.state_.holes)
+            if ((ref.is_number_integer() && h.id == ref.get<int>()) || (ref.is_string() && h.name == ref.get<std::string>())) return h.id;
+        fail(std::format("no label or hole {}", ref.dump()));
     }
     std::string datum_name(int id) const {
         for (const auto& x : d.state_.datums)
@@ -376,7 +386,14 @@ struct Document::Impl {
         set_paint(std::move(paint));
         set_region(std::move(region));
         std::erase_if(d.state_.labels, [&](const Label& l) { return l.id == id; });
+        std::vector<int> holes_gone;
+        for (const auto& h : d.state_.holes)
+            if (h.host == id) holes_gone.push_back(h.id);
         std::erase_if(d.state_.holes, [&](const Hole& h) { return h.host == id; });
+        for (const int h : holes_gone)
+            std::erase_if(d.state_.constraints, [&](const ConstraintDef& c) {
+                return refers_to_label(c.spec, h) || (c.spec.contains("hole") && c.spec["hole"] == h);
+            });
         for (auto& h : d.state_.holes)
             if (h.wall_label == id) h.wall_label = 0;
         std::erase_if(d.state_.fillets, [&](const Fillet& f) { return f.face_a == id || f.face_b == id; });
@@ -629,6 +646,7 @@ struct Document::Impl {
             h.axis = c.axis;
             h.measured_diameter = c.diameter;
             h.wall_seen = c.wall_diameter.has_value();
+            h.rim = c.opening;
             h.seen_depth = c.wall_depth;
             if (c.floor_depth) h.depth = *c.floor_depth;
             // The label most of its wall belongs to.
@@ -683,7 +701,10 @@ struct Document::Impl {
     json hole_delete(const json& p) {
         const int id = hole_ref(need(p, "hole")).id;
         std::erase_if(d.state_.holes, [&](const Hole& h) { return h.id == id; });
-        return {{"deleted", id}};
+        const auto removed = std::erase_if(d.state_.constraints, [&](const ConstraintDef& c) {
+            return refers_to_label(c.spec, id) || (c.spec.contains("hole") && c.spec["hole"] == id);
+        });
+        return {{"deleted", id}, {"constraints_removed", removed}};
     }
 
     json fillet_add(const json& p) {
@@ -811,21 +832,29 @@ struct Document::Impl {
         const auto type = get<std::string>(p, "type");
         json spec = {{"type", type}};
         const auto lbl = [&](const char* key) { spec[key] = label_ref(need(p, key)).id; };
+        const auto any = [&](const char* key) { spec[key] = entity_ref(need(p, key)); };  // a label or a hole
         const auto value = [&](bool positive) {
             const auto v = get<double>(p, "value");
             if (positive && !(v > 0)) fail("the value must be positive");
             spec["value"] = v;
         };
         if (type == "aligned") {
-            lbl("label");
+            any("label");
             spec["datum"] = datum_ref(need(p, "datum")).id;
             spec["axis"] = axis_index(need(p, "axis"));
-        } else if (type == "parallel" || type == "perpendicular" || type == "coplanar" || type == "coaxial") {
+        } else if (type == "coplanar") {
             lbl("a");
             lbl("b");
+        } else if (type == "parallel" || type == "perpendicular" || type == "coaxial") {
+            any("a");
+            any("b");
+        } else if (type == "axis_distance") {
+            any("a");
+            any("b");
+            value(true);
         } else if (type == "angle") {
-            lbl("a");
-            lbl("b");
+            any("a");
+            any("b");
             spec["degrees"] = get<double>(p, "degrees");
         } else if (type == "radius") {
             lbl("label");
@@ -839,7 +868,7 @@ struct Document::Impl {
             lbl("b");
             value(true);
         } else if (type == "offset") {
-            lbl("label");
+            any("label");
             spec["datum"] = datum_ref(need(p, "datum")).id;
             spec["axis"] = axis_index(need(p, "axis"));
             value(false);
@@ -938,12 +967,40 @@ struct Document::Impl {
             label_of.push_back(l.id);
             in.features.push_back({*l.fit, pts.points, pts.weights, false});
         }
+        // Holes take part through their axis: the wall's label when it was labelled, otherwise a cylinder fitted
+        // to the opening (its position, not its size: the opening is wider than the hole). Each stays parallel to
+        // its host face's normal.
+        std::map<int, int> rim_feature;  // hole id -> feature fitted to its opening
+        std::vector<std::pair<int, int>> hole_host;  // feature pairs held parallel
+        for (const auto& h : d.state_.holes) {
+            int f = -1;
+            if (h.wall_label && feature_of.contains(h.wall_label)) {
+                f = feature_of[h.wall_label];
+            } else if (h.rim.size() >= 6) {
+                std::vector<Vec3> pts;
+                double r = 0;
+                for (const auto v : h.rim) {
+                    pts.push_back(d.mesh().vertices[v].cast<double>());
+                    const Vec3 q = pts.back() - h.center;
+                    r += (q - q.dot(h.axis) * h.axis).norm();
+                }
+                r /= static_cast<double>(pts.size());
+                f = static_cast<int>(in.features.size());
+                rim_feature[h.id] = f;
+                in.features.push_back({fit::Cylinder{h.center, h.axis, r}, std::move(pts), {}, false});
+            }
+            if (f < 0) continue;
+            feature_of[h.id] = f;
+            if (feature_of.contains(h.host)) hole_host.emplace_back(f, feature_of[h.host]);
+        }
         std::map<int, int> datum_index;
         for (const auto& x : d.state_.datums) {
             datum_index[x.id] = static_cast<int>(in.datums.size());
             in.datums.push_back({x.frame, false});
         }
-        std::vector<int> constraint_of;  // input index -> constraint id
+        for (const auto& [hole, host] : hole_host) in.constraints.push_back(fit::Parallel{hole, host});
+        const std::size_t implicit = in.constraints.size();
+        std::vector<int> constraint_of;  // input index (after the implicit ones) -> constraint id
         json skipped = json::array();
         for (const auto& c : d.state_.constraints) {
             const auto& s = c.spec;
@@ -965,6 +1022,7 @@ struct Document::Impl {
             else if (type == "diameter") fc = fit::Diameter{f("label"), s["value"].get<double>()};
             else if (type == "distance") fc = fit::Distance{f("a"), f("b"), s["value"].get<double>()};
             else if (type == "offset") fc = fit::Offset{f("label"), dt(), s["axis"].get<int>(), s["value"].get<double>()};
+            else if (type == "axis_distance") fc = fit::AxisDistance{f("a"), f("b"), s["value"].get<double>()};
             if (!fc) continue;
             constraint_of.push_back(c.id);
             in.constraints.push_back(*fc);
@@ -981,17 +1039,27 @@ struct Document::Impl {
                 if (const auto* c = std::get_if<fit::Cylinder>(&d.state_.solved[fl.label])) fl.measured_radius = c->radius;
             }
         for (auto& h : d.state_.holes) {
+            std::optional<fit::Cylinder> axis;
             if (h.wall_label && d.state_.solved.contains(h.wall_label))
-                if (const auto* c = std::get_if<fit::Cylinder>(&d.state_.solved[h.wall_label])) h.measured_diameter = 2 * c->radius;
+                if (const auto* c = std::get_if<fit::Cylinder>(&d.state_.solved[h.wall_label])) {
+                    h.measured_diameter = 2 * c->radius;
+                    axis = *c;
+                }
+            if (rim_feature.contains(h.id))
+                if (const auto* c = std::get_if<fit::Cylinder>(&r.surfaces[static_cast<std::size_t>(rim_feature[h.id])])) axis = *c;
             if (d.state_.solved.contains(h.host))
                 if (const auto* pl = std::get_if<fit::Plane>(&d.state_.solved[h.host])) {
-                    h.center = fit::project(*pl, h.center);
+                    // The centre is where the solved axis meets the solved face.
+                    if (axis && std::abs(axis->axis.dot(pl->normal)) > 1e-6)
+                        h.center = axis->point + (pl->offset - pl->normal.dot(axis->point)) / pl->normal.dot(axis->axis) * axis->axis;
+                    else
+                        h.center = fit::project(*pl, h.center);
                     h.axis = h.axis.dot(pl->normal) < 0 ? Vec3(-pl->normal) : Vec3(pl->normal);
                 }
         }
         json report = {{"converged", r.converged}, {"iterations", r.iterations}, {"constraints", json::object()}, {"labels", json::object()}};
         for (std::size_t i = 0; i < constraint_of.size(); ++i) {
-            const auto& c = r.constraints[i];
+            const auto& c = r.constraints[implicit + i];
             report["constraints"][std::to_string(constraint_of[i])] = {{"status", fit::status_name(c.status)},
                                                                        {"message", c.message},
                                                                        {"violation", c.violation},

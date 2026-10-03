@@ -305,9 +305,12 @@ std::vector<MethodSpec> build() {
         "Adds a constraint (held exactly by model.solve): aligned {label, datum, axis}: a face's normal or an axis along a "
         "datum axis; parallel / perpendicular / coplanar / coaxial {a, b}; angle {a, b, degrees}; radius {label, value}; "
         "diameter {label or hole, value} (a measured hole size); distance {a, b, value}: between parallel planes; offset "
-        "{label, datum, axis, value}: a face or axis at a position along a datum axis. Prefer one datum with aligned faces "
-        "over many pairwise perpendicular constraints.",
-        object({{"type", one_of({"aligned", "parallel", "perpendicular", "angle", "coplanar", "coaxial", "radius", "diameter", "distance", "offset"},
+        "{label, datum, axis, value}: a face or axis at a position along a datum axis; axis_distance {a, b, value}: two "
+        "parallel axes this far apart (a hole pitch, or a hole from a boss or bolt-circle centre). Where an axis is meant "
+        "(aligned, parallel, perpendicular, angle, coaxial, offset, axis_distance) a hole may be named in place of a label. "
+        "Prefer one datum with aligned faces over many pairwise perpendicular constraints.",
+        object({{"type", one_of({"aligned", "parallel", "perpendicular", "angle", "coplanar", "coaxial", "radius", "diameter", "distance", "offset",
+                                 "axis_distance"},
                                 "The constraint.")},
                 {"label", kLabel}, {"a", kLabel}, {"b", kLabel}, {"hole", ref("A hole (diameter).")}, {"datum", ref("A datum.")},
                 {"axis", kAxis}, {"value", num("mm.")}, {"degrees", num("0-90.")}},

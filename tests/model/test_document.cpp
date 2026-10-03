@@ -8,6 +8,7 @@
 
 #include "einstar/agent/protocol.hpp"
 #include "einstar/core/timing.hpp"
+#include "einstar/fit/synthetic_part.hpp"
 #include "einstar/model/document.hpp"
 
 using namespace einstar;
@@ -172,4 +173,94 @@ TEST_CASE("bad commands fail without changing the document") {
     CHECK_FALSE(doc.apply("frobnicate", {}).ok);
     CHECK(doc.revision() == revision);
     CHECK(doc.history()["undo"].empty());
+}
+
+namespace {
+
+// The hole whose centre is nearest (x, y).
+json hole_near(const json& summary, double x, double y) {
+    json best;
+    double d = 1e9;
+    for (const auto& h : summary["holes"]) {
+        const double e = std::hypot(h["center"][0].get<double>() - x, h["center"][1].get<double>() - y);
+        if (e < d) {
+            d = e;
+            best = h;
+        }
+    }
+    return best;
+}
+
+// (Positions come back rounded to 0.1 um, so distances between them hold to about 2e-4 mm.)
+double centre_distance(const json& a, const json& b) {
+    return std::hypot(a["center"][0].get<double>() - b["center"][0].get<double>(), a["center"][1].get<double>() - b["center"][1].get<double>(),
+                      a["center"][2].get<double>() - b["center"][2].get<double>());
+}
+
+// The demo part squared to a datum, for constraint tests.
+void squared_demo(model::Document& doc) {
+    run(doc, "detect");
+    run(doc, "label.update", {{"label", label_below(doc, 10, 8)}, {"name", "top"}});
+    run(doc, "label.update", {{"label", label_along(doc, {80, 3, 12}, {-1, 0, 0})}, {"name", "right"}});
+    run(doc, "datum.create", {{"name", "part"}, {"z", "top"}, {"x", "right"}});
+    run(doc, "square", {{"datum", "part"}});
+}
+
+}  // namespace
+
+TEST_CASE("hole positions: pitches between holes hold exactly, a wrong one shows its cost") {
+    model::Document doc;
+    run(doc, "open_demo");
+    squared_demo(doc);
+    json s = run(doc, "summary");
+    const std::string a = hole_near(s, 42, -19)["name"], b = hole_near(s, 42, 19)["name"], c = hole_near(s, -42, -19)["name"];
+    run(doc, "constraint.add", {{"type", "axis_distance"}, {"a", a}, {"b", b}, {"value", 38.0}});
+    run(doc, "constraint.add", {{"type", "axis_distance"}, {"a", a}, {"b", c}, {"value", 84.0}});
+    const json solved = run(doc, "solve");
+    REQUIRE(solved["converged"].get<bool>());
+    s = run(doc, "summary");
+    for (const auto& con : s["constraints"])
+        if (con["constraint"]["type"] == "axis_distance") {
+            INFO(con.dump());
+            CHECK(con["last_solve"]["status"] == "satisfied");
+            CHECK(con["last_solve"]["moves_scan_fit_mm"].get<double>() < 0.05);  // the true pitches
+        }
+    const auto ha = hole_near(s, 42, -19), hb = hole_near(s, 42, 19), hc = hole_near(s, -42, -19);
+    CHECK(std::abs(centre_distance(ha, hb) - 38.0) < 2e-4);
+    CHECK(std::abs(centre_distance(ha, hc) - 84.0) < 2e-4);
+    std::println("hole centres: ({:.4f}, {:.4f}) ({:.4f}, {:.4f})", ha["center"][0].get<double>(), ha["center"][1].get<double>(),
+                 hb["center"][0].get<double>(), hb["center"][1].get<double>());
+
+    // A pitch 0.4 mm off: still held, and it says what it costs (the far hole, held by the other pitches, moves the
+    // most).
+    run(doc, "constraint.add", {{"type", "axis_distance"}, {"a", c}, {"b", hole_near(s, -42, 19)["name"]}, {"value", 38.4}});
+    run(doc, "solve");
+    s = run(doc, "summary");
+    const json& wrong = s["constraints"].back();
+    INFO(wrong.dump());
+    CHECK(wrong["last_solve"]["status"] == "satisfied");
+    CHECK(wrong["last_solve"]["moves_scan_fit_mm"].get<double>() > 0.15);
+    CHECK(wrong["last_solve"]["moves_scan_fit_mm"].get<double>() < 0.45);
+    CHECK(std::abs(centre_distance(hole_near(s, -42, -19), hole_near(s, -42, 19)) - 38.4) < 2e-4);
+}
+
+TEST_CASE("holes seen only at their rim take part in the solve by their opening") {
+    fit::PartSpec spec = fit::flanged_box_spec();
+    spec.hole_wall_depth = 0.02;  // only the rims were scanned
+    const fit::SyntheticPart part = fit::make_synthetic_part(spec);
+    model::Document doc;
+    doc.set_scan(part.mesh, model::ScanSource{{}, "demo", 0, 0, {}});
+    squared_demo(doc);
+    json s = run(doc, "summary");
+    REQUIRE(s["holes"].size() >= 4);
+    const std::string a = hole_near(s, 42, -19)["name"], b = hole_near(s, 42, 19)["name"];
+    CHECK(hole_near(s, 42, -19)["measured_from"] == "opening");
+    run(doc, "constraint.add", {{"type", "axis_distance"}, {"a", a}, {"b", b}, {"value", 38.0}});
+    const json solved = run(doc, "solve");
+    CHECK(solved["converged"].get<bool>());
+    s = run(doc, "summary");
+    CHECK(s["constraints"].back()["last_solve"]["status"] == "satisfied");
+    const auto ha = hole_near(s, 42, -19), hb = hole_near(s, 42, 19);
+    CHECK(std::abs(centre_distance(ha, hb) - 38.0) < 2e-4);
+    CHECK(std::hypot(ha["center"][0].get<double>() - 42, ha["center"][1].get<double>() + 19) < 0.08);
 }

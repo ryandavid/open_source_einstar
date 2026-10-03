@@ -100,6 +100,7 @@ int rows_of(const Constraint& c) {
                           [](const Diameter&) { return 1; },
                           [](const Distance&) { return 3; },
                           [](const Offset&) { return 1; },
+                          [](const AxisDistance&) { return 3; },
                       },
                       c);
 }
@@ -158,6 +159,11 @@ std::string check(const Constraint& c, const SolveInput& in) {
                               return radius_index(kind(d.feature)) ? "" : "only cylinders, spheres and tori have a diameter";
                           },
                           [&](const Distance& d) -> std::string { return is_plane(d.a) && is_plane(d.b) ? "" : "distance needs two planes"; },
+                          [&](const AxisDistance& d) -> std::string {
+                              if (!(d.value > 0)) return "the distance must be positive";
+                              return has_direction(d.a) && has_direction(d.b) && !is_plane(d.a) && !is_plane(d.b) ? ""
+                                                                                                                  : "axis distance needs two axes";
+                          },
                       },
                       c);
 }
@@ -184,6 +190,7 @@ Frozen freeze(const Constraint& c, const State& s) {
                    [&](const Parallel& p) { basis(direction(s, p.b)); },
                    [&](const Coplanar& p) { basis(direction(s, p.b)); },
                    [&](const Coaxial& p) { basis(direction(s, p.a)); },
+                   [&](const AxisDistance& p) { basis(direction(s, p.a)); },
                    [&](const Distance& d) {
                        basis(direction(s, d.b));
                        const auto& pa = std::get<Plane>(s.surfaces[static_cast<std::size_t>(d.a)]);
@@ -228,6 +235,13 @@ void evaluate(const Constraint& c, const State& s, const Frozen& fz, double* out
                        parallel_rows(direction(s, d.a), direction(s, d.b));
                        const auto& pa = std::get<Plane>(s.surfaces[static_cast<std::size_t>(d.a)]);
                        out[2] = pa.normal.dot(position(s, d.b)) - pa.offset - fz.sign * d.value;
+                   },
+                   [&](const AxisDistance& p) {
+                       const Vec3 ua = direction(s, p.a);
+                       parallel_rows(direction(s, p.b), ua);
+                       Vec3 d = position(s, p.b) - position(s, p.a);
+                       d -= d.dot(ua) * ua;
+                       out[2] = d.norm() - p.value;
                    },
                    [&](const Offset& o) {
                        const SE3& T = s.datums[static_cast<std::size_t>(o.datum)];
@@ -544,6 +558,7 @@ std::vector<std::string> direction_conflicts(const SolveInput& in, const std::ve
                        [&](const Coplanar& p) { join(ci, f(p.a), f(p.b)); },
                        [&](const Coaxial& p) { join(ci, f(p.a), f(p.b)); },
                        [&](const Distance& d) { join(ci, f(d.a), f(d.b)); },
+                       [&](const AxisDistance& d) { join(ci, f(d.a), f(d.b)); },
                        [&](const Perpendicular& p) { separate(ci, f(p.a), f(p.b)); },
                        [&](const Angle& a) {
                            if (a.degrees < 1e-9) join(ci, f(a.a), f(a.b));
@@ -619,6 +634,7 @@ std::string describe(const Constraint& c) {
                           [](const Radius& r) { return std::format("feature {} radius {:.4f}", r.feature, r.value); },
                           [](const Diameter& d) { return std::format("feature {} diameter {:.4f}", d.feature, d.value); },
                           [](const Distance& d) { return std::format("features {} and {} {:.4f} apart", d.a, d.b, d.value); },
+                          [](const AxisDistance& d) { return std::format("axes of features {} and {} {:.4f} apart", d.a, d.b, d.value); },
                           [](const Offset& o) {
                               return std::format("feature {} at {} {:.4f} from datum {}", o.feature, kAxis[static_cast<std::size_t>(std::clamp(o.axis, 0, 2))], o.value, o.datum);
                           },

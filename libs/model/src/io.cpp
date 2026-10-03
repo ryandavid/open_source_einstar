@@ -297,7 +297,7 @@ Result<void> Document::save(const std::filesystem::path& path) const {
         for (const auto& h : state_.holes) {
             json j = {{"id", h.id}, {"name", h.name}, {"host", h.host}, {"center", vec_to_json(h.center)}, {"axis", {h.axis.x(), h.axis.y(), h.axis.z()}},
                       {"measured_diameter", h.measured_diameter}, {"wall_seen", h.wall_seen}, {"wall_label", h.wall_label},
-                      {"seen_depth", h.seen_depth}};
+                      {"seen_depth", h.seen_depth}, {"rim", h.rim}};
             if (h.diameter) j["diameter"] = *h.diameter;
             if (h.depth) j["depth"] = *h.depth;
             doc["holes"].push_back(j);
@@ -388,6 +388,7 @@ Result<void> Document::load(const std::filesystem::path& path) {
             h.wall_seen = j.value("wall_seen", false);
             h.wall_label = j.value("wall_label", 0);
             h.seen_depth = j.value("seen_depth", 0.0);
+            h.rim = j.value("rim", std::vector<std::uint32_t>{});
             if (j.contains("diameter")) h.diameter = j["diameter"].get<double>();
             if (j.contains("depth")) h.depth = j["depth"].get<double>();
             s.holes.push_back(h);

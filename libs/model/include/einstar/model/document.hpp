@@ -64,6 +64,7 @@ struct Hole {
     double seen_depth = 0;         // how deep the scan saw its wall (a through hole's far end, or a blind hole's
                                    // floor, may not have been seen: the depth is then the user's to give)
     int wall_label = 0;            // a label on its wall, if any
+    std::vector<std::uint32_t> rim;  // the opening's boundary (scan vertices): its position when no wall is labelled
     [[nodiscard]] double used_diameter() const { return diameter.value_or(measured_diameter); }
 };
 

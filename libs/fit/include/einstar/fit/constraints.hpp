@@ -73,7 +73,12 @@ struct Offset {  // the feature's position along datum axis k, from the datum or
     double value;
 };
 
-using Constraint = std::variant<Aligned, Parallel, Perpendicular, Angle, Coplanar, Coaxial, Radius, Diameter, Distance, Offset>;
+struct AxisDistance {  // two parallel axes this far apart (implies parallel): a hole pitch, a bolt circle's radius
+    int a, b;
+    double value;
+};
+
+using Constraint = std::variant<Aligned, Parallel, Perpendicular, Angle, Coplanar, Coaxial, Radius, Diameter, Distance, Offset, AxisDistance>;
 
 [[nodiscard]] std::string describe(const Constraint& c);
 
