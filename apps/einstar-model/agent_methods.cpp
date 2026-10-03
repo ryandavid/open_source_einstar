@@ -1,11 +1,14 @@
 #include "agent_methods.hpp"
 
+#include <array>
 #include <cmath>
 #include <cstring>
 
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
+
+#include "einstar/model/photo_render.hpp"
 
 namespace einstar::modelapp {
 namespace {
@@ -52,7 +55,7 @@ bool agent_socket_in_use(const std::string& path) {
 
 void register_model_agent(agent::Server& server, ModelApp& app, render::ViewCamera& camera) {
     for (const auto& spec : agent::method_specs()) {
-        if (spec.app != agent::App::model || spec.name == "model.view") continue;
+        if (spec.app != agent::App::model || spec.name == "model.view" || spec.name == "model.photo.get") continue;
         const std::string command = spec.name.substr(std::string("model.").size());
         if (command == "open") {
             // A scan may take minutes to process: started here, answered when it is done.
@@ -75,6 +78,38 @@ void register_model_agent(agent::Server& server, ModelApp& app, render::ViewCame
             return wait_for(app);
         });
     }
+
+    // A photo as an image (decoded and drawn here; the document keeps the file's bytes).
+    server.handle("model.photo.get", [&app](const json& p) -> Outcome {
+        if (app.busy()) return agent::error(ErrorCode::refused, "busy: " + app.busy_text());
+        if (!p.contains("photo")) throw agent::Server::BadParams("missing parameter 'photo'");
+        const json& ref = p["photo"];
+        const model::Photo* photo = nullptr;
+        for (const auto& ph : app.doc.state().photos)
+            if ((ref.is_number_integer() && ph.id == ref.get<int>()) || (ref.is_string() && ph.name == ref.get<std::string>())) photo = &ph;
+        if (!photo) return agent::error(ErrorCode::not_found, "no photo " + ref.dump());
+        model::PhotoRenderOptions o;
+        o.max_size = p.value("max_size", 1600);
+        o.annotations = p.value("annotations", true);
+        o.grid = p.value("grid", false);
+        if (p.contains("crop")) {
+            const auto c = p["crop"].get<std::vector<double>>();
+            if (c.size() != 4) throw agent::Server::BadParams("crop is [x, y, w, h]");
+            o.crop = std::array<double, 4>{c[0], c[1], c[2], c[3]};
+        }
+        const auto r = model::render_photo(*photo, o);
+        if (!r) return agent::error(ErrorCode::internal, r.error().message);
+        json annotations = json::array();
+        for (const auto& a : photo->annotations) annotations.push_back(model::annotation_summary(a));
+        return json{{"jpeg_base64", model::base64_encode(r->jpeg)},
+                    {"photo", photo->name},
+                    {"photo_size", {photo->width, photo->height}},
+                    {"image_size", {r->width, r->height}},
+                    {"scale", r->scale},
+                    {"crop", r->crop},
+                    {"annotations", annotations},
+                    {"note", "an image pixel (px, py) is the photo pixel (crop.x + px / scale, crop.y + py / scale)"}};
+    });
 
     server.handle("model.view", [&app, &camera](const json& p) -> Outcome {
         if (app.busy()) return agent::error(ErrorCode::refused, "busy: " + app.busy_text());

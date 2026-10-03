@@ -85,6 +85,29 @@ The MCP server's instructions describe the modelling workflow. A typical exchang
 3. `model_solve`, `model_build`.
 4. `model_deviation`, a screenshot, and a report of any conflicts and of what each measurement cost.
 
+## Photos
+
+Photos of the part keep what the scan cannot show: caliper readings, threads, the material, how it fits its
+assembly. They can be taken anywhere. Nothing assumes they show the scan's setting.
+- **Storage:** the photos live in the `.emodel`, as the files were (JPEG, HEIC, PNG), in one `PHOT` record per file.
+- **Annotations:** each one is drawn in the photo's pixels (as shown, after EXIF orientation) and named:
+  - a dimension (two points and a length), named D1, D2, ...;
+  - a diameter (three points on a rim, or a centre and the rim), named DIA1, ...;
+  - an angle, named A1, ...;
+  - a callout (an arrow with text and/or a value), named C1, ...;
+  - a note pinned to a point, named N1, ....
+- **Values** are read as typed: `42`, `1 1/2"`, `3/8 in`, `Ø6 ±0.02`, `R2`, `30°`. A typed value is also kept as
+  entered.
+- **Links:** an annotation can name the labels, holes or fillets it is about.
+- **Notes** (`model.note.*`) keep facts about the part as a whole.
+- **For the agent:**
+  - `model.summary` lists the photos, their annotations and the notes;
+  - `model.photo.list` gives the annotations in full;
+  - `model.photo.get` returns a photo as an image, scaled down, with its annotations drawn and named, optionally
+    cropped or with a grid of pixel coordinates.
+
+  The agent annotates too, to keep what the user tells it attached to a picture.
+
 ## When the scan changes
 
 The model keeps its own copy of the mesh, so a changed source cannot move the labels underneath it. When

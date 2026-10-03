@@ -72,11 +72,14 @@ target_link_libraries(debug_depth_errors PRIVATE einstar::pipeline einstar::synt
 einstar_add_test(test_fit fit/test_topology.cpp fit/test_primitive_fit.cpp fit/test_grow.cpp fit/test_holes_detect.cpp fit/test_solve.cpp)
 target_link_libraries(test_fit PRIVATE einstar::fit)
 
+einstar_add_test(test_image image/test_image.cpp)
+target_link_libraries(test_image PRIVATE einstar::image)
+
 if(TARGET einstar::brep)
   einstar_add_test(test_brep brep/test_brep.cpp)
   target_link_libraries(test_brep PRIVATE einstar::brep einstar::fit)
-  einstar_add_test(test_model model/test_document.cpp)
-  target_link_libraries(test_model PRIVATE einstar::model einstar::agent_protocol)
+  einstar_add_test(test_model model/test_document.cpp model/test_photos.cpp)
+  target_link_libraries(test_model PRIVATE einstar::model einstar::image einstar::agent_protocol)
 endif()
 
 if(EINSTAR_BUILD_APP)

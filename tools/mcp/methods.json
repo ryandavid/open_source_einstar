@@ -2030,6 +2030,376 @@
   },
   {
     "app": "model",
+    "description": "Adds photos of the part to the document (stored in the .emodel as the files are: JPEG, HEIC, PNG ...). Photos may be taken anywhere, in another setting than the scan.",
+    "kind": "mutating",
+    "name": "model.photo.import",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "caption": {
+          "description": "What it shows.",
+          "type": "string"
+        },
+        "data_base64": {
+          "description": "A photo's bytes instead of a file.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Name (default: the file's name).",
+          "type": "string"
+        },
+        "path": {
+          "description": "A photo file.",
+          "type": "string"
+        },
+        "paths": {
+          "description": "Photo files.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Renames a photo, sets its caption, or whether it may colour the scan.",
+    "kind": "mutating",
+    "name": "model.photo.update",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "caption": {
+          "description": "Caption.",
+          "type": "string"
+        },
+        "name": {
+          "description": "New name.",
+          "type": "string"
+        },
+        "photo": {
+          "description": "A photo: its name or id.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "use_for_colour": {
+          "description": "Once registered, may colour the scan (off when something covers the part).",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "photo"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Removes a photo and its annotations.",
+    "kind": "mutating",
+    "name": "model.photo.delete",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "photo": {
+          "description": "A photo: its name or id.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        }
+      },
+      "required": [
+        "photo"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Marks something on a photo: a dimension (two points and a length), a diameter (a circle), an angle, a callout (an arrow with text and/or a value) or a note. Named D1, DIA2, A3, C4, N5 ... Links say which labels, holes or fillets it is about. Use it to keep what the user tells you, attached to the picture.",
+    "kind": "mutating",
+    "name": "model.photo.annotate",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "description": "What it is.",
+          "enum": [
+            "dimension",
+            "diameter",
+            "angle",
+            "callout",
+            "note"
+          ],
+          "type": "string"
+        },
+        "links": {
+          "description": "Labels, holes or fillets it is about.",
+          "items": {
+            "type": [
+              "string",
+              "integer"
+            ]
+          },
+          "type": "array"
+        },
+        "photo": {
+          "description": "A photo: its name or id.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "points": {
+          "description": "Photo pixels [[x, y], ...] (as shown, origin top left, y down): dimension 2 (its ends), diameter 3 on the rim or 2 (centre, rim), angle 3 (the vertex in the middle), callout 2 (what it points at, then where its text sits), note 1.",
+          "items": {
+            "items": {
+              "type": "number"
+            },
+            "maxItems": 2,
+            "minItems": 2,
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "text": {
+          "description": "What it says.",
+          "type": "string"
+        },
+        "tolerance": {
+          "description": "+- in the value's unit.",
+          "type": "number"
+        },
+        "value": {
+          "description": "mm (an angle: degrees), or as typed: '42 mm', '1.5 in', '1 1/2\"', 'Ø6', 'R2', '30°', with an optional '±0.05' (null: none).",
+          "type": [
+            "number",
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "photo",
+        "kind",
+        "points"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Changes an annotation's points, value, tolerance, text or links.",
+    "kind": "mutating",
+    "name": "model.photo.annotation.update",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "annotation": {
+          "description": "An annotation: its name (D1 ...) or id.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "links": {
+          "description": "Labels, holes or fillets it is about (replaces them).",
+          "items": {
+            "type": [
+              "string",
+              "integer"
+            ]
+          },
+          "type": "array"
+        },
+        "points": {
+          "description": "Photo pixels [[x, y], ...] (as shown, origin top left, y down): dimension 2 (its ends), diameter 3 on the rim or 2 (centre, rim), angle 3 (the vertex in the middle), callout 2 (what it points at, then where its text sits), note 1.",
+          "items": {
+            "items": {
+              "type": "number"
+            },
+            "maxItems": 2,
+            "minItems": 2,
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "text": {
+          "description": "What it says.",
+          "type": "string"
+        },
+        "tolerance": {
+          "description": "+- in the value's unit (null: none).",
+          "type": "number"
+        },
+        "value": {
+          "description": "mm (an angle: degrees), or as typed: '42 mm', '1.5 in', '1 1/2\"', 'Ø6', 'R2', '30°', with an optional '±0.05' (null: none).",
+          "type": [
+            "number",
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "annotation"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Deletes an annotation.",
+    "kind": "mutating",
+    "name": "model.photo.annotation.delete",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "annotation": {
+          "description": "An annotation: its name (D1 ...) or id.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        }
+      },
+      "required": [
+        "annotation"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "The photos with their annotations in full (points, values, text, links), and the part's notes. model.photo.get shows one.",
+    "kind": "read_only",
+    "name": "model.photo.list",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "photo": {
+          "description": "Only this photo.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "A photo as an image to look at, scaled down, with its annotations drawn and named as in model.photo.list. Optionally a crop of it, or a grid labelled with photo pixel coordinates to point at things with (model.photo.annotate).",
+    "kind": "read_only",
+    "name": "model.photo.get",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "annotations": {
+          "description": "Draw the annotations (default true).",
+          "type": "boolean"
+        },
+        "crop": {
+          "description": "[x, y, w, h] in photo pixels.",
+          "items": {
+            "type": "number"
+          },
+          "maxItems": 4,
+          "minItems": 4,
+          "type": "array"
+        },
+        "grid": {
+          "description": "Draw a pixel grid (default false).",
+          "type": "boolean"
+        },
+        "max_size": {
+          "description": "Longer side of the image, px (default 1600).",
+          "type": "integer"
+        },
+        "photo": {
+          "description": "A photo: its name or id.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        }
+      },
+      "required": [
+        "photo"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Writes down a fact about the part that is not in the scan: material, finish, a thread, 'the bottom is flat', what it mates with. Kept in the document for later sessions.",
+    "kind": "mutating",
+    "name": "model.note.add",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "text": {
+          "description": "The note.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Rewrites a note.",
+    "kind": "mutating",
+    "name": "model.note.update",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "note": {
+          "description": "Its id.",
+          "type": "integer"
+        },
+        "text": {
+          "description": "The note.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "note",
+        "text"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Deletes a note.",
+    "kind": "mutating",
+    "name": "model.note.delete",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "note": {
+          "description": "Its id.",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "note"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
     "description": "Writes the built solid as STEP (AP242, mm, faces named after labels) and reads it back to check.",
     "kind": "read_only",
     "name": "model.export_step",

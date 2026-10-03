@@ -30,6 +30,7 @@
 #include "einstar/fit/deviation.hpp"
 #include "einstar/fit/mesh_topology.hpp"
 #include "einstar/fit/surface.hpp"
+#include "einstar/model/photo.hpp"
 #include "einstar/recon/mesh.hpp"
 
 namespace einstar::model {
@@ -111,6 +112,8 @@ struct State {
     std::vector<ConstraintDef> constraints;
     std::map<int, fit::Surface> solved;  // label id -> surface after the last solve
     json solve_report;                   // per constraint and label, from the last solve
+    std::vector<Photo> photos;           // of the part, with annotations (photo.hpp)
+    std::vector<Note> notes;             // facts about the part
     int next_id = 1;
 };
 

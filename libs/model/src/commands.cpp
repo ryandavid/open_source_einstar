@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include <format>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <numbers>
@@ -14,6 +15,7 @@
 #include "einstar/fit/holes.hpp"
 #include "einstar/fit/primitive_fit.hpp"
 #include "einstar/fit/synthetic_part.hpp"
+#include "einstar/image/image.hpp"
 #include "einstar/model/document.hpp"
 #include "einstar/model/io.hpp"
 #include "einstar/model/json.hpp"
@@ -28,6 +30,7 @@ struct CommandError {
 
 struct Document::Impl {
     Document& d;
+    Author author = Author::user;  // who gave the command
 
     // ---- references ----
 
@@ -220,6 +223,10 @@ struct Document::Impl {
         } else {
             out["model"] = nullptr;
         }
+        out["photos"] = json::array();
+        for (const auto& ph : d.state_.photos) out["photos"].push_back(photo_json(ph, false));
+        out["notes"] = json::array();
+        for (const auto& n : d.state_.notes) out["notes"].push_back({{"id", n.id}, {"text", n.text}, {"author", n.author}});
         out["undo_steps"] = d.undo_.size();
         out["redo_steps"] = d.redo_.size();
         return out;
@@ -411,6 +418,8 @@ struct Document::Impl {
             if (f.label == id) f.label = 0;
         const auto removed = std::erase_if(d.state_.constraints, [&](const ConstraintDef& c) { return refers_to_label(c.spec, id); });
         d.state_.solved.erase(id);
+        forget_links(id);
+        for (const int h : holes_gone) forget_links(h);
         return {{"deleted", id}, {"constraints_removed", removed}};
     }
 
@@ -820,6 +829,7 @@ struct Document::Impl {
         const auto removed = std::erase_if(d.state_.constraints, [&](const ConstraintDef& c) {
             return refers_to_label(c.spec, id) || (c.spec.contains("hole") && c.spec["hole"] == id);
         });
+        forget_links(id);
         return {{"deleted", id}, {"constraints_removed", removed}};
     }
 
@@ -880,6 +890,7 @@ struct Document::Impl {
     json fillet_delete(const json& p) {
         const int id = fillet_ref(need(p, "fillet")).id;
         std::erase_if(d.state_.fillets, [&](const Fillet& f) { return f.id == id; });
+        forget_links(id);
         return {{"deleted", id}};
     }
 
@@ -1067,6 +1078,272 @@ struct Document::Impl {
             added.push_back({{"label", l.name}, {"axis", std::string(1, "xyz"[best])}, {"was_off_deg", angle}});
         }
         return {{"added", added}, {"skipped", skipped}};
+    }
+
+    // ---- photos and notes (photo.hpp) ----
+
+    std::string author_text() const { return std::string(author_name(author)); }
+
+    Photo& photo_ref(const json& ref) {
+        for (auto& ph : d.state_.photos)
+            if ((ref.is_number_integer() && ph.id == ref.get<int>()) || (ref.is_string() && ph.name == ref.get<std::string>())) return ph;
+        fail(std::format("no photo {}", ref.dump()));
+    }
+    std::pair<Photo*, Annotation*> annotation_ref(const json& ref) {
+        for (auto& ph : d.state_.photos)
+            for (auto& a : ph.annotations)
+                if ((ref.is_number_integer() && a.id == ref.get<int>()) || (ref.is_string() && a.name == ref.get<std::string>())) return {&ph, &a};
+        fail(std::format("no annotation {}", ref.dump()));
+    }
+    Note& note_ref(const json& ref) {
+        for (auto& n : d.state_.notes)
+            if (ref.is_number_integer() && n.id == ref.get<int>()) return n;
+        fail(std::format("no note {} (notes are referred to by id)", ref.dump()));
+    }
+    // What an annotation can be about: a label, a hole or a fillet.
+    int link_ref(const json& ref) {
+        if (const Label* l = d.find_label(ref)) return l->id;
+        for (const auto& h : d.state_.holes)
+            if ((ref.is_number_integer() && h.id == ref.get<int>()) || (ref.is_string() && h.name == ref.get<std::string>())) return h.id;
+        for (const auto& f : d.state_.fillets)
+            if ((ref.is_number_integer() && f.id == ref.get<int>()) || (ref.is_string() && f.name == ref.get<std::string>())) return f.id;
+        fail(std::format("no label, hole or fillet {}", ref.dump()));
+    }
+    std::string link_name(int id) const {
+        for (const auto& f : d.state_.fillets)
+            if (f.id == id) return f.name;
+        return label_name(id);
+    }
+    void forget_links(int id) {
+        for (auto& ph : d.state_.photos)
+            for (auto& a : ph.annotations) std::erase(a.links, id);
+    }
+
+    json annotation_json(const Photo& ph, const Annotation& a) const {
+        json j = {{"id", a.id}, {"name", a.name}, {"photo", ph.name}, {"kind", annotation_kind_name(a.kind)}, {"points", json::array()},
+                  {"summary", annotation_summary(a)}, {"author", a.author}};
+        for (const auto& q : a.points) j["points"].push_back({std::round(q.x() * 10) / 10, std::round(q.y() * 10) / 10});
+        if (a.value) j["value"] = *a.value;
+        if (a.value) j["unit"] = a.kind == AnnotationKind::angle ? "deg" : "mm";
+        if (!a.entered.empty()) j["entered"] = a.entered;
+        if (a.tolerance) j["tolerance"] = *a.tolerance;
+        if (!a.text.empty()) j["text"] = a.text;
+        if (!a.links.empty()) {
+            j["links"] = json::array();
+            for (const int id : a.links) j["links"].push_back(link_name(id));
+        }
+        if (const auto c = annotation_circle(a)) j["circle"] = {{"center", {c->first.x(), c->first.y()}}, {"radius_px", c->second}};
+        if (a.applied) j["applied_to"] = a.applied;
+        return j;
+    }
+    json photo_json(const Photo& ph, bool annotations) const {
+        json j = {{"id", ph.id}, {"name", ph.name}, {"size", {ph.width, ph.height}}, {"mime", ph.blob ? ph.blob->mime : ""},
+                  {"bytes", ph.blob ? ph.blob->bytes.size() : 0}, {"annotation_count", ph.annotations.size()}, {"registered", ph.camera.has_value()}};
+        if (!ph.caption.empty()) j["caption"] = ph.caption;
+        if (!ph.exif.empty()) j["exif"] = ph.exif;
+        if (annotations) {
+            j["annotations"] = json::array();
+            for (const auto& a : ph.annotations) j["annotations"].push_back(annotation_json(ph, a));
+        } else {
+            j["annotations"] = json::array();
+            for (const auto& a : ph.annotations) j["annotations"].push_back(annotation_summary(a));
+        }
+        if (!ph.correspondences.empty()) j["matched_points"] = ph.correspondences.size();
+        if (ph.camera) j["camera"] = {{"rms_px", ph.camera->rms_px}, {"focal_px", ph.camera->focal_px}};
+        return j;
+    }
+
+    std::string unique_photo_name(const std::string& base) const {
+        const auto taken = [&](const std::string& n) { return std::ranges::any_of(d.state_.photos, [&](const Photo& ph) { return ph.name == n; }); };
+        if (!taken(base)) return base;
+        for (int i = 2;; ++i)
+            if (const auto n = std::format("{} {}", base, i); !taken(n)) return n;
+    }
+    std::string next_annotation_name(AnnotationKind kind) const {
+        int n = 0;
+        const std::string prefix(annotation_prefix(kind));
+        for (const auto& ph : d.state_.photos)
+            for (const auto& a : ph.annotations)
+                if (a.name.starts_with(prefix) && a.name.size() > prefix.size() && std::isdigit(static_cast<unsigned char>(a.name[prefix.size()])))
+                    n = std::max(n, std::atoi(a.name.c_str() + prefix.size()));
+        return std::format("{}{}", prefix, n + 1);
+    }
+
+    // Adds a photo from a file's bytes (kept as they are).
+    Photo& add_photo(std::string bytes, const std::string& name) {
+        const auto info = image::probe(bytes);
+        if (!info) refuse(std::format("{}: {}", name, info.error().message));
+        Photo ph;
+        ph.id = new_id();
+        ph.name = unique_photo_name(name.empty() ? "photo" : name);
+        ph.width = info->width;
+        ph.height = info->height;
+        const auto& e = info->exif;
+        if (!e.make.empty()) ph.exif["make"] = e.make;
+        if (!e.model.empty()) ph.exif["model"] = e.model;
+        if (!e.taken.empty()) ph.exif["taken"] = e.taken;
+        if (e.focal_mm) ph.exif["focal_mm"] = *e.focal_mm;
+        if (e.focal_35mm) ph.exif["focal_35mm"] = *e.focal_35mm;
+        const std::string hash = image::content_hash(bytes);
+        for (const auto& other : d.state_.photos)
+            if (other.blob && other.blob->hash == hash) ph.blob = other.blob;  // the same file again: shared
+        if (!ph.blob) ph.blob = std::make_shared<const PhotoBlob>(PhotoBlob{std::move(bytes), info->mime, hash});
+        d.state_.photos.push_back(std::move(ph));
+        return d.state_.photos.back();
+    }
+
+    json photo_import(const json& p) {
+        need_scan();
+        std::vector<std::filesystem::path> paths;
+        if (p.contains("path")) paths.emplace_back(get<std::string>(p, "path"));
+        if (p.contains("paths"))
+            for (const auto& x : need(p, "paths")) paths.emplace_back(x.get<std::string>());
+        json out = json::array();
+        for (const auto& path : paths) {
+            std::ifstream f(path, std::ios::binary);
+            if (!f) refuse("cannot read " + path.string());
+            std::string bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            out.push_back(photo_json(add_photo(std::move(bytes), opt<std::string>(p, "name").value_or(path.stem().string())), false));
+        }
+        if (const auto data = opt<std::string>(p, "data_base64")) {
+            auto bytes = base64_decode(*data);
+            if (!bytes) fail("data_base64 is not base64");
+            out.push_back(photo_json(add_photo(std::move(*bytes), opt<std::string>(p, "name").value_or("photo")), false));
+        }
+        if (out.empty()) fail("give 'path', 'paths' or 'data_base64'");
+        if (const auto caption = opt<std::string>(p, "caption"))
+            for (auto& ph : d.state_.photos)
+                for (const auto& j : out)
+                    if (ph.id == j["id"].get<int>()) ph.caption = *caption;
+        return {{"photos", out}};
+    }
+
+    json photo_update(const json& p) {
+        Photo& ph = photo_ref(need(p, "photo"));
+        if (const auto n = opt<std::string>(p, "name"); n && *n != ph.name) {
+            if (n->empty() || std::ranges::any_of(d.state_.photos, [&](const Photo& o) { return o.name == *n; }))
+                fail(std::format("the photo name '{}' is taken or empty", *n));
+            ph.name = *n;
+        }
+        if (const auto c = opt<std::string>(p, "caption")) ph.caption = *c;
+        if (const auto u = opt<bool>(p, "use_for_colour")) ph.use_for_colour = *u;
+        return photo_json(ph, false);
+    }
+
+    json photo_delete(const json& p) {
+        const int id = photo_ref(need(p, "photo")).id;
+        std::erase_if(d.state_.photos, [&](const Photo& ph) { return ph.id == id; });
+        return {{"deleted", id}};
+    }
+
+    std::vector<Vec2> points_param(const json& p, const Photo& ph, AnnotationKind kind) {
+        std::vector<Vec2> pts;
+        for (const auto& q : need(p, "points")) {
+            if (!q.is_array() || q.size() != 2) fail("a point is [x, y] in photo pixels");
+            const Vec2 v(q[0].get<double>(), q[1].get<double>());
+            if (v.x() < 0 || v.y() < 0 || v.x() > ph.width || v.y() > ph.height)
+                fail(std::format("the point [{:.0f}, {:.0f}] is outside the photo ({} x {} px)", v.x(), v.y(), ph.width, ph.height));
+            pts.push_back(v);
+        }
+        const auto [lo, hi] = annotation_points(kind);
+        if (static_cast<int>(pts.size()) < lo || static_cast<int>(pts.size()) > hi)
+            fail(std::format("a {} takes {} point{}", annotation_kind_name(kind), lo == hi ? std::to_string(lo) : std::format("{} or {}", lo, hi),
+                             hi > 1 ? "s" : ""));
+        return pts;
+    }
+    // A value given as a number (mm / degrees) or as typed ("1 1/2 in", "Ø6 ±0.02", "30°").
+    void set_value(Annotation& a, const json& v) {
+        if (v.is_null()) {
+            a.value.reset();
+            a.entered.clear();
+            a.tolerance.reset();
+            return;
+        }
+        if (v.is_number()) {
+            a.value = v.get<double>();
+            a.entered.clear();
+            return;
+        }
+        if (!v.is_string()) fail("a value is a number or text such as '42 mm', '1 1/2 in', 'Ø6', '30°'");
+        const auto parsed = parse_value(v.get<std::string>(), a.kind == AnnotationKind::angle);
+        if (!parsed) fail(std::format("cannot read '{}' as a value (e.g. 42, 42 mm, 1.5 in, 1 1/2\", Ø6, R2, 30°)", v.get<std::string>()));
+        if (parsed->angle != (a.kind == AnnotationKind::angle))
+            fail(a.kind == AnnotationKind::angle ? "an angle's value is in degrees" : "a length's value cannot be an angle");
+        a.value = parsed->value;
+        if (a.kind == AnnotationKind::diameter && parsed->form == 'R') *a.value *= 2;  // "R3" on a diameter: 6
+        a.entered = v.get<std::string>();
+        if (parsed->tolerance) a.tolerance = parsed->tolerance;
+    }
+
+    json photo_annotate(const json& p) {
+        Photo& ph = photo_ref(need(p, "photo"));
+        const auto kind = annotation_kind_from_name(get<std::string>(p, "kind"));
+        if (!kind) fail("kind is dimension, diameter, angle, callout or note");
+        Annotation a;
+        a.kind = *kind;
+        a.points = points_param(p, ph, a.kind);
+        if (p.contains("value")) set_value(a, p["value"]);
+        if (const auto t = opt<double>(p, "tolerance")) a.tolerance = *t;
+        a.text = opt<std::string>(p, "text").value_or("");
+        if (p.contains("links"))
+            for (const auto& ref : p["links"]) a.links.push_back(link_ref(ref));
+        if ((a.kind == AnnotationKind::callout || a.kind == AnnotationKind::note) && !a.value && a.text.empty())
+            fail(std::format("a {} needs text or a value", annotation_kind_name(a.kind)));
+        a.id = new_id();
+        a.name = next_annotation_name(a.kind);
+        a.author = author_text();
+        ph.annotations.push_back(a);
+        return annotation_json(ph, ph.annotations.back());
+    }
+
+    json photo_annotation_update(const json& p) {
+        auto [ph, a] = annotation_ref(need(p, "annotation"));
+        if (p.contains("points")) a->points = points_param(p, *ph, a->kind);
+        if (p.contains("value")) set_value(*a, p["value"]);
+        if (p.contains("tolerance")) a->tolerance = p["tolerance"].is_null() ? std::nullopt : std::optional<double>(get<double>(p, "tolerance"));
+        if (const auto t = opt<std::string>(p, "text")) a->text = *t;
+        if (p.contains("links")) {
+            a->links.clear();
+            for (const auto& ref : p["links"]) a->links.push_back(link_ref(ref));
+        }
+        return annotation_json(*ph, *a);
+    }
+
+    json photo_annotation_delete(const json& p) {
+        auto [ph, a] = annotation_ref(need(p, "annotation"));
+        const int id = a->id;
+        std::erase_if(ph->annotations, [&](const Annotation& x) { return x.id == id; });
+        return {{"deleted", id}};
+    }
+
+    json photo_list(const json& p) const {
+        json out = json::array();
+        const auto only = p.is_object() && p.contains("photo") ? std::optional<json>(p["photo"]) : std::nullopt;
+        for (const auto& ph : d.state_.photos) {
+            if (only && !((only->is_number_integer() && ph.id == only->get<int>()) || (only->is_string() && ph.name == only->get<std::string>()))) continue;
+            out.push_back(photo_json(ph, true));
+        }
+        if (only && out.empty()) fail(std::format("no photo {}", only->dump()));
+        json notes = json::array();
+        for (const auto& n : d.state_.notes) notes.push_back({{"id", n.id}, {"text", n.text}, {"author", n.author}});
+        return {{"photos", out}, {"notes", notes}};
+    }
+
+    json note_add(const json& p) {
+        const auto text = get<std::string>(p, "text");
+        if (text.empty()) fail("a note needs text");
+        d.state_.notes.push_back({new_id(), text, author_text()});
+        return {{"id", d.state_.notes.back().id}, {"text", text}};
+    }
+    json note_update(const json& p) {
+        Note& n = note_ref(need(p, "note"));
+        n.text = get<std::string>(p, "text");
+        return {{"id", n.id}, {"text", n.text}};
+    }
+    json note_delete(const json& p) {
+        const int id = note_ref(need(p, "note")).id;
+        std::erase_if(d.state_.notes, [&](const Note& n) { return n.id == id; });
+        return {{"deleted", id}};
     }
 
     // ---- solve and build ----
@@ -1521,6 +1798,16 @@ const std::map<std::string, CommandInfo, std::less<>>& table() {
         {"scale", {[](I& i, const json& p) { return i.scale(p); }, false}},
         {"reprocess", {[](I& i, const json& p) { return i.reprocess(p); }, false}},
         {"export_step", {[](I& i, const json& p) { return i.export_step(p); }, false}},
+        {"photo.import", {[](I& i, const json& p) { return i.photo_import(p); }, true}},
+        {"photo.update", {[](I& i, const json& p) { return i.photo_update(p); }, true}},
+        {"photo.delete", {[](I& i, const json& p) { return i.photo_delete(p); }, true}},
+        {"photo.annotate", {[](I& i, const json& p) { return i.photo_annotate(p); }, true}},
+        {"photo.annotation.update", {[](I& i, const json& p) { return i.photo_annotation_update(p); }, true}},
+        {"photo.annotation.delete", {[](I& i, const json& p) { return i.photo_annotation_delete(p); }, true}},
+        {"photo.list", {[](I& i, const json& p) { return i.photo_list(p); }, false}},
+        {"note.add", {[](I& i, const json& p) { return i.note_add(p); }, true}},
+        {"note.update", {[](I& i, const json& p) { return i.note_update(p); }, true}},
+        {"note.delete", {[](I& i, const json& p) { return i.note_delete(p); }, true}},
     };
     return t;
 }
@@ -1559,7 +1846,7 @@ Outcome Document::apply(std::string_view command, const json& params, Author aut
     }
     const auto it = table().find(command);
     if (it == table().end()) return {false, nullptr, std::format("unknown command '{}'", command), false};
-    Impl impl{*this};
+    Impl impl{*this, author};
     const bool mutating = it->second.mutating;
     const bool opens = command == "open" || command == "open_demo";
     State before = state_;

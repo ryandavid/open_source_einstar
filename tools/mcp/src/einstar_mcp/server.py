@@ -50,6 +50,11 @@ Modelling (the model app) -- the user describes the part in words and measuremen
   are the scan rounding sharp edges, not errors) and model_view + ui_screenshot to look. Report conflicts and what
   each measurement cost (how far it moved the surfaces off the scan) rather than hiding them.
 - model_export_step writes the STEP file the user imports into CAD.
+- Photos (model_summary lists them; model_photo_list has their annotations): the user's photos of the part, often taken
+  somewhere else than the scan. Look at them (model_photo_get, grid=true to read pixel positions) before asking the user
+  what you could see. Annotations (D1, DIA2, A3, C4, N5 ...) hold measured values and remarks; links say which labels or
+  holes they are about. When the user tells you something about the part, keep it: model_photo_annotate on a photo that
+  shows it, or model_note_add.
 - When model_summary's scan.source is 'changed' (the .estr was scanned further or edited since), model_reprocess
   makes the mesh again and carries the labels over; solve and build again after. In the scanning app, scan_open
   brings a recording back as a paused scan (edit it, process it, or connect the scanner and continue it)."""
@@ -180,7 +185,7 @@ class EinstarMcp:
                 return ok(out or "(nothing captured)")
             if name == "app_call":
                 method = args.get("method", "")
-                return self._result(sup.call(app, method, args.get("params") or {}, 120), method == "ui.screenshot")
+                return self._result(sup.call(app, method, args.get("params") or {}, 120))
             m = self.methods.get(name)
             if m is None:
                 return fail(f"no tool '{name}'")
@@ -193,18 +198,21 @@ class EinstarMcp:
             timeout = max(60.0, params.get("timeout_ms", 0) / 1000.0 + 10.0)
             if m["name"] in LONG_WORK:
                 timeout = 1800.0
-            return self._result(sup.call(target, m["name"], params, timeout), m["name"] == "ui.screenshot")
+            return self._result(sup.call(target, m["name"], params, timeout))
         except (AgentError, LaunchError) as e:
             return fail(str(e))
 
     @staticmethod
-    def _result(result: Any, image: bool) -> types.CallToolResult:
-        if image and isinstance(result, dict) and "png_base64" in result:
-            meta = {k: v for k, v in result.items() if k != "png_base64"}
-            return types.CallToolResult(
-                content=[types.ImageContent(type="image", data=result["png_base64"], mime_type="image/png"), text(json.dumps(meta))],
-                is_error=False,
-            )
+    def _result(result: Any) -> types.CallToolResult:
+        # Images (ui.screenshot, model.photo.get) go to the client as images, the rest of the result as text.
+        if isinstance(result, dict):
+            for key, mime in (("png_base64", "image/png"), ("jpeg_base64", "image/jpeg")):
+                if key in result:
+                    meta = {k: v for k, v in result.items() if k != key}
+                    return types.CallToolResult(
+                        content=[types.ImageContent(type="image", data=result[key], mime_type=mime), text(json.dumps(meta))],
+                        is_error=False,
+                    )
         return ok(json.dumps(result, indent=1))
 
 

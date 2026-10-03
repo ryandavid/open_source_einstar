@@ -4,6 +4,7 @@
 #include <cstring>
 #include <format>
 #include <fstream>
+#include <set>
 #include <sstream>
 #include <unordered_map>
 
@@ -319,6 +320,19 @@ Result<void> Document::save(const std::filesystem::path& path) const {
         for (const auto& x : state_.datums) doc["datums"].push_back({{"id", x.id}, {"name", x.name}, {"frame", frame_to_json(x.frame)}});
         for (const auto& c : state_.constraints) doc["constraints"].push_back({{"id", c.id}, {"spec", c.spec}});
         for (const auto& [id, s] : state_.solved) doc["solved"][std::to_string(id)] = surface_to_json(s);
+        // Photos: their bytes once per file however many photos share them, their annotations in DOCU.
+        doc["photos"] = json::array();
+        std::set<std::string> written;
+        for (const auto& ph : state_.photos) {
+            doc["photos"].push_back(photo_to_file(ph));
+            if (!ph.blob || !written.insert(ph.blob->hash).second) continue;
+            std::string payload = json{{"hash", ph.blob->hash}, {"mime", ph.blob->mime}, {"size", ph.blob->bytes.size()}}.dump();
+            payload.push_back('\0');
+            payload += ph.blob->bytes;
+            put_record(f, tag("PHOT"), payload);
+        }
+        doc["notes"] = json::array();
+        for (const auto& n : state_.notes) doc["notes"].push_back({{"id", n.id}, {"text", n.text}, {"author", n.author}});
         put_record(f, tag("DOCU"), doc.dump());
         if (!f) return make_error(Errc::io, "cannot write " + path.string());
     }
@@ -338,12 +352,25 @@ Result<void> Document::load(const std::filesystem::path& path) {
     if (magic != kMagic) return make_error(Errc::invalid_argument, "not an .emodel file: " + path.string());
     if (version > kVersion) return make_error(Errc::unsupported, "made by a newer version: " + path.string());
     std::map<std::uint32_t, std::string> records;
+    std::map<std::string, std::shared_ptr<const PhotoBlob>> blobs;  // PHOT records, by hash
     while (f) {
         std::uint32_t t = 0, reserved = 0;
         std::uint64_t size = 0;
         if (!f.read(reinterpret_cast<char*>(&t), 4) || !f.read(reinterpret_cast<char*>(&reserved), 4) || !f.read(reinterpret_cast<char*>(&size), 8)) break;
         std::string payload(size, '\0');
         if (!f.read(payload.data(), static_cast<std::streamsize>(size))) return make_error(Errc::io, "the file ends early: " + path.string());
+        if (t == tag("PHOT")) {
+            const auto nul = payload.find('\0');
+            if (nul == std::string::npos) return make_error(Errc::invalid_argument, "damaged photo in " + path.string());
+            const json header = json::parse(payload.substr(0, nul), nullptr, false);
+            if (header.is_discarded()) return make_error(Errc::invalid_argument, "damaged photo in " + path.string());
+            auto blob = std::make_shared<PhotoBlob>();
+            blob->hash = header.value("hash", "");
+            blob->mime = header.value("mime", "");
+            blob->bytes = payload.substr(nul + 1);
+            blobs[blob->hash] = std::move(blob);
+            continue;
+        }
         records[t] = std::move(payload);
     }
     for (const char* need : {"SCAN", "MESH", "LABL", "DOCU"}) {
@@ -426,6 +453,12 @@ Result<void> Document::load(const std::filesystem::path& path) {
         for (const auto& j : doc.at("constraints")) s.constraints.push_back({j.at("id"), j.at("spec")});
         for (const auto& [k, v] : doc.at("solved").items()) s.solved[std::stoi(k)] = surface_from_json(v);
         s.solve_report = doc.value("solve_report", json::object());
+        for (const auto& j : doc.value("photos", json::array())) {
+            const auto it = blobs.find(j.value("blob", ""));
+            if (it == blobs.end()) return make_error(Errc::invalid_argument, std::format("{}: the photo '{}' has no image", path.string(), j.value("name", "?")));
+            s.photos.push_back(photo_from_file(j, it->second));
+        }
+        for (const auto& j : doc.value("notes", json::array())) s.notes.push_back({j.at("id"), j.at("text"), j.value("author", "user")});
         state_ = std::move(s);
         path_ = path;
         ++revision_;

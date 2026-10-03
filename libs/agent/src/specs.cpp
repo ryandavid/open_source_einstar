@@ -365,6 +365,57 @@ std::vector<MethodSpec> build() {
         "again after. Clears the undo history. Seconds to minutes for an .estr.",
         object({{"path", str("The source (default: the scan's own, e.g. after it was moved).")},
                 {"fine", boolean("For .estr: 0.3 mm voxels (default: as it was processed before).")}}));
+    // Photos of the part (taken anywhere: they need not show the scan's setting) and what the user marked on them.
+    const json points = {{"type", "array"}, {"items", {{"type", "array"}, {"items", {{"type", "number"}}}, {"minItems", 2}, {"maxItems", 2}}},
+                         {"description", "Photo pixels [[x, y], ...] (as shown, origin top left, y down): dimension 2 (its ends), diameter "
+                                         "3 on the rim or 2 (centre, rim), angle 3 (the vertex in the middle), callout 2 (what it points "
+                                         "at, then where its text sits), note 1."}};
+    const json value = {{"type", {"number", "string", "null"}},
+                        {"description", "mm (an angle: degrees), or as typed: '42 mm', '1.5 in', '1 1/2\"', 'Ø6', 'R2', '30°', with an optional "
+                                        "'±0.05' (null: none)."}};
+    add("model.photo.import", model, mutating,
+        "Adds photos of the part to the document (stored in the .emodel as the files are: JPEG, HEIC, PNG ...). Photos may be "
+        "taken anywhere, in another setting than the scan.",
+        object({{"path", str("A photo file.")}, {"paths", {{"type", "array"}, {"items", {{"type", "string"}}}, {"description", "Photo files."}}},
+                {"data_base64", str("A photo's bytes instead of a file.")}, {"name", str("Name (default: the file's name).")},
+                {"caption", str("What it shows.")}}));
+    add("model.photo.update", model, mutating, "Renames a photo, sets its caption, or whether it may colour the scan.",
+        object({{"photo", ref("A photo: its name or id.")}, {"name", str("New name.")}, {"caption", str("Caption.")},
+                {"use_for_colour", boolean("Once registered, may colour the scan (off when something covers the part).")}},
+               {"photo"}));
+    add("model.photo.delete", model, mutating, "Removes a photo and its annotations.", object({{"photo", ref("A photo: its name or id.")}}, {"photo"}));
+    add("model.photo.annotate", model, mutating,
+        "Marks something on a photo: a dimension (two points and a length), a diameter (a circle), an angle, a callout (an "
+        "arrow with text and/or a value) or a note. Named D1, DIA2, A3, C4, N5 ... Links say which labels, holes or fillets it "
+        "is about. Use it to keep what the user tells you, attached to the picture.",
+        object({{"photo", ref("A photo: its name or id.")}, {"kind", one_of({"dimension", "diameter", "angle", "callout", "note"}, "What it is.")},
+                {"points", points}, {"value", value}, {"tolerance", num("+- in the value's unit.")}, {"text", str("What it says.")},
+                {"links", refs("Labels, holes or fillets it is about.")}},
+               {"photo", "kind", "points"}));
+    add("model.photo.annotation.update", model, mutating, "Changes an annotation's points, value, tolerance, text or links.",
+        object({{"annotation", ref("An annotation: its name (D1 ...) or id.")}, {"points", points}, {"value", value},
+                {"tolerance", num("+- in the value's unit (null: none).")}, {"text", str("What it says.")},
+                {"links", refs("Labels, holes or fillets it is about (replaces them).")}},
+               {"annotation"}));
+    add("model.photo.annotation.delete", model, mutating, "Deletes an annotation.",
+        object({{"annotation", ref("An annotation: its name (D1 ...) or id.")}}, {"annotation"}));
+    add("model.photo.list", model, read_only,
+        "The photos with their annotations in full (points, values, text, links), and the part's notes. model.photo.get shows one.",
+        object({{"photo", ref("Only this photo.")}}));
+    add("model.photo.get", model, read_only,
+        "A photo as an image to look at, scaled down, with its annotations drawn and named as in model.photo.list. Optionally "
+        "a crop of it, or a grid labelled with photo pixel coordinates to point at things with (model.photo.annotate).",
+        object({{"photo", ref("A photo: its name or id.")}, {"max_size", integer("Longer side of the image, px (default 1600).")},
+                {"crop", {{"type", "array"}, {"items", {{"type", "number"}}}, {"minItems", 4}, {"maxItems", 4},
+                          {"description", "[x, y, w, h] in photo pixels."}}},
+                {"annotations", boolean("Draw the annotations (default true).")}, {"grid", boolean("Draw a pixel grid (default false).")}},
+               {"photo"}));
+    add("model.note.add", model, mutating,
+        "Writes down a fact about the part that is not in the scan: material, finish, a thread, 'the bottom is flat', what it "
+        "mates with. Kept in the document for later sessions.",
+        object({{"text", str("The note.")}}, {"text"}));
+    add("model.note.update", model, mutating, "Rewrites a note.", object({{"note", integer("Its id.")}, {"text", str("The note.")}}, {"note", "text"}));
+    add("model.note.delete", model, mutating, "Deletes a note.", object({{"note", integer("Its id.")}}, {"note"}));
     add("model.export_step", model, read_only, "Writes the built solid as STEP (AP242, mm, faces named after labels) and reads it back to check.",
         object({{"path", str("The .step file.")}}, {"path"}));
     add("model.view", model, mutating,

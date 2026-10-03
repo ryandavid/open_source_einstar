@@ -33,6 +33,20 @@ def until(m: EinstarMcp, tool: str, done, polls: int = 600):
     raise AssertionError(f"{tool} never got there: {r}")
 
 
+def write_png(path: pathlib.Path, w: int, h: int) -> None:
+    """A w x h gradient as a PNG (the standard library has no image encoder; PNG is simple to write)."""
+    import struct
+    import zlib
+
+    rows = b"".join(b"\0" + bytes(c for x in range(w) for c in (255 * x // w, 255 * y // h, 128)) for y in range(h))
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data))
+
+    png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b"")
+    path.write_bytes(png)
+
+
 def main() -> int:
     data = pathlib.Path(tempfile.mkdtemp(prefix="einstar_mcp_e2e_"))
     m = EinstarMcp()
@@ -114,6 +128,19 @@ def main() -> int:
         step = data / "part.step"
         assert result(m, "model_export_step", path=str(step))["read_back"]["valid"]
         assert step.stat().st_size > 10000
+        # A photo of the part, annotated, and looked at as the agent would.
+        photo = data / "part.png"
+        write_png(photo, 320, 240)
+        assert result(m, "model_photo_import", path=str(photo), caption="the flange")["photos"][0]["name"] == "part"
+        dim = result(m, "model_photo_annotate", photo="part", kind="dimension", points=[[20, 200], [300, 200]], value="100 mm",
+                     text="flange length", links=["top"])
+        assert dim["name"] == "D1" and dim["links"] == ["top"], dim
+        ok(m, "model_note_add", text="aluminium")
+        seen = ok(m, "model_photo_get", photo="part", max_size=160, grid=True)
+        assert seen.content[0].type == "image" and seen.content[0].mime_type == "image/jpeg", seen.content[0]
+        assert json.loads(seen.content[1].text)["annotations"] == ["D1 100.00 mm: flange length"]
+        summary = result(m, "model_summary")
+        assert summary["photos"][0]["annotation_count"] == 1 and summary["notes"][0]["text"] == "aluminium"
         assert result(m, "model_open", path=str(mesh))["scan"]["triangles"] > 1000
         assert m.call("model_grow", {}).is_error  # refused: nothing painted, said so
 
