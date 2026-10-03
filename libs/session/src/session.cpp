@@ -29,6 +29,7 @@ constexpr std::uint32_t kDropped = tag("DROP");
 constexpr std::uint32_t kRaw = tag("RAWI");
 constexpr std::uint32_t kErase = tag("ERAS");
 constexpr std::uint32_t kUndo = tag("UNDO");
+constexpr std::uint32_t kResume = tag("RESM");
 constexpr double kDepthScale = 50.0;  // u16 units per mm (0.02 mm, up to 1310 mm)
 constexpr int kZstdLevel = 1;  // ~2x faster than 3 for 2% larger files (recording runs every frame)
 
@@ -329,6 +330,39 @@ Result<std::unique_ptr<SessionWriter>> SessionWriter::create(const std::string& 
     w->write_record(kHead, p.b);
     w->thread_ = std::thread([raw = w.get()] { raw->run(); });
     return w;
+}
+
+Result<std::unique_ptr<SessionWriter>> SessionWriter::append(const std::string& path) {
+    std::uint64_t complete = 0;
+    {
+        auto r = SessionReader::open(path);
+        if (!r) return std::unexpected(r.error());
+        complete = (*r)->complete_bytes();
+    }
+    std::error_code ec;
+    if (std::filesystem::file_size(path, ec) != complete && !ec) {
+        std::filesystem::resize_file(path, complete, ec);
+        if (ec) return make_error(Errc::io, std::format("cannot trim the cut-short end of {}: {}", path, ec.message()));
+    }
+    auto w = std::unique_ptr<SessionWriter>(new SessionWriter());
+    w->path_ = path;
+    w->out_.open(path, std::ios::binary | std::ios::app);
+    if (!w->out_) return make_error(Errc::io, "cannot append to " + path);
+    w->thread_ = std::thread([raw = w.get()] { raw->run(); });
+    return w;
+}
+
+void SessionWriter::write_resume(std::uint64_t frames_before, const std::string& note) {
+    Writer p;
+    p.put(kResume);
+    p.put(frames_before);
+    p.put_string(note);
+    {
+        std::lock_guard lock(mutex_);
+        if (closing_) return;
+        queue_.push_back(std::move(p.b));
+    }
+    cv_.notify_one();
 }
 
 SessionWriter::~SessionWriter() { close(); }
@@ -686,10 +720,17 @@ Result<std::unique_ptr<SessionReader>> SessionReader::open(const std::string& pa
             } else if (t == kUndo) {
                 const auto id = rd.get<std::uint32_t>();
                 if (rd.ok) std::erase_if(r->erasures_, [&](const SessionErase& e) { return e.id == id; });
+            } else if (t == kResume) {
+                ResumeMark m;
+                (void)rd.get<std::uint64_t>();
+                m.frames_before = r->frames_.size();
+                m.note = rd.get_string();
+                if (rd.ok) r->resumes_.push_back(std::move(m));
             }
         }
         r->in_.seekg(static_cast<std::streamoff>(payload_at + size));
         if (!r->in_) break;
+        r->complete_bytes_ = payload_at + size;
     }
     r->in_.clear();
     if (!have_header) return make_error(Errc::protocol, path + " has no session header");

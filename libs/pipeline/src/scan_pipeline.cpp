@@ -347,6 +347,7 @@ void ScanPipeline::restart_recording(bool delete_current) {
     stats_.recorded_frames = 0;
     stats_.raw_frames = 0;
     raw_dropped_ = 0;
+    continuation_ = {};
 }
 
 session::SessionWriter* ScanPipeline::ensure_recorder() {
@@ -398,7 +399,11 @@ void ScanPipeline::set_temperature(float celsius) {
 
 void ScanPipeline::record_dropped(const usb::FrameGroup& group, std::string reason) {
     std::lock_guard lock(recorder_mutex_);
-    if (auto* w = ensure_recorder()) w->write_dropped({group.frame_id, static_cast<double>(group.timestamp) * 1e-6, std::move(reason)});
+    if (auto* w = ensure_recorder()) {
+        session::DroppedFrame d{group.frame_id, static_cast<double>(group.timestamp) * 1e-6, std::move(reason)};
+        continue_numbering(d.index, d.timestamp_s);
+        w->write_dropped(d);
+    }
 }
 
 void ScanPipeline::record(const track::TrackResult& r, const DepthOutput& depth) {
@@ -407,6 +412,7 @@ void ScanPipeline::record(const track::TrackResult& r, const DepthOutput& depth)
     session::FrameRecord rec;
     rec.index = depth.frame.index;
     rec.timestamp_s = depth.frame.timestamp_s;
+    continue_numbering(rec.index, rec.timestamp_s);
     rec.flags = (r.accepted ? session::frame_accepted : 0u) | (r.degenerate ? session::frame_degenerate : 0u) |
                 (r.relocalized ? session::frame_relocalized : 0u) | (r.marker_pose ? session::frame_marker_pose : 0u) |
                 (r.integrated ? session::frame_integrated : 0u) |
@@ -512,6 +518,7 @@ void ScanPipeline::push(usb::FrameGroup&& group) {
         for (int sensor = 0; sensor < 2; ++sensor)
             if (const auto& sf = group.sensors[static_cast<std::size_t>(sensor)]) raw.images.emplace_back(sensor, sf->pixels);
         std::lock_guard lock(recorder_mutex_);
+        continue_numbering(raw.index, raw.timestamp_s);
         if (auto* w = ensure_recorder(); w && !w->write_raw(std::move(raw))) {
             if (raw_dropped_++ % 50 == 0) log::warn("recording: disk too slow for raw IR, {} raw frames not written", raw_dropped_.load());
         }
@@ -575,6 +582,128 @@ ModelSnapshot ScanPipeline::snapshot_model() {
     }
     stats_.model_points = m.size();
     return m;
+}
+
+void ScanPipeline::continue_numbering(std::uint64_t& index, double& timestamp_s) {
+    auto& c = continuation_;
+    if (c.pending && recorder_) {
+        // The scanner numbers frames and keeps time from its own start: move the new frames past the recording's.
+        c.index_offset = static_cast<std::int64_t>(c.next_index) - static_cast<std::int64_t>(index);
+        c.time_offset_s = c.next_time_s - timestamp_s;
+        c.pending = false;
+        c.active = true;
+        recorder_->write_resume(c.frames_before, std::format("scanning resumed after {} frames", c.frames_before));
+        log::info("recording: resumed {} after {} frames", recorder_->path(), c.frames_before);
+    }
+    if (!c.active) return;
+    index = static_cast<std::uint64_t>(static_cast<std::int64_t>(index) + c.index_offset);
+    timestamp_s += c.time_offset_s;
+}
+
+void ScanPipeline::load_recording(std::string recording, std::function<void(LoadResult)> done) {
+    post([this, path = std::move(recording), on_done = std::move(done)] {
+        LoadResult res;
+        res.path = path;
+        auto reader = session::SessionReader::open(path);
+        if (!reader) {
+            res.error = reader.error().message;
+            if (on_done) on_done(std::move(res));
+            return;
+        }
+        const auto& rd = **reader;
+        // A clean slate: the current recording is closed (and kept), the model and tracking state cleared.
+        edits_.clear();
+        reset_requested_ = false;
+        restart_recording(false);
+        tracker_.reset(false);
+        cache_.clear();
+        {
+            std::lock_guard lock(trajectory_mutex_);
+            trajectory_.clear();
+        }
+        if (phase_ != ScanPhase::surface) {
+            phase_ = ScanPhase::surface;
+            apply_phase();
+        }
+        // Continuing it needs the same depth camera (and scanner, when both are known): the process step reads
+        // every frame with the recording's one set of intrinsics.
+        const auto& k = rd.header().depth_intrinsics;
+        const auto live = frontend_->depth_intrinsics();
+        res.resumable = k.width == live.width && k.height == live.height && std::abs(k.fx - live.fx) < 1e-6 && std::abs(k.cx - live.cx) < 1e-6 &&
+                        std::abs(k.cy - live.cy) < 1e-6;
+        {
+            std::lock_guard lock(recorder_mutex_);
+            if (rd.device() && device_record_ && rd.device()->serial != device_record_->serial) res.resumable = false;
+        }
+        if (!res.resumable) res.note = "recorded with another scanner or calibration: it can be viewed, edited and processed; a new scan starts a new recording";
+
+        // The model: every frame live tracking fused, again at its live pose (erases applied).
+        std::map<int, std::pair<Vec3, int>> seen;  // marker map id -> sum of world positions, count
+        std::map<int, double> diameters;
+        std::optional<SE3> last_pose;
+        std::uint64_t last_index = 0;
+        double last_time = 0;
+        std::vector<SE3> trail;
+        res.frames = rd.frame_count();
+        for (std::size_t i = 0; i < rd.frame_count(); ++i) {
+            const auto& meta = rd.meta(i);
+            last_index = std::max(last_index, meta.index);
+            last_time = std::max(last_time, meta.timestamp_s);
+            if (!meta.accepted()) continue;
+            last_pose = meta.T_world_camera;
+            trail.push_back(meta.T_world_camera);
+            for (const auto& m : meta.markers)
+                if (m.map_id >= 0) {
+                    auto& acc = seen[m.map_id];
+                    acc.first += meta.T_world_camera * m.position;
+                    ++acc.second;
+                    diameters[m.map_id] += m.diameter;
+                }
+            if (!(meta.flags & session::frame_integrated) || (meta.flags & session::frame_global_marker_capture)) continue;
+            auto f = rd.read(i);
+            if (!f) continue;
+            tracker_.volume().integrate(f->depth_frame(k), f->T_world_camera);
+            ++res.fused;
+        }
+        // The marker map: a recorded global map as it was (fixed), the rest averaged over their sightings.
+        std::vector<markers::MapMarker> map = rd.global_markers();
+        for (const auto& [id, acc] : seen) {
+            if (std::ranges::any_of(map, [id](const markers::MapMarker& m) { return m.id == id; })) continue;
+            map.push_back({id, acc.first / acc.second, diameters[id] / acc.second, acc.second, false});
+        }
+        res.markers = static_cast<int>(map.size());
+        {
+            std::lock_guard lock(global_mutex_);
+            global_map_ = rd.global_markers();
+        }
+        tracker_.resume(last_pose.value_or(SE3::Identity()), std::move(map));
+        {
+            std::lock_guard lock(trajectory_mutex_);
+            trajectory_ = std::move(trail);
+        }
+        // The recording stays the session file: edits and new frames are appended to it.
+        {
+            std::lock_guard lock(recorder_mutex_);
+            {
+                auto w = session::SessionWriter::append(path);
+                if (w) {
+                    recorder_ = std::move(*w);
+                    continuation_ = {};
+                    continuation_.pending = res.resumable;
+                    continuation_.next_index = last_index + 1;
+                    continuation_.next_time_s = last_time + 10.0;  // a gap: processing starts a new fragment there
+                    continuation_.frames_before = rd.frame_count();
+                } else {
+                    res.note = "cannot append to it (" + w.error().message + "): edits and new frames are not recorded";
+                    res.resumable = false;
+                }
+            }
+        }
+        res.model = snapshot_model();
+        res.ok = true;
+        log::info("loaded {}: {} frames, {} fused, {} markers{}", path, res.frames, res.fused, res.markers, res.resumable ? "" : " (not resumable)");
+        if (on_done) on_done(std::move(res));
+    });
 }
 
 void ScanPipeline::erase(LassoSelection selection, std::function<void(EditResult)> done) {

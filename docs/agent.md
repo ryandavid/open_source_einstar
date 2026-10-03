@@ -54,6 +54,7 @@ scan_state()                                   # connection, workflow, HUD, reco
 ui_screenshot(app="scan")                      # an image of the window
 edit_select(polygon=[[500,250],[760,250],[760,600],[500,600]]); edit_delete()
 process_run(); process_status(); process_export(path="/tmp/scan.stl")
+scan_open(path="scan.estr")                    # a recording as a paused scan: edit, process, or connect and resume
 app_launch(app="calibration"); calib_connect(emulator=true); calib_state()
 ```
 

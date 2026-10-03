@@ -265,3 +265,43 @@ TEST_CASE("an erase removes the selected depth from the frames before it, an und
     CHECK_FALSE(any_left);
     std::filesystem::remove(path);
 }
+
+TEST_CASE("a recording is continued: appended after its last complete record, the join marked") {
+    const auto path = (std::filesystem::temp_directory_path() / "einstar_test_resume.estr").string();
+    std::mt19937 rng(5);
+    session::SessionHeader h;
+    h.depth_intrinsics = {64, 48, 58.0, 58.0, 32.0, 24.0};
+    h.description = "resume test";
+    {
+        auto w = session::SessionWriter::create(path, h);
+        REQUIRE(w.has_value());
+        for (std::uint64_t i = 0; i < 10; ++i) (*w)->write(make_frame(i, rng));
+        (*w)->close();
+    }
+    // A crash cut the last record short.
+    const auto full = std::filesystem::file_size(path);
+    std::filesystem::resize_file(path, full - 100);
+    {
+        auto r = session::SessionReader::open(path);
+        REQUIRE(r.has_value());
+        CHECK((*r)->frame_count() == 9);
+        CHECK((*r)->complete_bytes() < full - 100);
+    }
+    {
+        auto w = session::SessionWriter::append(path);
+        REQUIRE(w.has_value());
+        (*w)->write_resume(9, "resumed");
+        for (std::uint64_t i = 100; i < 105; ++i) (*w)->write(make_frame(i, rng));
+        (*w)->close();
+    }
+    auto r = session::SessionReader::open(path);
+    REQUIRE(r.has_value());
+    CHECK((*r)->header().description == "resume test");
+    REQUIRE((*r)->frame_count() == 14);
+    CHECK((*r)->meta(9).index == 100);
+    REQUIRE((*r)->resumes().size() == 1);
+    CHECK((*r)->resumes()[0].frames_before == 9);
+    CHECK((*r)->resumes()[0].note == "resumed");
+    CHECK((*r)->complete_bytes() == std::filesystem::file_size(path));
+    REQUIRE((*r)->read(13).has_value());
+}

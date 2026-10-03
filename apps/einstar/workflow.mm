@@ -91,12 +91,32 @@ namespace {
 
 // ---- the steps ----
 
+// Opens a recording as a paused scan (with or without the scanner connected).
+void open_recording(AppState& state, WorkflowUi& ui) {
+    const auto path = choose_file(@"A scan (.estr) to view, edit, process or continue scanning");
+    if (path.empty()) return;
+    state.open_recording(path);
+    ui.scanned = {};
+    enter_step(state, ui, Step::scan);
+}
+
 void connect_step(AppState& state, WorkflowUi& ui) {
     const auto c = state.connection();
     if (c.kind == Connection::Kind::none) {
         ImGui::TextWrapped("Plug the Einstar in (USB) and close EXStar, then connect.");
         if (big_button("Connect scanner", kGreen) && state.connect(false)) enter_step(state, ui, Step::scan_type);
         if (ImGui::Button("Use the emulator instead", ImVec2(-1, 0)) && state.connect(true)) enter_step(state, ui, Step::scan_type);
+        if (ImGui::Button("Open a recorded scan...", ImVec2(-1, 0))) open_recording(state, ui);
+        if (!c.error.empty()) ImGui::TextColored(kRed, "%s", c.error.c_str());
+        return;
+    }
+    if (c.kind == Connection::Kind::recording) {
+        ImGui::TextColored(kBlue, "A recording, no scanner");
+        ImGui::TextWrapped("%s", c.device.c_str());
+        ImGui::TextWrapped("Connect the scanner it was made with to continue scanning it.");
+        if (big_button("Connect scanner", kGreen) && state.connect(false)) enter_step(state, ui, Step::scan);
+        if (ImGui::Button("Use the emulator instead", ImVec2(-1, 0)) && state.connect(true)) enter_step(state, ui, Step::scan);
+        if (ImGui::Button("Continue", ImVec2(-1, 0))) enter_step(state, ui, Step::scan);
         if (!c.error.empty()) ImGui::TextColored(kRed, "%s", c.error.c_str());
         return;
     }
@@ -207,19 +227,35 @@ void scan_step(AppState& state, WorkflowUi& ui) {
     const bool scanning = state.scanning();
     ImGui::Text("Mode: %s%s", ui.type == ScanType::surface ? "surface only" : "surface + markers",
                 hud.global_markers > 0 ? std::format(", locked to {} global markers", hud.global_markers).c_str() : "");
-    if (!scanning) {
-        if (big_button(hud.frames > 0 ? "Resume scanning" : "Start scanning", kRed)) state.start_scan();
+    const auto load = state.load_status();
+    const bool offline = state.connection().kind == Connection::Kind::recording;
+    if (load.loading) {
+        ImGui::TextColored(kBlue, "%s ...", load.message.c_str());
+    } else if (!scanning) {
+        if (offline) {
+            ImGui::TextWrapped("No scanner: connect it to continue this scan.");
+            if (big_button("Connect scanner to continue", kGreen)) (void)state.connect(false);
+        } else if (load.loaded && !load.resumable) {
+            ImGui::TextColored(kAmber, "This recording was made with another scanner or calibration: start a new scan to scan.");
+        } else if (big_button(hud.frames > 0 || load.loaded ? "Resume scanning" : "Start scanning", kRed)) {
+            state.start_scan();
+        }
     } else if (big_button("Pause", kAmber)) {
         state.stop_scan();
     }
-    ImGui::TextDisabled("(or the scanner's start / pause button)");
+    if (!offline) ImGui::TextDisabled("(or the scanner's start / pause button)");
+    if (!load.message.empty() && !load.loading) ImGui::TextWrapped("%s", load.message.c_str());
     const auto path = state.recording_path();
     if (!path.empty())
         ImGui::TextWrapped("Recording %s (%llu frames)", std::filesystem::path(path).filename().c_str(),
-                           static_cast<unsigned long long>(hud.recorded_frames));
-    if (!scanning && hud.recorded_frames > 0) edit_section(state);
+                           static_cast<unsigned long long>(load.loaded ? load.frames + hud.recorded_frames : hud.recorded_frames));
+    const bool have_scan = hud.recorded_frames > 0 || load.loaded;
+    if (!scanning && !load.loading && have_scan) edit_section(state);
+    ImGui::BeginDisabled(scanning || load.loading);
+    if (ImGui::Button("Open a recorded scan...", ImVec2(-1, 0))) open_recording(state, ui);
+    ImGui::EndDisabled();
     ImGui::Separator();
-    ImGui::BeginDisabled(scanning || hud.recorded_frames == 0);
+    ImGui::BeginDisabled(scanning || load.loading || !have_scan);
     if (big_button("Finish: process the scan", kGreen)) enter_step(state, ui, Step::process);
     ImGui::EndDisabled();
     ImGui::BeginDisabled(scanning);
@@ -334,9 +370,18 @@ void draw_status_banner(const AppState& state, const WorkflowUi& ui) {
     const bool scanning = state.scanning();
     std::string text, detail;
     ImVec4 colour = kGrey;
+    const auto load = state.load_status();
     if (c.kind == Connection::Kind::none) {
         text = "NOT CONNECTED";
         detail = "Connect the scanner (step 1)";
+    } else if (load.loading) {
+        text = "OPENING THE RECORDING";
+        detail = load.message;
+        colour = kBlue;
+    } else if (c.kind == Connection::Kind::recording && !ps.running) {
+        text = "RECORDING OPEN";
+        detail = std::format("{} frames: view, edit or process it; connect the scanner to continue scanning", load.frames);
+        colour = kBlue;
     } else if (c.kind == Connection::Kind::scanner && !c.online) {
         text = "SCANNER OFFLINE";
         detail = "Reconnecting...";
@@ -393,7 +438,9 @@ void draw_status_banner(const AppState& state, const WorkflowUi& ui) {
     ImGui::SetWindowFontScale(1.0f);
     ImGui::TextUnformatted(detail.c_str());
     if (c.kind != Connection::Kind::none)
-        ImGui::TextDisabled("%s", c.kind == Connection::Kind::emulator ? "Emulator (no scanner attached)" : c.device.c_str());
+        ImGui::TextDisabled("%s", c.kind == Connection::Kind::emulator ? "Emulator (no scanner attached)"
+                                  : c.kind == Connection::Kind::recording ? "No scanner (a recording)"
+                                                                          : c.device.c_str());
     ImGui::End();
 }
 

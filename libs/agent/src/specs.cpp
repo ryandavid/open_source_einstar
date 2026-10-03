@@ -125,6 +125,12 @@ std::vector<MethodSpec> build() {
         object({{"type", one_of({"hybrid", "surface", "global_markers"}, "The type.")}}, {"type"}));
     add("scan.start", scan, mutating, "Starts or resumes scanning (opens the scan step).");
     add("scan.pause", scan, mutating, "Pauses scanning; the model and recording are kept.");
+    add("scan.open", scan, mutating,
+        "Opens a recording (.estr) as a paused scan: its model is rebuilt from the recorded poses, and it can be viewed, "
+        "edited (edit.*) and processed without a scanner. With the scanner it was made with connected, scan.start "
+        "continues it: the scanner finds its place on the model and new frames are appended to the same file. Answers "
+        "when loaded, or with loading=true if it takes longer (then scan.state's 'load').",
+        object({{"path", str("The .estr file.")}}, {"path"}));
     add("scan.new", scan, mutating, "A new scan: clears the model and starts a new recording.",
         object({{"discard", boolean("Delete the current recording (default false: it is kept).")}}));
     add("scan.settings", scan, mutating,

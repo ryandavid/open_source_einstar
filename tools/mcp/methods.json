@@ -517,6 +517,25 @@
   },
   {
     "app": "scan",
+    "description": "Opens a recording (.estr) as a paused scan: its model is rebuilt from the recorded poses, and it can be viewed, edited (edit.*) and processed without a scanner. With the scanner it was made with connected, scan.start continues it: the scanner finds its place on the model and new frames are appended to the same file. Answers when loaded, or with loading=true if it takes longer (then scan.state's 'load').",
+    "kind": "mutating",
+    "name": "scan.open",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "description": "The .estr file.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "scan",
     "description": "A new scan: clears the model and starts a new recording.",
     "kind": "mutating",
     "name": "scan.new",

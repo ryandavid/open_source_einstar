@@ -1,9 +1,11 @@
 #include "app_state.hpp"
 
 #include <algorithm>
+#include <filesystem>
 #include <format>
 
 #include "einstar/session/session.hpp"
+#include "einstar/synth/demo.hpp"
 
 #include "einstar/core/log.hpp"
 
@@ -106,6 +108,12 @@ bool AppState::export_mesh(const std::string& path) {
 
 bool AppState::connect(bool emulator) {
     if (scanning()) stop_scan();
+    // A recording opened without a scanner goes on in the scanner's session (loaded again there).
+    std::string reopen;
+    {
+        std::lock_guard lock(mutex_);
+        if (session_ && session_->offline() && load_.loaded) reopen = load_.path;
+    }
     session_.reset();
     trail_.clear();
     auto s = Session::open(
@@ -127,7 +135,86 @@ bool AppState::connect(bool emulator) {
     error_.clear();
     session_ = std::move(*s);
     log::info("{}", session_->description());
+    if (!reopen.empty()) open_recording(reopen);
     return true;
+}
+
+void AppState::open_recording(const std::string& path) {
+    if (process_status().running) return;
+    if (scanning()) stop_scan();
+    if (!session_) {
+        // No scanner: a pipeline with the recording's own calibration.
+        auto reader = session::SessionReader::open(path);
+        if (!reader) {
+            std::lock_guard lock(mutex_);
+            load_ = {};
+            load_.path = path;
+            load_.message = reader.error().message;
+            return;
+        }
+        session::DeviceRecord recorded = (*reader)->device().value_or(session::DeviceRecord{});
+        if (!(*reader)->device()) recorded.rig = synth::synthetic_einstar_rig();
+        auto s = Session::open_offline(recorded, [this](pipeline::LiveUpdate&& u) { on_live_update(std::move(u)); });
+        if (!s) {
+            std::lock_guard lock(mutex_);
+            load_ = {};
+            load_.path = path;
+            load_.message = s.error().message;
+            return;
+        }
+        session_ = std::move(*s);
+    }
+    clear_selection();
+    {
+        std::lock_guard lock(mutex_);
+        load_ = {};
+        load_.loading = true;
+        load_.path = path;
+        load_.message = "Loading " + std::filesystem::path(path).filename().string();
+        edit_ = {};
+        trail_.clear();
+        mesh_.reset();
+        process_ = {};
+        if (!pending_) pending_.emplace();
+        pending_->mesh = std::pair<std::vector<render::MeshVertex>, std::vector<std::uint32_t>>{};
+    }
+    session_->pipeline().load_recording(path, [this](pipeline::LoadResult r) { on_loaded(std::move(r)); });
+}
+
+void AppState::on_loaded(pipeline::LoadResult&& r) {
+    const auto trajectory = session_->pipeline().trajectory();
+    std::lock_guard lock(mutex_);
+    load_.loading = false;
+    load_.loaded = r.ok;
+    load_.frames = r.frames;
+    load_.fused = r.fused;
+    load_.markers = r.markers;
+    load_.resumable = r.ok && r.resumable;
+    const auto name = std::filesystem::path(r.path).filename().string();
+    if (!r.ok) {
+        load_.message = std::format("Could not open {}: {}", name, r.error);
+        return;
+    }
+    load_.message = std::format("Opened {}: {} frames, {} fused, {} markers{}", name, r.frames, r.fused, r.markers, r.note.empty() ? "" : "; " + r.note);
+    hud_.model_points = r.model.size();
+    hud_.map_markers = r.markers;
+    trail_.clear();
+    for (const auto& T : trajectory) trail_.push_back(T.translation().cast<float>());
+    if (!pending_) pending_.emplace();
+    if (r.model.buffer) {
+        pending_->model_gpu = GpuPoints{r.model.buffer, r.model.buffer_count};
+        pending_->model.reset();
+    } else {
+        pending_->model = r.model.points;
+        pending_->model_gpu.reset();
+    }
+    pending_->frame_points.clear();
+    log::info("{}", load_.message);
+}
+
+LoadStatus AppState::load_status() const {
+    std::lock_guard lock(mutex_);
+    return load_;
 }
 
 void AppState::disconnect() {
@@ -144,7 +231,7 @@ Connection AppState::connection() const {
     Connection c;
     c.error = error_;
     if (!session_) return c;
-    c.kind = session_->emulated() ? Connection::Kind::emulator : Connection::Kind::scanner;
+    c.kind = session_->offline() ? Connection::Kind::recording : session_->emulated() ? Connection::Kind::emulator : Connection::Kind::scanner;
     c.online = session_->online();
     const auto& i = session_->info();
     c.device = std::format("{}{}, serial {}, firmware {}", i.product_name, session_->emulated() ? " (emulated)" : "", i.serial, i.firmware);
@@ -161,6 +248,7 @@ void AppState::new_scan(bool discard) {
     clear_selection();
     std::lock_guard lock(mutex_);
     edit_ = {};
+    load_ = {};
     trail_.clear();
     if (!pending_) pending_.emplace();
     pending_->model = std::vector<render::PointVertex>{};
@@ -176,6 +264,15 @@ std::string AppState::status() const {
 
 void AppState::start_scan() {
     if (!session_) return;
+    {
+        std::lock_guard lock(mutex_);
+        if (load_.loading) return;
+        if (load_.loaded && !load_.resumable) {
+            error_ = "this recording was made with another scanner or calibration: start a new scan to scan";
+            log::warn("start scan: {}", error_);
+            return;
+        }
+    }
     clear_selection();
     {
         std::lock_guard lock(mutex_);
@@ -201,6 +298,7 @@ void AppState::clear_model() {
     clear_selection();
     std::lock_guard lock(mutex_);
     edit_ = {};
+    load_ = {};
     trail_.clear();
     if (!pending_) pending_.emplace();
     pending_->model = std::vector<render::PointVertex>{};

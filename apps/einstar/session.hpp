@@ -1,7 +1,8 @@
 #pragma once
 
 // A connected scanner (real over USB, or the emulator when none is attached) plus the live
-// scan pipeline fed by it.
+// scan pipeline fed by it; or, with no scanner, a pipeline holding a loaded recording (to view, edit and
+// process it).
 
 #include <functional>
 #include <memory>
@@ -29,14 +30,17 @@ public:
 
     // Opens the first attached scanner (an error if there is none), or the emulator.
     static Result<std::unique_ptr<Session>> open(bool emulator, UpdateSink updates, ButtonSink buttons);
+    // No scanner: a pipeline with the recording's own calibration, for a recording loaded to view, edit and process.
+    static Result<std::unique_ptr<Session>> open_offline(const session::DeviceRecord& recorded, UpdateSink updates);
+    [[nodiscard]] bool offline() const { return device_ == nullptr; }
     ~Session();
 
     [[nodiscard]] const std::string& description() const { return description_; }
     [[nodiscard]] bool emulated() const { return emulated_; }
-    [[nodiscard]] const device::DeviceInfo& info() const { return device_->info(); }
+    [[nodiscard]] const device::DeviceInfo& info() const { return device_ ? device_->info() : offline_info_; }
     [[nodiscard]] bool scanning() const { return scanning_; }
     // False while the scanner is off the bus (it is reopened and its settings replayed automatically).
-    [[nodiscard]] bool online() const { return device_->online(); }
+    [[nodiscard]] bool online() const { return device_ && device_->online(); }
     [[nodiscard]] const std::string& calibration() const { return calibration_; }
 
     Result<void> start_scan(const ScanSettings& s);
@@ -44,7 +48,10 @@ public:
     Result<void> apply(const ScanSettings& s);
     void reset_model(bool discard = true) { pipeline_->reset_model(discard); }
     [[nodiscard]] pipeline::ScanPipeline& pipeline() { return *pipeline_; }
-    Result<double> temperature() { return device_->temperature_c(); }
+    Result<double> temperature() {
+        if (!device_) return make_error(Errc::unsupported, "no scanner connected");
+        return device_->temperature_c();
+    }
     void set_distance_indication(float mean_depth_mm);
 
 private:
@@ -58,6 +65,7 @@ private:
     bool scanning_ = false;
     int last_zone_ = -1;
     std::shared_ptr<void> emulator_state_;  // keeps the emulator scene alive
+    device::DeviceInfo offline_info_;        // a recording's scanner, when there is none
 };
 
 }  // namespace einstar::app

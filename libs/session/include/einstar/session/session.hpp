@@ -17,6 +17,9 @@
 //         depth whose point (at the frame's live pose) the selection contains; it follows every frame
 //         submitted before it (the writer flushes first)
 //   UNDO  cancels an erase
+//   RESM  the scan was loaded and scanning resumed: frames after it continue the same model (in the same world
+//         frame, relocalised against it), their timestamps moved past the earlier ones by a gap, so processing
+//         treats the join like a tracking gap
 // Readers skip record types they do not know, so new kinds can be added without breaking old
 // files or old readers. A reader tolerates a truncated last record (e.g. after a crash).
 
@@ -153,6 +156,12 @@ struct SessionErase {
     LassoSelection selection;
 };
 
+// Where a recording was resumed.
+struct ResumeMark {
+    std::size_t frames_before = 0;  // frames in the file before it
+    std::string note;
+};
+
 // Depth / confidence of a frame from its CPU images or GPU buffers.
 void capture_depth(const track::DepthFrame& frame, ImageF32& depth, ImageF32& confidence);
 
@@ -160,6 +169,9 @@ void capture_depth(const track::DepthFrame& frame, ImageF32& depth, ImageF32& co
 class SessionWriter {
 public:
     static Result<std::unique_ptr<SessionWriter>> create(const std::string& path, const SessionHeader& header);
+    // Continues an existing recording: records go after its last complete one (a record cut short by a crash is
+    // trimmed first, or it would hide everything written after it).
+    static Result<std::unique_ptr<SessionWriter>> append(const std::string& path);
     ~SessionWriter();
 
     void write(FrameRecord frame);
@@ -169,6 +181,8 @@ public:
     // Edits: an erase covers every frame submitted before it (waits until they are on disk first).
     void write_erase(std::uint32_t id, const LassoSelection& selection);
     void write_undo(std::uint32_t id);
+    // Marks where scanning resumed on a loaded recording.
+    void write_resume(std::uint64_t frames_before, const std::string& note);
     // Raw images are compressed on the writer thread. Returns false (and drops the frame) when more
     // than `max_raw_backlog` are waiting, so a slow disk cannot grow memory without bound.
     bool write_raw(RawFrame frame, std::size_t max_raw_backlog = 48);
@@ -218,6 +232,9 @@ public:
     [[nodiscard]] const std::vector<markers::MapMarker>& global_markers() const { return global_markers_; }
     [[nodiscard]] const std::optional<DeviceRecord>& device() const { return device_; }
     [[nodiscard]] const std::vector<DroppedFrame>& dropped() const { return dropped_; }
+    [[nodiscard]] const std::vector<ResumeMark>& resumes() const { return resumes_; }
+    // Bytes up to the end of the last complete record (the rest is a record cut short).
+    [[nodiscard]] std::uint64_t complete_bytes() const { return complete_bytes_; }
     // Raw IR frames (optional): index / timestamp without decoding, and the full images on demand.
     [[nodiscard]] std::size_t raw_count() const { return raws_.size(); }
     [[nodiscard]] std::uint64_t raw_index(std::size_t i) const { return raws_[i].index; }
@@ -239,6 +256,8 @@ private:
     std::optional<DeviceRecord> device_;
     std::vector<DroppedFrame> dropped_;
     std::vector<SessionErase> erasures_;
+    std::vector<ResumeMark> resumes_;
+    std::uint64_t complete_bytes_ = 8;
     struct RawBlock {
         std::uint64_t index = 0;
         double timestamp_s = 0;

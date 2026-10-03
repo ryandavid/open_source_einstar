@@ -156,7 +156,25 @@ Result<std::unique_ptr<Session>> Session::open(bool emulator, UpdateSink updates
     return s;
 }
 
+Result<std::unique_ptr<Session>> Session::open_offline(const session::DeviceRecord& recorded, UpdateSink updates) {
+    auto s = std::unique_ptr<Session>(new Session());
+    pipeline::ScanPipelineParams pp;
+    pp.block_when_full = true;
+    s->pipeline_ = std::make_unique<pipeline::ScanPipeline>(std::make_unique<pipeline::StereoFrontend>(recorded.rig), pp, std::move(updates));
+    s->pipeline_->set_device_record(recorded);
+    s->pipeline_->start();
+    s->offline_info_.vendor_name = recorded.vendor;
+    s->offline_info_.product_name = recorded.product.empty() ? "Einstar" : recorded.product;
+    s->offline_info_.serial = recorded.serial;
+    s->offline_info_.firmware = recorded.firmware;
+    s->calibration_ = "from the recording";
+    s->description_ = std::format("No scanner: a recording of {} (serial {}); connect the scanner to continue scanning", s->offline_info_.product_name,
+                                  recorded.serial.empty() ? "unknown" : recorded.serial);
+    return s;
+}
+
 Result<void> Session::apply(const ScanSettings& st) {
+    if (!device_) return {};
     // Sensors 0 and 1 share one exposure register; gain is per sensor.
     if (auto r = device_->set_exposure(0, static_cast<std::uint32_t>(st.exposure)); !r) return r;
     for (int sensor = 0; sensor < 2; ++sensor)
@@ -186,6 +204,7 @@ Result<void> Session::apply(const ScanSettings& st) {
 
 Result<void> Session::start_scan(const ScanSettings& st) {
     if (scanning_) return {};
+    if (!device_) return make_error(Errc::disconnected, "no scanner connected: connect the scanner (or the emulator) to continue scanning");
     if (auto r = apply(st); !r) return r;
     if (auto r = device_->configure_scan_mode(st.trigger_period_us); !r) return r;
     auto r = device_->start_stream([this](usb::FrameGroup&& g) { pipeline_->push(std::move(g)); });
@@ -195,7 +214,7 @@ Result<void> Session::start_scan(const ScanSettings& st) {
 }
 
 void Session::stop_scan() {
-    if (!scanning_) return;
+    if (!scanning_ || !device_) return;
     (void)device_->set_trigger(0, 0);
     (void)device_->set_laser_percent(0);
     (void)device_->set_strobe(0, 0);
@@ -204,6 +223,7 @@ void Session::stop_scan() {
 }
 
 void Session::set_distance_indication(float mean_depth_mm) {
+    if (!device_) return;
     // The top LED: red when too near, green in the 250-450 mm sweet spot, blue when too far.
     const int zone = mean_depth_mm <= 0 ? last_zone_ : mean_depth_mm < 250 ? 0 : mean_depth_mm > 450 ? 2 : 1;
     if (zone < 0 || zone == last_zone_) return;

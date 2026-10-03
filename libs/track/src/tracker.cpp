@@ -28,6 +28,20 @@ void Tracker::reset(bool keep_fixed_markers) {
     have_velocity_ = false;
 }
 
+void Tracker::resume(const SE3& last_pose, std::vector<markers::MapMarker> map) {
+    map_.set_markers(std::move(map));
+    if (reloc_) reloc_->clear();
+    feature_model_bricks_ = 0;  // the descriptor model is built from the loaded surface on the first query
+    feature_model_frame_ = frame_no_;
+    initial_pose_.reset();
+    last_pose_ = prev_pose_ = lost_pose_ = last_pose;
+    have_velocity_ = false;
+    confirm_count_ = 0;
+    lost_frames_ = 0;
+    accepted_since_start_ = params_.restart_if_lost_within;  // a model worth keeping: never start over
+    state_ = TrackState::lost;
+}
+
 SE3 Tracker::predict(double t) const {
     if (!have_velocity_ || last_time_ <= prev_time_) return last_pose_;
     // Constant velocity in the camera frame, scaled by the elapsed time (capped so a long gap

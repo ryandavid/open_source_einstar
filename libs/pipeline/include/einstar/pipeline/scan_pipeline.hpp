@@ -126,6 +126,21 @@ struct EditResult {
     ModelSnapshot model;            // the live model now
 };
 
+// A recording loaded as the live model (ScanPipeline::load_recording).
+struct LoadResult {
+    bool ok = false;
+    std::string error;
+    std::string path;
+    std::size_t frames = 0;  // in the recording
+    std::size_t fused = 0;   // fused into the model (the frames live tracking fused)
+    int markers = 0;         // in the rebuilt marker map
+    // Scanning can continue it: recorded with this depth camera (and scanner, when known). Otherwise it can be
+    // viewed, edited and processed, and a new scan starts a new recording.
+    bool resumable = false;
+    std::string note;
+    ModelSnapshot model;
+};
+
 struct ScanPipelineParams {
     track::TrackerParams tracker;
     std::size_t queue_capacity = 16;  // ~1 s at 14.7 Hz: rides out stalls without dropping frames
@@ -172,6 +187,12 @@ public:
     // `undo_erase` reverts the last erase; erases are final once the next frame is processed.
     void erase(LassoSelection selection, std::function<void(EditResult)> done);
     void undo_erase(std::function<void(EditResult)> done);
+    // Makes a recording the live model, as a paused scan: the frames live tracking fused are fused again at their
+    // live poses, the marker map is rebuilt from the markers they identified, and the tracker relocalises the next
+    // frames against it. The recording stays the session file: edits and (when resumable) new frames are appended
+    // to it, the new frames' timestamps moved past the earlier ones by a gap so processing sees the join as a
+    // tracking gap. `done` is called on the worker thread.
+    void load_recording(std::string path, std::function<void(LoadResult)> done);
 
     // Alignment used while scanning surfaces (geometry falls back to hybrid while a global map is set).
     void set_surface_mode(track::AlignMode mode);
@@ -214,6 +235,9 @@ private:
     [[nodiscard]] ModelSnapshot snapshot_model();  // the whole live model (refreshes the CPU cache)
     session::SessionWriter* ensure_recorder();    // creates the session file on first use (recorder_mutex_ held)
     void record_dropped(const usb::FrameGroup& group, std::string reason);
+    // A loaded recording's numbering continued: the first new frame sets the offsets (and marks the join);
+    // recorder_mutex_ held.
+    void continue_numbering(std::uint64_t& index, double& timestamp_s);
 
     std::unique_ptr<StereoFrontend> frontend_;
     ScanPipelineParams params_;
@@ -252,6 +276,16 @@ private:
     session::CaptureSettings capture_;                     // guarded by recorder_mutex_
     std::atomic<bool> record_raw_ir_{false};
     std::atomic<std::uint64_t> raw_dropped_{0};
+    // Continuing a loaded recording (guarded by recorder_mutex_).
+    struct Continuation {
+        bool pending = false;  // set at load; the first new frame fixes the offsets
+        bool active = false;
+        std::uint64_t next_index = 0;
+        double next_time_s = 0;
+        std::uint64_t frames_before = 0;
+        std::int64_t index_offset = 0;
+        double time_offset_s = 0;
+    } continuation_;
 
     std::mutex mutex_;
     std::condition_variable cv_;

@@ -60,6 +60,27 @@ def main() -> int:
         ok(m, "process_export", path=str(mesh))
         assert mesh.stat().st_size > 1000
 
+        # The recording again, in a new run: opened with no scanner, edited, then continued with the emulator.
+        recording = result(m, "scan_state")["recording"]["path"]
+        ok(m, "app_quit", app="scan")
+        ok(m, "app_launch", app="scan", data_dir=str(data))
+        opened = result(m, "scan_open", path=recording)
+        if opened["loading"]:
+            opened = until(m, "scan_state", lambda s: not s["load"]["loading"])["load"]
+        assert opened["loaded"] and opened["resumable"] and opened["frames"] >= 40, opened
+        state = result(m, "scan_state")
+        assert state["connection"]["kind"] == "recording" and state["hud"]["model_points"] > 0, state
+        assert m.call("scan_start", {}).is_error  # no scanner
+        ok(m, "edit_select", polygon=[[500, 250], [760, 250], [760, 600], [500, 600]])
+        assert result(m, "edit_delete")["undo_depth"] == 1
+        ok(m, "device_connect", emulator=True)  # reopens the recording with the scanner
+        until(m, "scan_state", lambda s: s["load"]["loaded"] and not s["load"]["loading"])
+        ok(m, "scan_start")
+        until(m, "scan_state", lambda s: s["recording"]["frames"] >= 20)
+        ok(m, "scan_pause")
+        state = result(m, "scan_state")
+        assert state["recording"]["path"] == recording, state["recording"]
+
         # The calibration app alongside it.
         ok(m, "app_launch", app="calibration", data_dir=str(data / "calibration"))
         ok(m, "calib_connect", emulator=True)

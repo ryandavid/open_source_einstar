@@ -36,7 +36,9 @@ variants on discrete GPUs.
 - **Scanner controls:** the start / pause and brightness buttons, the top LED as a distance indicator, and
   exposure, gain, projector and strobe settings.
 - **Recording:** every scan is saved to `~/Documents/Einstar/Scans/*.estr`: depth, poses, markers, the
-  calibration and capture settings, optionally the raw IR images.
+  calibration and capture settings, optionally the raw IR images. *Open a recorded scan...* brings one back
+  as a paused scan: to view, edit and process with no scanner attached, or to continue scanning it with the
+  scanner it was made with.
 - **Processing:**
   - pose-graph optimisation with loop closures and recovery of frames lost during scanning;
   - re-fusion with filtering of edge noise;

@@ -1,6 +1,8 @@
 #include "agent_methods.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <filesystem>
 #include <format>
 
 namespace einstar::app {
@@ -35,8 +37,16 @@ std::optional<E> from_name(const std::pair<E, const char*> (&table)[N], std::str
 json vec(const Eigen::Vector3f& v) { return {v.x(), v.y(), v.z()}; }
 
 json connection_json(const Connection& c) {
-    const char* kind = c.kind == Connection::Kind::scanner ? "scanner" : c.kind == Connection::Kind::emulator ? "emulator" : "none";
+    const char* kind = c.kind == Connection::Kind::scanner    ? "scanner"
+                       : c.kind == Connection::Kind::emulator  ? "emulator"
+                       : c.kind == Connection::Kind::recording ? "recording"
+                                                               : "none";
     return {{"kind", kind}, {"online", c.online}, {"device", c.device}, {"calibration", c.calibration}, {"error", c.error}};
+}
+
+json load_json(const LoadStatus& l) {
+    return {{"loading", l.loading}, {"loaded", l.loaded},       {"path", l.path},           {"frames", l.frames},
+            {"fused", l.fused},     {"markers", l.markers},     {"resumable", l.resumable}, {"message", l.message}};
 }
 
 json settings_json(const AppState& s) {
@@ -114,6 +124,7 @@ void register_scan_agent(agent::Server& server, ScanAgentHost h) {
                       {"temperature_c", hud.temperature_c > -273.0f ? json(hud.temperature_c) : json(nullptr)},
                       {"notice", hud.notice}}},
                     {"recording", {{"path", st.recording_path()}, {"frames", hud.recorded_frames}, {"raw_frames", hud.raw_frames}}},
+                    {"load", load_json(st.load_status())},
                     {"global_markers", st.global_marker_status()},
                     {"settings", settings_json(st)},
                     {"process", process_json(st.process_status())},
@@ -158,6 +169,23 @@ void register_scan_agent(agent::Server& server, ScanAgentHost h) {
         if (!st.scanning()) return refused("could not start: " + st.status());
         return json{{"scanning", true}, {"step", name_of(kSteps, ui.step)}};
     });
+    server.handle("scan.open", [&st, &ui](const json& p) -> Outcome {
+        const auto path = param<std::string>(p, "path");
+        if (st.scanning()) return refused("scanning: pause first");
+        if (st.process_status().running) return refused("processing: wait for it or process.cancel");
+        if (!std::filesystem::exists(path)) return agent::error(ErrorCode::not_found, "no such file: " + path);
+        st.open_recording(path);
+        ui.scanned = {};
+        enter_step(st, ui, Step::scan);
+        // Answers when loaded, or (a long recording) after a while with loading=true: scan.state tells the rest.
+        const auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(12);
+        return agent::Server::Poll([&st, give_up]() -> std::optional<agent::Result> {
+            const auto l = st.load_status();
+            if (l.loading && std::chrono::steady_clock::now() < give_up) return std::nullopt;
+            if (!l.loading && !l.loaded) return agent::Result(refused("could not open: " + l.message));
+            return agent::Result(load_json(l));
+        });
+    });
     server.handle("scan.pause", [&st](const json&) -> Outcome {
         st.stop_scan();
         return json{{"scanning", st.scanning()}};
@@ -200,7 +228,8 @@ void register_scan_agent(agent::Server& server, ScanAgentHost h) {
 
     server.handle("process.run", [&st, &ui](const json& p) -> Outcome {
         if (st.scanning()) return refused("scanning: pause first");
-        if (st.hud().recorded_frames == 0) return refused("nothing recorded yet");
+        if (st.hud().recorded_frames == 0 && !st.load_status().loaded) return refused("nothing recorded yet");
+        if (st.load_status().loading) return refused("still opening the recording");
         if (st.process_status().running) return refused("already processing");
         const auto res = opt_param<std::string>(p, "resolution_mm").value_or("0.5");
         if (res != "0.3" && res != "0.5" && res != "1.0") throw agent::Server::BadParams("resolution_mm is 0.3, 0.5 or 1.0");

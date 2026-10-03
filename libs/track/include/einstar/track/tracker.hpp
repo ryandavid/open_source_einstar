@@ -128,6 +128,10 @@ public:
     [[nodiscard]] const TrackerParams& params() const { return params_; }
     // Clears the model and tracking state; fixed (global) markers survive when asked to.
     void reset(bool keep_fixed_markers = false);
+    // Continues a model built elsewhere (a loaded recording, already fused into volume()) with this marker map:
+    // the next frames relocalise against it from `last_pose` as after a loss, and nothing is fused until one is
+    // confirmed on the model.
+    void resume(const SE3& last_pose, std::vector<markers::MapMarker> map);
 
 private:
     struct FrameMarkers {

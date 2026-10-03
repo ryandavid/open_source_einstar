@@ -36,6 +36,9 @@ Alongside the frames:
   so rescanning an erased area brings it back. The writer flushes before an erase, so it always follows
   the frames it covers.
 
+- `RESM`: where a recording opened again (below) continues: how many frame records came before, and a
+  note.
+
 Readers skip record types they do not know, so new kinds can be added without breaking old files or
 old readers. Records are length-prefixed, so a file truncated by a crash still loads up to its last
 complete record. `einstar-cli inspect <file>` summarises a session file.
@@ -51,6 +54,23 @@ step's clean-up of small pieces.
 A new file starts whenever the tracker's world frame restarts: Clear model (which also deletes the
 discarded recording), a new marker capture, or loading or discarding a global-marker map. Pausing
 and resuming a scan continues the same file.
+
+**Opening a recording** (Open a recorded scan..., `scan.open`). Opening a recording makes it a paused scan
+again, with or without a scanner (`ScanPipeline::load_recording`):
+- The live model is rebuilt from the frames live tracking fused, at their recorded poses, with erases
+  applied. The marker map is rebuilt from the recorded global map plus every other marker, averaged over
+  its sightings.
+- It can be viewed, edited with the lasso, and processed with no scanner connected. Its edits are appended
+  to the same file.
+- With the scanner it was made with (the same serial and rectification), Resume continues it. The tracker
+  starts out lost at the last recorded pose (`Tracker::resume`) and relocalises against the rebuilt model,
+  so the new frames share the old ones' world frame. They are appended to the same file
+  (`SessionWriter::append`, which first trims a record cut short by a crash).
+- The first new frame writes a `RESM` mark. New frames number on from the last recorded index, and their
+  timestamps start 10 s after the last one. The process step therefore sees a tracking gap at the join and
+  starts a new fragment there; loop closures tie the two sessions together.
+- A recording made with another scanner or calibration can be viewed, edited and processed, but not
+  continued; New scan starts a new one.
 
 ## Process step (`libs/recon`, `einstar-cli process`, the app's Process panel)
 

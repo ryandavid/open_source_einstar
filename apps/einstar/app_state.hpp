@@ -85,9 +85,20 @@ struct ProcessStatus {
     std::string summary;       // report of the last run (or its error)
 };
 
+// A recording opened as a paused scan.
+struct LoadStatus {
+    bool loading = false;
+    bool loaded = false;      // the live model is the recording's
+    std::string path;
+    std::size_t frames = 0, fused = 0;
+    int markers = 0;
+    bool resumable = false;   // scanning continues it (once the scanner is connected)
+    std::string message;      // the outcome, or why it cannot be resumed
+};
+
 // What the scanner connection is, for the UI.
 struct Connection {
-    enum class Kind { none, scanner, emulator } kind = Kind::none;
+    enum class Kind { none, scanner, emulator, recording } kind = Kind::none;  // recording: a loaded one, no scanner
     bool online = false;         // false while a real scanner is off the bus (it is reopened automatically)
     std::string device;          // product, serial, firmware
     std::string calibration;     // where the calibration came from
@@ -109,6 +120,11 @@ public:
     [[nodiscard]] std::string recording_path() const;
     // Starts a new scan (new recording and world frame). `discard` deletes the current recording.
     void new_scan(bool discard);
+    // Opens a recording (.estr) as a paused scan: its model rebuilt, to view, edit (a lasso delete is recorded in
+    // it) and process; scanning continues it once the scanner it was made with is connected. Works without a
+    // scanner. Runs in the background (load_status()).
+    void open_recording(const std::string& path);
+    [[nodiscard]] LoadStatus load_status() const;
 
     void start_scan();
     void stop_scan();
@@ -169,6 +185,8 @@ private:
     std::uint64_t selection_version_ = 0;
     EditStatus edit_;           // guarded by mutex_
     void on_edit(const pipeline::EditResult& r, bool undo);
+    void on_loaded(pipeline::LoadResult&& r);
+    LoadStatus load_;  // guarded by mutex_
     Hud hud_;
     std::vector<Eigen::Vector3f> trail_;
     std::atomic<bool> toggle_requested_{false};
