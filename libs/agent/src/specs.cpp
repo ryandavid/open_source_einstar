@@ -333,7 +333,8 @@ std::vector<MethodSpec> build() {
         "cyan-blue inside), model (the built solid). preset: look from top, bottom, front, back, left, right or iso (in the "
         "first datum's axes when there is one). frame: fit a label (or 'all') in the view.",
         object({{"mode", one_of({"labels", "deviation", "model"}, "What to show.")},
-                {"preset", one_of({"top", "bottom", "front", "back", "left", "right", "iso"}, "Look from.")},
+                {"preset", one_of({"top", "bottom", "front", "back", "left", "right", "iso", "scanned"},
+                                  "Look from (scanned: the side the scanner saw the surface from).")},
                 {"frame", str("A label's name, or 'all'.")},
                 {"edges", boolean("Draw the model's edges.")},
                 {"orbit", point("[dx, dy] radians, as a left-drag would.")},

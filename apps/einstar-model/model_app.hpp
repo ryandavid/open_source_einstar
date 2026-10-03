@@ -47,12 +47,16 @@ public:
 
     // Opening a scan can take minutes (an .estr is processed first): it runs in the background.
     void open(const std::filesystem::path& path, bool fine = false);
-    [[nodiscard]] bool busy() const { return job_.valid(); }
+    // Commands that can take seconds on a large scan (detect, grow, solve, build, find holes, export) run in the
+    // background too; the window stays live, and nothing else touches the document until they finish.
+    [[nodiscard]] static bool is_slow(std::string_view command);
+    bool start(std::string_view command, json params, model::Author author = model::Author::user);
+    [[nodiscard]] bool busy() const { return job_.valid() || command_job_.valid(); }
     [[nodiscard]] const std::string& busy_text() const { return busy_text_; }
     // Called every frame: finishes background work.
     void update();
-    // The outcome of the last background open, once (for the agent waiting on it).
-    std::optional<model::Outcome> take_open_outcome() { return std::exchange(open_outcome_, std::nullopt); }
+    // The outcome of the last background open or command, once (for the agent waiting on it).
+    std::optional<model::Outcome> take_outcome() { return std::exchange(open_outcome_, std::nullopt); }
 
     // The brush: a stroke (one undo step) of dabs where the ray meets the scan.
     void begin_stroke(bool erase);
@@ -83,6 +87,8 @@ private:
     std::filesystem::path job_path_;
     std::string busy_text_;
     std::optional<model::Outcome> open_outcome_;
+    std::future<model::Outcome> command_job_;
+    std::string command_name_;
     struct Stroke {
         bool erase = false;
         int dabs = 0;

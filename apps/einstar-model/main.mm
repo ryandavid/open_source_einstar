@@ -226,10 +226,11 @@ int main(int argc, char** argv) {
             }
 
             app.update();
-            if (app.doc.has_scan() && framed_scan != &app.doc.mesh()) {
-                // A new scan: fit it in the view, looking at it from above and to the side.
+            if (!app.busy() && app.doc.has_scan() && framed_scan != &app.doc.mesh()) {
+                // A new scan: fit it in the view, looked at from the side the scanner saw (the demo part, whose
+                // axes are the part's, from above and to the side).
                 framed_scan = &app.doc.mesh();
-                app.look_from(camera, "iso");
+                app.look_from(camera, app.doc.source().kind == "demo" ? "iso" : "scanned");
                 app.frame(camera);
             }
             if (auto upd = app.take_render_update()) {
@@ -247,11 +248,11 @@ int main(int argc, char** argv) {
             if (app.stroking()) {
                 if (io.MouseDown[0]) app.dab(ray_origin, ray_dir);
                 else app.end_stroke();
-            } else if (over_view && io.MouseClicked[0] && (io.KeyShift || io.KeyAlt) && app.doc.has_scan()) {
+            } else if (over_view && io.MouseClicked[0] && (io.KeyShift || io.KeyAlt) && app.doc.has_scan() && !app.busy()) {
                 app.begin_stroke(io.KeyAlt && !io.KeyShift);
                 app.dab(ray_origin, ray_dir);
             }
-            if (!io.WantTextInput) {
+            if (!io.WantTextInput && !app.busy()) {
                 if (io.KeySuper && ImGui::IsKeyPressed(ImGuiKey_Z, false)) app.run(io.KeyShift ? "redo" : "undo", {});
                 if (ImGui::IsKeyPressed(ImGuiKey_F, false) && !io.KeySuper) app.frame(camera);
             }
@@ -298,7 +299,7 @@ int main(int argc, char** argv) {
             app.draw_ui(camera);
 
             // The brush outline and the label under the cursor.
-            if (over_view && app.doc.has_scan()) {
+            if (over_view && app.doc.has_scan() && !app.busy()) {
                 if (const auto hit = app.doc.bvh().raycast(ray_origin, ray_dir)) {
                     const float dist = (hit->point - camera.eye()).norm();
                     const float px = app.brush_radius * (io.DisplaySize.y / 2) / (dist * std::tan(camera.fov_y / 2));

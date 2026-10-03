@@ -63,6 +63,12 @@ bool combo(const char* id, int& index, const std::vector<std::string>& items) {
     return changed;
 }
 
+// An up direction for a view along `forward`: the scan's -y (its images' up) unless that is nearly the view.
+Vec3 any_up(const Vec3& forward) {
+    const Vec3 up = -Vec3::UnitY();
+    return std::abs(up.dot(forward)) < 0.95 ? up : Vec3(Vec3::UnitZ());
+}
+
 }  // namespace
 
 std::string_view display_name(Display d) { return kDisplayNames[static_cast<std::size_t>(d)]; }
@@ -101,7 +107,34 @@ void ModelApp::open(const std::filesystem::path& path, bool fine) {
     job_ = std::async(std::launch::async, [path, fine] { return model::load_scan_mesh(path, fine); });
 }
 
+bool ModelApp::is_slow(std::string_view command) {
+    for (const char* c : {"detect", "grow", "solve", "build", "find_holes", "export_step"})
+        if (command == c) return true;
+    return false;
+}
+
+bool ModelApp::start(std::string_view command, json params, model::Author author) {
+    if (busy()) return false;
+    if (!is_slow(command)) {
+        open_outcome_ = run(command, params, author);
+        return true;
+    }
+    command_name_ = std::string(command);
+    busy_text_ = command == "detect" ? "Detecting faces ..." : command == "build" ? "Building the solid ..." : std::format("{} ...", command);
+    command_job_ = std::async(std::launch::async, [this, c = command_name_, p = std::move(params), author] { return doc.apply(c, p, author); });
+    return true;
+}
+
 void ModelApp::update() {
+    if (command_job_.valid() && command_job_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        model::Outcome o = command_job_.get();
+        busy_text_.clear();
+        status_ = o.ok ? std::format("{}: done", command_name_) : std::format("{}: {}", command_name_, o.error);
+        status_error_ = !o.ok;
+        if (o.ok && command_name_ == "build" && display == Display::labels) display = Display::model;
+        open_outcome_ = std::move(o);
+        return;
+    }
     if (!job_.valid() || job_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
     auto r = job_.get();
     busy_text_.clear();
@@ -120,7 +153,7 @@ void ModelApp::update() {
 }
 
 void ModelApp::begin_stroke(bool erase) {
-    if (!doc.has_scan() || (!erase && active_label == 0)) return;
+    if (busy() || !doc.has_scan() || (!erase && active_label == 0)) return;
     const model::Label* l = doc.label(active_label);
     doc.begin_change(erase ? "erase paint" : std::format("paint {}", l ? l->name : "?"), model::Author::user);
     stroke_ = Stroke{erase, 0};
@@ -145,7 +178,7 @@ void ModelApp::end_stroke() {
 }
 
 std::optional<std::string> ModelApp::label_at(const Vec3f& origin, const Vec3f& direction) const {
-    if (!doc.has_scan()) return std::nullopt;
+    if (busy() || !doc.has_scan()) return std::nullopt;
     const auto hit = doc.bvh().raycast(origin, direction.normalized());
     if (!hit) return std::nullopt;
     const int id = (*doc.state().region)[hit->triangle];
@@ -182,7 +215,16 @@ bool ModelApp::look_from(render::ViewCamera& camera, std::string_view preset) co
     else if (preset == "right") forward = -R.col(0), up = R.col(2);
     else if (preset == "left") forward = R.col(0), up = R.col(2);
     else if (preset == "iso") forward = (-R.col(0) + R.col(1) - R.col(2)).normalized(), up = R.col(2);
-    else return false;
+    else if (preset == "scanned") {
+        // From the side the scanner saw: against the scan's mean (area-weighted) normal.
+        if (!doc.has_scan()) return false;
+        Vec3 n = Vec3::Zero();
+        const auto& topo = doc.topology();
+        for (std::uint32_t t = 0; t < topo.triangle_count(); ++t) n += topo.area(t) * topo.normal(t).cast<double>();
+        if (n.norm() < 1e-9) return false;
+        forward = -n.normalized();
+        up = any_up(forward);
+    } else return false;
     // Camera axes in the world: x right, y down, z forward.
     const Vec3 down = -(up - up.dot(forward) * forward).normalized();
     const Vec3 right = down.cross(forward);
@@ -204,6 +246,7 @@ render::Rgba8 ModelApp::label_color(int id) const {
 }
 
 std::optional<RenderUpdate> ModelApp::take_render_update() {
+    if (busy()) return std::nullopt;
     const double tol = settings.tolerance_mm, range = settings.deviation_range_mm;
     const bool want_model = display == Display::model && doc.built() && doc.built()->result.ok;
     const bool scan_changed = doc.has_scan() && shown_scan_ != &doc.mesh();
@@ -314,7 +357,7 @@ void ModelApp::draw_ui(render::ViewCamera& camera) {
     ImGui::SameLine();
     ImGui::BeginDisabled(!(doc.built() && doc.built()->result.ok));
     if (ImGui::Button("Export STEP...")) {
-        if (const auto p = choose_save_file("part.step", "step")) run("export_step", {{"path", p->string()}});
+        if (const auto p = choose_save_file("part.step", "step")) start("export_step", {{"path", p->string()}});
     }
     ImGui::EndDisabled();
     ImGui::EndDisabled();
@@ -324,7 +367,12 @@ void ModelApp::draw_ui(render::ViewCamera& camera) {
         ImGui::EndCombo();
     }
     ImGui::EndDisabled();
-    if (busy()) ImGui::TextColored(ImVec4(1, 0.85f, 0.3f, 1), "%s", busy_text_.c_str());
+    if (busy()) {
+        // The document is being worked on in the background: nothing reads it until that is done.
+        ImGui::TextColored(ImVec4(1, 0.85f, 0.3f, 1), "%s", busy_text_.c_str());
+        ImGui::End();
+        return;
+    }
     if (!doc.has_scan()) {
         ImGui::TextWrapped("Open a scan (.estr from the Einstar app, or an STL/PLY mesh) or a saved model, or try the demo part.");
         ImGui::End();
@@ -361,14 +409,14 @@ void ModelApp::draw_ui(render::ViewCamera& camera) {
 
     // ---- Labels ----
     if (ImGui::CollapsingHeader("Labels", ImGuiTreeNodeFlags_DefaultOpen)) {
-        if (ImGui::Button("Detect faces")) run("detect", {});
+        if (ImGui::Button("Detect faces")) start("detect", {});
         ImGui::SameLine();
         if (ImGui::Button("New label")) {
             const auto o = run("label.create", {});
             if (o.ok) active_label = o.result["id"];
         }
         ImGui::SameLine();
-        if (ImGui::Button("Grow")) run("grow", {});
+        if (ImGui::Button("Grow")) start("grow", {});
         ImGui::SliderFloat("Brush mm", &brush_radius, 0.3f, 15.0f, "%.1f");
         ImGui::TextDisabled("Shift-drag paints the selected label, Option-drag erases.");
         if (ImGui::BeginTable("labels", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp,
@@ -401,7 +449,7 @@ void ModelApp::draw_ui(render::ViewCamera& camera) {
             int role = static_cast<int>(l->role);
             if (ImGui::Combo("Role", &role, "face\0hole\0fillet\0ignore\0"))
                 run("label.update", {{"label", l->id}, {"role", model::role_name(static_cast<model::Role>(role))}});
-            if (ImGui::Button("Find holes")) run("find_holes", {{"label", l->id}});
+            if (ImGui::Button("Find holes")) start("find_holes", {{"label", l->id}});
             ImGui::SameLine();
             if (ImGui::Button("As fillet")) run("fillet.add", {{"label", l->id}});
             ImGui::SameLine();
@@ -540,11 +588,9 @@ void ModelApp::draw_ui(render::ViewCamera& camera) {
 
     // ---- Solve and build ----
     if (ImGui::CollapsingHeader("Solve and build", ImGuiTreeNodeFlags_DefaultOpen)) {
-        if (ImGui::Button("Solve")) run("solve", {});
+        if (ImGui::Button("Solve")) start("solve", {});
         ImGui::SameLine();
-        if (ImGui::Button("Build")) {
-            if (run("build", {{"tolerance_mm", settings.tolerance_mm}}).ok && display == Display::labels) display = Display::model;
-        }
+        if (ImGui::Button("Build")) start("build", {{"tolerance_mm", settings.tolerance_mm}});
         if (summary["model"].is_object()) {
             const auto& m = summary["model"];
             ImGui::Text("%s%s, %.1f mm3, %d faces, scan coverage %.0f%%", m["ok"].get<bool>() ? (m["closed"].get<bool>() ? "solid" : "open") : "failed",

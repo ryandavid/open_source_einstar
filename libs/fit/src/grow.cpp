@@ -4,6 +4,7 @@
 #include <cmath>
 #include <numbers>
 #include <queue>
+#include <unordered_set>
 
 namespace einstar::fit {
 namespace {
@@ -36,30 +37,25 @@ double gate_of(const FitResult& f, const GrowOptions& o) {
 constexpr std::size_t kMinSeedTriangles = 40;
 
 void widen_small_seed(const MeshTopology& topo, std::vector<std::uint32_t>& seed, std::span<const std::uint8_t> blocked) {
-    if (seed.empty()) return;
-    std::vector<std::uint8_t> in(topo.triangle_count(), 0);
-    for (const auto t : seed) in[t] = 1;
+    if (seed.empty() || seed.size() >= kMinSeedTriangles) return;
+    std::unordered_set<std::uint32_t> in(seed.begin(), seed.end());
     for (int ring = 0; ring < 4 && seed.size() < kMinSeedTriangles; ++ring) {
         const std::size_t n = seed.size();
         for (std::size_t i = 0; i < n; ++i)
             for (const auto nb : topo.neighbors(seed[i]))
-                if (nb != kNoTriangle && !in[nb] && (blocked.empty() || !blocked[nb])) {
-                    in[nb] = 1;
-                    seed.push_back(nb);
-                }
+                if (nb != kNoTriangle && (blocked.empty() || !blocked[nb]) && in.insert(nb).second) seed.push_back(nb);
     }
 }
 
 // Growth order decides who gets a triangle where two regions meet; afterwards each border triangle goes to
 // the neighbouring region whose surface it lies closer to (the first rows of a plane, tangent to a fillet,
 // to the plane), and the regions are refitted, a few rounds.
-void reassign_borders(const MeshTopology& topo, std::vector<Active>& active, std::vector<std::uint16_t>& owner, const GrowOptions& o,
-                      double cos_max) {
+void reassign_borders(const MeshTopology& topo, std::vector<Active>& active, GrowWorkspace& ws, const GrowOptions& o, double cos_max) {
     if (active.size() < 2) return;
+    auto& owner = ws.owner;
     for (int round = 0; round < 4; ++round) {
         std::size_t moved = 0;
-        for (std::uint32_t t = 0; t < owner.size(); ++t) {
-            if (owner[t] == 0) continue;
+        for (const std::uint32_t t : ws.owned) {
             const std::size_t a = owner[t] - 1u;
             const Vec3 c = topo.centroid(t).cast<double>();
             const Vec3 n = topo.normal(t).cast<double>();
@@ -81,8 +77,7 @@ void reassign_borders(const MeshTopology& topo, std::vector<Active>& active, std
         }
         if (moved == 0) break;
         for (auto& a : active) a.members.clear();
-        for (std::uint32_t t = 0; t < owner.size(); ++t)
-            if (owner[t] != 0) active[owner[t] - 1u].members.push_back(t);
+        for (const std::uint32_t t : ws.owned) active[owner[t] - 1u].members.push_back(t);
         for (auto& a : active) {
             if (a.members.empty()) continue;
             const RegionPoints pts = region_points(topo, a.members, o.max_fit_points);
@@ -99,7 +94,8 @@ void reassign_borders(const MeshTopology& topo, std::vector<Active>& active, std
 // seed alone. Each plausible kind is grown on its own and the simplest one that grows clearly furthest
 // (by 20%) wins: the face's extent decides, not the few triangles under the brush.
 std::optional<FitResult> choose_seed_surface(const MeshTopology& topo, const RegionSeed& seed, std::span<const SurfaceKind> kinds,
-                                             const RegionPoints& pts, const GrowOptions& o, std::span<const std::uint8_t> blocked) {
+                                             const RegionPoints& pts, const GrowOptions& o, std::span<const std::uint8_t> blocked,
+                                             GrowWorkspace& ws) {
     std::vector<FitResult> candidates;
     for (const SurfaceKind k : kinds) {
         const std::array one{k};
@@ -112,7 +108,7 @@ std::optional<FitResult> choose_seed_surface(const MeshTopology& topo, const Reg
     std::size_t best = 0, best_size = 0;
     for (std::size_t i = 0; i < candidates.size(); ++i) {
         const RegionSeed trial{seed.triangles, {kind_of(candidates[i].surface)}, candidates[i].surface};
-        const GrowResult g = grow_regions(topo, std::span(&trial, 1), o, blocked);
+        const GrowResult g = grow_regions(topo, std::span(&trial, 1), o, blocked, ws);
         const std::size_t size = g.regions[0].triangles.size();
         if (i == 0 || static_cast<double>(size) > 1.2 * static_cast<double>(best_size)) {
             best = i;
@@ -128,10 +124,13 @@ RegionPoints region_points(const MeshTopology& topo, std::span<const std::uint32
         std::uint32_t vertex;
         std::uint32_t triangle;
     };
+    // A large region is thinned by triangles first (a vertex has about two triangles), so only what is kept
+    // gets sorted.
+    const std::size_t step = max_points > 0 && triangles.size() > 2 * max_points ? triangles.size() / (2 * max_points) : 1;
     std::vector<Corner> corners;
-    corners.reserve(triangles.size() * 3);
-    for (const auto t : triangles)
-        for (const auto v : mesh.triangles[t]) corners.push_back({v, t});
+    corners.reserve(triangles.size() / step * 3 + 3);
+    for (std::size_t i = 0; i < triangles.size(); i += step)
+        for (const auto v : mesh.triangles[triangles[i]]) corners.push_back({v, triangles[i]});
     std::ranges::sort(corners, [](const Corner& a, const Corner& b) { return a.vertex < b.vertex; });
     RegionPoints out;
     for (std::size_t i = 0; i < corners.size();) {
@@ -168,19 +167,15 @@ RegionPoints region_points(const MeshTopology& topo, std::span<const std::uint32
 std::vector<std::uint32_t> triangles_within(const MeshTopology& topo, std::uint32_t start, const Vec3f& center, float radius) {
     std::vector<std::uint32_t> out;
     if (start >= topo.triangle_count()) return out;
-    std::vector<std::uint8_t> seen(topo.triangle_count(), 0);
+    std::unordered_set<std::uint32_t> seen{start};
     std::vector<std::uint32_t> stack{start};
-    seen[start] = 1;
     const float r2 = radius * radius;
     while (!stack.empty()) {
         const std::uint32_t t = stack.back();
         stack.pop_back();
         out.push_back(t);
         for (const auto n : topo.neighbors(t))
-            if (n != kNoTriangle && !seen[n] && (topo.centroid(n) - center).squaredNorm() <= r2) {
-                seen[n] = 1;
-                stack.push_back(n);
-            }
+            if (n != kNoTriangle && (topo.centroid(n) - center).squaredNorm() <= r2 && seen.insert(n).second) stack.push_back(n);
     }
     std::ranges::sort(out);
     return out;
@@ -188,9 +183,28 @@ std::vector<std::uint32_t> triangles_within(const MeshTopology& topo, std::uint3
 
 GrowResult grow_regions(const MeshTopology& topo, std::span<const RegionSeed> seeds, const GrowOptions& o,
                         std::span<const std::uint8_t> blocked) {
+    GrowWorkspace ws;
+    GrowResult result = grow_regions(topo, seeds, o, blocked, ws);
+    // (The workspace is clean again; the owners come back from the regions.)
+    result.owner.assign(topo.triangle_count(), 0);
+    for (std::size_t r = 0; r < result.regions.size(); ++r)
+        for (const auto t : result.regions[r].triangles) result.owner[t] = static_cast<std::uint16_t>(r + 1);
+    return result;
+}
+
+GrowResult grow_regions(const MeshTopology& topo, std::span<const RegionSeed> seeds, const GrowOptions& o,
+                        std::span<const std::uint8_t> blocked, GrowWorkspace& ws) {
     const std::size_t nt = topo.triangle_count();
+    if (ws.owner.size() != nt) {
+        ws.owner.assign(nt, 0);
+        ws.owned.clear();
+    }
+    auto& owner = ws.owner;
+    const auto own = [&](std::uint32_t t, std::size_t r) {
+        if (owner[t] == 0) ws.owned.push_back(t);
+        owner[t] = static_cast<std::uint16_t>(r + 1);
+    };
     GrowResult result;
-    result.owner.assign(nt, 0);
     result.regions.resize(seeds.size());
     const double cos_max = std::cos(o.max_normal_angle_deg * std::numbers::pi / 180.0);
     const auto is_blocked = [&](std::uint32_t t) { return !blocked.empty() && blocked[t] != 0; };
@@ -209,7 +223,7 @@ GrowResult grow_regions(const MeshTopology& topo, std::span<const RegionSeed> se
     const auto push_neighbours = [&](std::uint16_t r, std::uint32_t t) {
         const Active& a = active[r];
         for (const auto n : topo.neighbors(t)) {
-            if (n == kNoTriangle || result.owner[n] != 0 || is_blocked(n)) continue;
+            if (n == kNoTriangle || owner[n] != 0 || is_blocked(n)) continue;
             double score = 0;
             if (fits(a, n, a.gate, score)) queue.push({score, n, r});
         }
@@ -224,7 +238,7 @@ GrowResult grow_regions(const MeshTopology& topo, std::span<const RegionSeed> se
             fit = refine_surface(*seed.surface, pts.view(), o.fit);
         } else {
             const std::span<const SurfaceKind> kinds = seed.kinds.empty() ? std::span<const SurfaceKind>(kDefaultKinds) : seed.kinds;
-            fit = choose_seed_surface(topo, seed, kinds, pts, o, blocked);
+            fit = choose_seed_surface(topo, seed, kinds, pts, o, blocked, ws);
         }
         if (!fit) continue;
         Active& a = active[r];
@@ -234,8 +248,8 @@ GrowResult grow_regions(const MeshTopology& topo, std::span<const RegionSeed> se
         // not take the neighbouring face with it.
         for (const auto t : seed.triangles) {
             double score = 0;
-            if (t < nt && result.owner[t] == 0 && !is_blocked(t) && fits(a, t, 2 * a.gate, score)) {
-                result.owner[t] = static_cast<std::uint16_t>(r + 1);
+            if (t < nt && owner[t] == 0 && !is_blocked(t) && fits(a, t, 2 * a.gate, score)) {
+                own(t, r);
                 a.members.push_back(t);
             }
         }
@@ -249,11 +263,11 @@ GrowResult grow_regions(const MeshTopology& topo, std::span<const RegionSeed> se
         while (!queue.empty()) {
             const Candidate c = queue.top();
             queue.pop();
-            if (result.owner[c.triangle] != 0) continue;
+            if (owner[c.triangle] != 0) continue;
             Active& a = active[c.region];
             double score = 0;
             if (!fits(a, c.triangle, a.gate, score)) continue;  // the surface moved since it was queued
-            result.owner[c.triangle] = static_cast<std::uint16_t>(c.region + 1);
+            own(c.triangle, c.region);
             a.members.push_back(c.triangle);
             if (a.members.size() >= 2 * a.fitted_size + 16) {
                 const RegionPoints pts = region_points(topo, a.members, o.max_fit_points);
@@ -288,7 +302,9 @@ GrowResult grow_regions(const MeshTopology& topo, std::span<const RegionSeed> se
         run_queue();
     }
 
-    reassign_borders(topo, active, result.owner, o, cos_max);
+    reassign_borders(topo, active, ws, o, cos_max);
+    for (const auto t : ws.owned) owner[t] = 0;
+    ws.owned.clear();
 
     for (std::size_t r = 0; r < seeds.size(); ++r) {
         if (!result.regions[r].ok) continue;

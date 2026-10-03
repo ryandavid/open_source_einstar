@@ -488,9 +488,15 @@ struct Document::Impl {
         o.blocked = blocked;
         // At the scan's resolution: tighter curves than two voxels are rounded edges, smaller curved patches
         // than about 32 voxels are rims and corners (left for the user to brush if they matter).
+        // Faces are proposed if they are also a visible share of the part (0.2% of its area for planes, 0.1%
+        // for curved ones): an organic part, which no set of primitives describes, does not turn into thousands
+        // of small patches.
         const double voxel = d.voxel_mm();
+        double total_area = 0;
+        for (const float a : d.topology().areas()) total_area += a;
         o.min_radius_mm = 2 * voxel;
-        o.min_curved_area_mm2 = std::max(o.min_curved_area_mm2, 32 * voxel * voxel);
+        o.min_curved_area_mm2 = std::max({o.min_curved_area_mm2, 32 * voxel * voxel, 0.001 * total_area});
+        o.min_plane_area_mm2 = std::max({o.min_plane_area_mm2, 32 * voxel * voxel, 0.002 * total_area});
         const auto found = fit::detect_regions(d.topology(), o);
         std::map<fit::SurfaceKind, int> counter;
         std::vector<int> created;

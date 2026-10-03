@@ -52,11 +52,22 @@ struct GrowResult {
 [[nodiscard]] GrowResult grow_regions(const MeshTopology& topo, std::span<const RegionSeed> seeds, const GrowOptions& options = {},
                                       std::span<const std::uint8_t> blocked = {});
 
+// Scratch space sized to the mesh, for calling grow_regions many times (detection grows thousands of seeds
+// on a million-triangle scan): each call visits only the triangles it grows over, and leaves it clean.
+struct GrowWorkspace {
+    std::vector<std::uint16_t> owner;
+    std::vector<std::uint32_t> owned;
+};
+// As above, but the result's per-triangle owner array is left empty (the regions list their triangles).
+[[nodiscard]] GrowResult grow_regions(const MeshTopology& topo, std::span<const RegionSeed> seeds, const GrowOptions& options,
+                                      std::span<const std::uint8_t> blocked, GrowWorkspace& workspace);
+
 struct RegionPoints;
+struct GrowWorkspace;
 // The surface a seed grows with when its kind is not given (see grow.cpp).
 [[nodiscard]] std::optional<FitResult> choose_seed_surface(const MeshTopology& topo, const RegionSeed& seed, std::span<const SurfaceKind> kinds,
                                                            const RegionPoints& points, const GrowOptions& options,
-                                                           std::span<const std::uint8_t> blocked = {});
+                                                           std::span<const std::uint8_t> blocked, GrowWorkspace& workspace);
 
 // Triangles connected to `start` whose centroids lie within `radius` of `center` (a brush dab).
 [[nodiscard]] std::vector<std::uint32_t> triangles_within(const MeshTopology& topo, std::uint32_t start, const Vec3f& center,

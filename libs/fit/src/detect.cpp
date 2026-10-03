@@ -1,6 +1,7 @@
 #include "einstar/fit/detect.hpp"
 
 #include <algorithm>
+#include <map>
 #include <numeric>
 
 namespace einstar::fit {
@@ -39,46 +40,61 @@ double area_of(const MeshTopology& topo, std::span<const std::uint32_t> tris) {
 }
 
 // Neighbouring regions that are one face (two seeds grew parts of the same hole wall): merged when one
-// surface fits both about as well as each fits alone.
+// surface fits both about as well as each fits alone. One pass over the neighbouring pairs, most shared
+// edges first, with union-find; a pair is first checked cheaply (each region's surface against a sample of
+// the other's points) before the two are fitted together.
 void merge_same_surfaces(const MeshTopology& topo, std::vector<DetectedRegion>& regions, const DetectOptions& o, double noise) {
-    for (bool merged = true; merged;) {
-        merged = false;
-        std::vector<std::uint32_t> owner(topo.triangle_count(), kNoTriangle);
-        for (std::uint32_t r = 0; r < regions.size(); ++r)
-            for (const auto t : regions[r].triangles) owner[t] = r;
-        for (std::uint32_t a = 0; a < regions.size() && !merged; ++a) {
-            std::vector<std::uint32_t> touching;
-            for (const auto t : regions[a].triangles)
-                for (const auto n : topo.neighbors(t))
-                    if (n != kNoTriangle && owner[n] != kNoTriangle && owner[n] > a) touching.push_back(owner[n]);
-            std::ranges::sort(touching);
-            touching.erase(std::unique(touching.begin(), touching.end()), touching.end());
-            for (const auto b : touching) {
-                if (kind_of(regions[a].fit.surface) != kind_of(regions[b].fit.surface)) continue;
-                std::vector<std::uint32_t> both = regions[a].triangles;
-                both.insert(both.end(), regions[b].triangles.begin(), regions[b].triangles.end());
-                const RegionPoints pts = region_points(topo, both, o.grow.max_fit_points);
-                const FitResult fit = refine_surface(regions[a].triangles.size() >= regions[b].triangles.size() ? regions[a].fit.surface
-                                                                                                                : regions[b].fit.surface,
-                                                     pts.view(), o.grow.fit);
-                // Each region's own points must sit on the merged surface about as well as on its own (the
-                // robust fit alone would let a large region absorb a small one as outliers).
-                const auto fits_part = [&](const DetectedRegion& part) {
-                    const RegionPoints pp = region_points(topo, part.triangles, o.grow.max_fit_points);
-                    std::vector<double> res(pp.points.size());
-                    for (std::size_t i = 0; i < res.size(); ++i) res[i] = signed_distance(fit.surface, pp.points[i]);
-                    // (A small region overfits its own noise, so the scan's noise level is a floor.)
-                    return robust_sigma(res) < std::max(1.25 * part.fit.sigma, 1.5 * noise);
-                };
-                if (!fits_part(regions[a]) || !fits_part(regions[b])) continue;
-                std::ranges::sort(both);
-                regions[a] = {std::move(both), fit, regions[a].area_mm2 + regions[b].area_mm2};
-                regions.erase(regions.begin() + b);
-                merged = true;
-                break;
-            }
-        }
+    const std::size_t nr = regions.size();
+    if (nr < 2) return;
+    std::vector<std::uint32_t> owner(topo.triangle_count(), kNoTriangle);
+    for (std::uint32_t r = 0; r < nr; ++r)
+        for (const auto t : regions[r].triangles) owner[t] = r;
+    std::map<std::pair<std::uint32_t, std::uint32_t>, int> shared;
+    for (std::uint32_t r = 0; r < nr; ++r)
+        for (const auto t : regions[r].triangles)
+            for (const auto n : topo.neighbors(t))
+                if (n != kNoTriangle && owner[n] != kNoTriangle && owner[n] > r) ++shared[{r, owner[n]}];
+    std::vector<std::pair<int, std::pair<std::uint32_t, std::uint32_t>>> pairs;
+    for (const auto& [p, n] : shared) pairs.push_back({n, p});
+    std::ranges::sort(pairs, [](const auto& a, const auto& b) { return a.first > b.first; });
+
+    std::vector<std::uint32_t> parent(nr);
+    for (std::uint32_t r = 0; r < nr; ++r) parent[r] = r;
+    const auto find = [&](std::uint32_t x) {
+        while (parent[x] != x) x = parent[x] = parent[parent[x]];
+        return x;
+    };
+    constexpr std::size_t kSample = 300;
+    std::vector<RegionPoints> sample(nr);
+    for (std::uint32_t r = 0; r < nr; ++r) sample[r] = region_points(topo, regions[r].triangles, kSample);
+    const auto spread = [](const Surface& s, const RegionPoints& pts) {
+        std::vector<double> res(pts.points.size());
+        for (std::size_t i = 0; i < res.size(); ++i) res[i] = signed_distance(s, pts.points[i]);
+        return robust_sigma(res);
+    };
+    for (const auto& [count, pair] : pairs) {
+        const std::uint32_t a = find(pair.first), b = find(pair.second);
+        if (a == b || kind_of(regions[a].fit.surface) != kind_of(regions[b].fit.surface)) continue;
+        // (A small region overfits its own noise, so the scan's noise level is a floor.)
+        const double limit_a = std::max(1.25 * regions[a].fit.sigma, 1.5 * noise), limit_b = std::max(1.25 * regions[b].fit.sigma, 1.5 * noise);
+        const bool near = spread(regions[a].fit.surface, sample[b]) < 2 * limit_b || spread(regions[b].fit.surface, sample[a]) < 2 * limit_a;
+        if (!near) continue;
+        std::vector<std::uint32_t> both = regions[a].triangles;
+        both.insert(both.end(), regions[b].triangles.begin(), regions[b].triangles.end());
+        const RegionPoints pts = region_points(topo, both, o.grow.max_fit_points);
+        const FitResult fit = refine_surface(regions[a].triangles.size() >= regions[b].triangles.size() ? regions[a].fit.surface
+                                                                                                        : regions[b].fit.surface,
+                                             pts.view(), o.grow.fit);
+        // Each region's own points must sit on the merged surface about as well as on its own (the robust fit
+        // alone would let a large region absorb a small one as outliers).
+        if (spread(fit.surface, sample[a]) >= limit_a || spread(fit.surface, sample[b]) >= limit_b) continue;
+        std::ranges::sort(both);
+        regions[a] = {std::move(both), fit, regions[a].area_mm2 + regions[b].area_mm2};
+        regions[b].triangles.clear();
+        sample[a] = region_points(topo, regions[a].triangles, kSample);
+        parent[b] = a;
     }
+    std::erase_if(regions, [](const DetectedRegion& r) { return r.triangles.empty(); });
 }
 
 }  // namespace
@@ -115,6 +131,7 @@ std::vector<DetectedRegion> detect_regions(const MeshTopology& topo, const Detec
     std::ranges::stable_sort(order, [&](std::uint32_t a, std::uint32_t b) { return rough[a] < rough[b]; });
 
     std::vector<DetectedRegion> out;
+    GrowWorkspace ws;
     const auto pass = [&](std::span<const SurfaceKind> kinds, double min_area) {
         const bool planes_only = kinds.size() == 1 && kinds[0] == SurfaceKind::plane;
         std::ranges::fill(tried, 0);
@@ -123,9 +140,13 @@ std::vector<DetectedRegion> detect_regions(const MeshTopology& topo, const Detec
             std::vector<std::uint32_t> seed = triangles_within(topo, start, topo.centroid(start), o.seed_radius_mm);
             if (planes_only) {
                 // Only where the patch itself is flat, judged on the whole patch (the strip of a fillet left
-                // between two planes is narrow enough to look flat).
+                // between two planes is narrow enough to look flat). Most patches of a curved part already fail
+                // the plane's own noise test, before any other kind is tried.
                 const RegionPoints pts = region_points(topo, seed, o.grow.max_fit_points);
-                const auto best = fit_best(kAnyKind, pts.view(), o.grow.fit);
+                const std::array plane_only{SurfaceKind::plane};
+                const auto plane = fit_best(plane_only, pts.view(), o.grow.fit);
+                const bool flat = plane && (noise <= 0 || plane->sigma <= 1.5 * noise);
+                const auto best = flat ? fit_best(kAnyKind, pts.view(), o.grow.fit) : std::nullopt;
                 if (!best || kind_of(best->surface) != SurfaceKind::plane) {
                     // Its middle is curved too: no need to try those as starts again.
                     const float r2 = 0.25f * o.seed_radius_mm * o.seed_radius_mm;
@@ -138,12 +159,23 @@ std::vector<DetectedRegion> detect_regions(const MeshTopology& topo, const Detec
             for (const auto t : seed) tried[t] = 1;
             if (seed.size() < 8) continue;
             const RegionSeed rs{std::move(seed), {kinds.begin(), kinds.end()}, std::nullopt};
-            const GrowResult g = grow_regions(topo, std::span(&rs, 1), o.grow, taken);
+            const GrowResult g = grow_regions(topo, std::span(&rs, 1), o.grow, taken, ws);
             if (!g.regions[0].ok) continue;
             const double area = area_of(topo, g.regions[0].triangles);
             // A surface that does not fit (a plane laid on a fillet) shows as noise well above the scan's.
-            if (area < min_area || (noise > 0 && g.regions[0].fit.sigma > (planes_only ? 1.5 : 2.0) * noise)) continue;
-            if (o.min_radius_mm > 0 && smallest_radius(g.regions[0].fit.surface) < o.min_radius_mm) continue;
+            // A rejected region's triangles are not tried as starts again (they would grow the same region);
+            // another region may still take them.
+            const auto reject = [&] {
+                for (const auto t : g.regions[0].triangles) tried[t] = 1;
+            };
+            if (area < min_area || (noise > 0 && g.regions[0].fit.sigma > (planes_only ? 1.5 : 2.0) * noise)) {
+                reject();
+                continue;
+            }
+            if (o.min_radius_mm > 0 && smallest_radius(g.regions[0].fit.surface) < o.min_radius_mm) {
+                reject();
+                continue;
+            }
             for (const auto t : g.regions[0].triangles) taken[t] = 1;
             out.push_back({g.regions[0].triangles, g.regions[0].fit, area});
         }

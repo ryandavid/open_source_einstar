@@ -19,6 +19,17 @@ Outcome answer(const model::Outcome& o) {
     return agent::error(o.refused ? ErrorCode::refused : ErrorCode::invalid_params, o.error);
 }
 
+// Answers once the background work started for the agent has finished.
+Outcome wait_for(ModelApp& app) {
+    return agent::Server::Poll([&app]() -> std::optional<agent::Result> {
+        if (app.busy()) return std::nullopt;
+        const auto o = app.take_outcome();
+        if (!o) return agent::error(ErrorCode::internal, "the work finished without an outcome");
+        if (o->ok) return agent::Result(o->result);
+        return agent::Result(agent::error(o->refused ? ErrorCode::refused : ErrorCode::invalid_params, o->error));
+    });
+}
+
 json view_json(const ModelApp& app, const render::ViewCamera& c) {
     const auto v = [](const Vec3f& x) { return json{x.x(), x.y(), x.z()}; };
     return {{"mode", display_name(app.display)}, {"edges", app.show_edges}, {"target", v(c.target)}, {"distance", c.distance},
@@ -49,26 +60,24 @@ void register_model_agent(agent::Server& server, ModelApp& app, render::ViewCame
                 if (!p.contains("path") || !p["path"].is_string()) throw agent::Server::BadParams("missing parameter 'path'");
                 const std::filesystem::path path = p["path"].get<std::string>();
                 if (path.extension() == ".emodel") return answer(app.run("open", p, model::Author::agent));
-                if (app.busy()) return agent::error(ErrorCode::refused, "already opening a scan");
-                (void)app.take_open_outcome();
+                if (app.busy()) return agent::error(ErrorCode::refused, "busy: " + app.busy_text());
+                (void)app.take_outcome();
                 app.open(path, p.value("fine", false));
-                return agent::Server::Poll([&app]() -> std::optional<agent::Result> {
-                    if (app.busy()) return std::nullopt;
-                    const auto o = app.take_open_outcome();
-                    if (!o) return agent::error(ErrorCode::internal, "the open finished without an outcome");
-                    if (o->ok) return agent::Result(o->result);
-                    return agent::Result(agent::error(ErrorCode::refused, o->error));
-                });
+                return wait_for(app);
             });
             continue;
         }
         server.handle(spec.name, [&app, command](const json& p) -> Outcome {
-            if (app.busy()) return agent::error(ErrorCode::refused, "a scan is being opened");
-            return answer(app.run(command, p, model::Author::agent));
+            if (app.busy()) return agent::error(ErrorCode::refused, "busy: " + app.busy_text() + " (try again when it is done)");
+            if (!ModelApp::is_slow(command)) return answer(app.run(command, p, model::Author::agent));
+            (void)app.take_outcome();
+            app.start(command, p, model::Author::agent);
+            return wait_for(app);
         });
     }
 
     server.handle("model.view", [&app, &camera](const json& p) -> Outcome {
+        if (app.busy()) return agent::error(ErrorCode::refused, "busy: " + app.busy_text());
         if (p.contains("mode")) {
             const auto d = display_from_name(p["mode"].get<std::string>());
             if (!d) throw agent::Server::BadParams("mode is labels, deviation or model");

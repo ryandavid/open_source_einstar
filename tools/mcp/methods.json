@@ -1962,7 +1962,7 @@
           "type": "array"
         },
         "preset": {
-          "description": "Look from.",
+          "description": "Look from (scanned: the side the scanner saw the surface from).",
           "enum": [
             "top",
             "bottom",
@@ -1970,7 +1970,8 @@
             "back",
             "left",
             "right",
-            "iso"
+            "iso",
+            "scanned"
           ],
           "type": "string"
         },

@@ -254,14 +254,12 @@ FitResult refine_surface(const Surface& initial, const PointSet& d, const FitOpt
             for (std::size_t i = 0; i < n; ++i)
                 J(static_cast<Eigen::Index>(i), j) = (signed_distance(sj, d.points[i]) - e.residuals[i]) / kStep;
         }
-        MatX H = MatX::Zero(k, k);
-        VecX g = VecX::Zero(k);
-        for (std::size_t i = 0; i < n; ++i) {
-            if (w[i] == 0) continue;
-            const auto row = J.row(static_cast<Eigen::Index>(i));
-            H.noalias() += w[i] * row.transpose() * row;
-            g.noalias() += w[i] * row.transpose() * e.residuals[i];
-        }
+        // Normal equations in one product: J^T W J and J^T W r.
+        const Eigen::Map<const VecX> wv(w.data(), static_cast<Eigen::Index>(n));
+        const Eigen::Map<const VecX> rv(e.residuals.data(), static_cast<Eigen::Index>(n));
+        const MatX WJ = wv.asDiagonal() * J;
+        const MatX H = J.transpose() * WJ;
+        const VecX g = WJ.transpose() * rv;
         bool improved = false;
         for (int attempt = 0; attempt < 8 && !improved; ++attempt) {
             MatX Hd = H;
