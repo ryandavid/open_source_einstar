@@ -32,6 +32,14 @@ else()
 endif()
 find_package(nlohmann_json REQUIRED)
 find_package(Ceres QUIET)
+# OpenCASCADE (LGPL 2.1 with exception): solids and STEP for the modelling app (libs/brep). Optional; Homebrew's
+# `opencascade` is found without hints.
+find_package(OpenCASCADE CONFIG QUIET HINTS /opt/homebrew/opt/opencascade/lib/cmake/opencascade)
+if(OpenCASCADE_FOUND)
+  message(STATUS "OpenCASCADE ${OpenCASCADE_VERSION}: building libs/brep")
+else()
+  message(STATUS "OpenCASCADE not found: no solids or STEP export (brew install opencascade)")
+endif()
 
 # nanoflann: header-only k-d trees (BSD).
 FetchContent_Declare(nanoflann

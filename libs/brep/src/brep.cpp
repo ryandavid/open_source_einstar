@@ -1,0 +1,550 @@
+#include "einstar/brep/brep.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <format>
+#include <numbers>
+
+#include <BOPAlgo_CellsBuilder.hxx>
+#include <BOPAlgo_MakerVolume.hxx>
+#include <BRepAdaptor_Curve.hxx>
+#include <BRepAdaptor_Surface.hxx>
+#include <BRepAlgoAPI_Cut.hxx>
+#include <BRepBuilderAPI_MakeFace.hxx>
+#include <BRepCheck_Analyzer.hxx>
+#include <BRepClass_FaceClassifier.hxx>
+#include <BRepFilletAPI_MakeFillet.hxx>
+#include <BRepGProp.hxx>
+#include <BRepMesh_IncrementalMesh.hxx>
+#include <BRepPrimAPI_MakeCylinder.hxx>
+#include <BRepTools.hxx>
+#include <BRep_Tool.hxx>
+#include <GCPnts_TangentialDeflection.hxx>
+#include <GProp_GProps.hxx>
+#include <IFSelect_ReturnStatus.hxx>
+#include <Interface_Static.hxx>
+#include <Message.hxx>
+#include <Message_Messenger.hxx>
+#include <Message_Printer.hxx>
+#include <STEPCAFControl_Reader.hxx>
+#include <STEPCAFControl_Writer.hxx>
+#include <ShapeAnalysis_Surface.hxx>
+#include <ShapeUpgrade_UnifySameDomain.hxx>
+#include <TDF_LabelSequence.hxx>
+#include <TDataStd_Name.hxx>
+#include <TDocStd_Document.hxx>
+#include <TopExp.hxx>
+#include <TopExp_Explorer.hxx>
+#include <TopTools_DataMapOfShapeInteger.hxx>
+#include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
+#include <TopTools_IndexedMapOfShape.hxx>
+#include <TopoDS.hxx>
+#include <XCAFApp_Application.hxx>
+#include <XCAFDoc_DocumentTool.hxx>
+#include <XCAFDoc_ShapeTool.hxx>
+#include <gp_Ax3.hxx>
+#include <gp_Cone.hxx>
+#include <gp_Cylinder.hxx>
+#include <gp_Pln.hxx>
+#include <gp_Sphere.hxx>
+#include <gp_Torus.hxx>
+
+namespace einstar::brep {
+
+struct Shape {
+    TopoDS_Shape shape;
+};
+
+namespace {
+
+template <class... Ts>
+struct Overloaded : Ts... {
+    using Ts::operator()...;
+};
+
+gp_Pnt to_pnt(const Vec3& v) { return {v.x(), v.y(), v.z()}; }
+gp_Dir to_dir(const Vec3& v) { return {v.x(), v.y(), v.z()}; }
+Vec3 to_vec(const gp_Pnt& p) { return {p.X(), p.Y(), p.Z()}; }
+Vec3 to_vec(const gp_Vec& p) { return {p.X(), p.Y(), p.Z()}; }
+
+// A frame with its z along `axis`, origin at `origin`.
+gp_Ax3 frame(const Vec3& origin, const Vec3& axis) {
+    const Vec3 x = fit::any_perpendicular(axis);
+    return {to_pnt(origin), to_dir(axis), to_dir(x)};
+}
+
+// The input surface as a face reaching `reach` past the part's centre in every direction.
+TopoDS_Face extended_face(const fit::Surface& s, const Vec3& center, double reach) {
+    return std::visit(Overloaded{
+                          [&](const fit::Plane& p) -> TopoDS_Face {
+                              const gp_Pln pln(frame(fit::project(s, center), p.normal));
+                              return BRepBuilderAPI_MakeFace(pln, -reach, reach, -reach, reach).Face();
+                          },
+                          [&](const fit::Cylinder& c) -> TopoDS_Face {
+                              const Vec3 o = c.point + (center - c.point).dot(c.axis) * c.axis;
+                              const gp_Cylinder cyl(frame(o, c.axis), c.radius);
+                              return BRepBuilderAPI_MakeFace(cyl, 0, 2 * std::numbers::pi, -reach, reach).Face();
+                          },
+                          [&](const fit::Cone& c) -> TopoDS_Face {
+                              const gp_Cone cone(frame(c.apex, c.axis), c.half_angle, 0.0);
+                              return BRepBuilderAPI_MakeFace(cone, 0, 2 * std::numbers::pi, 0, 2 * reach / std::cos(c.half_angle)).Face();
+                          },
+                          [&](const fit::Sphere& sp) -> TopoDS_Face { return BRepBuilderAPI_MakeFace(gp_Sphere(frame(sp.center, Vec3::UnitZ()), sp.radius)).Face(); },
+                          [&](const fit::Torus& t) -> TopoDS_Face {
+                              return BRepBuilderAPI_MakeFace(gp_Torus(frame(t.center, t.axis), t.major, t.minor)).Face();
+                          },
+                      },
+                      s);
+}
+
+// Unit normal of a face at a point near it, pointing out of the solid the face bounds (its orientation).
+std::optional<Vec3> face_normal(const TopoDS_Face& f, const Vec3& p) {
+    const Handle(Geom_Surface) surf = BRep_Tool::Surface(f);
+    if (surf.IsNull()) return std::nullopt;
+    ShapeAnalysis_Surface sas(surf);
+    const gp_Pnt2d uv = sas.ValueOfUV(to_pnt(p), 1e-7);
+    BRepAdaptor_Surface ad(f, false);
+    gp_Pnt pt;
+    gp_Vec du, dv;
+    ad.D1(uv.X(), uv.Y(), pt, du, dv);
+    gp_Vec n = du.Crossed(dv);
+    if (n.Magnitude() < 1e-12) return std::nullopt;
+    n.Normalize();
+    if (f.Orientation() == TopAbs_REVERSED) n.Reverse();
+    return to_vec(n);
+}
+
+bool face_contains(const TopoDS_Face& f, const Vec3& p) {
+    const Handle(Geom_Surface) surf = BRep_Tool::Surface(f);
+    ShapeAnalysis_Surface sas(surf);
+    const gp_Pnt2d uv = sas.ValueOfUV(to_pnt(p), 1e-7);
+    BRepClass_FaceClassifier fc(f, uv, 1e-6);
+    return fc.State() == TopAbs_IN || fc.State() == TopAbs_ON;
+}
+
+// A point inside a face: the middle of its parameter range if that is on it, otherwise the first point of
+// finer and finer grids over the range (a face with a large opening, like a flange around a body).
+std::optional<Vec3> point_on(const TopoDS_Face& f) {
+    double u0, u1, v0, v1;
+    BRepTools::UVBounds(f, u0, u1, v0, v1);
+    BRepAdaptor_Surface ad(f);
+    for (const int n : {1, 3, 7, 15, 31}) {
+        for (int i = 0; i < n; ++i)
+            for (int j = 0; j < n; ++j) {
+                const gp_Pnt2d uv(u0 + (i + 0.5) / n * (u1 - u0), v0 + (j + 0.5) / n * (v1 - v0));
+                BRepClass_FaceClassifier fc(f, uv, 1e-7);
+                if (fc.State() == TopAbs_IN) return to_vec(ad.Value(uv.X(), uv.Y()));
+            }
+    }
+    return std::nullopt;
+}
+
+// OpenCASCADE reports every STEP transfer on stdout; only failures are of interest.
+void quiet_occt() {
+    for (const auto& printer : Message::DefaultMessenger()->Printers()) printer->SetTraceLevel(Message_Fail);
+}
+
+int count_of(const TopoDS_Shape& s, TopAbs_ShapeEnum kind) {
+    TopTools_IndexedMapOfShape m;
+    TopExp::MapShapes(s, kind, m);
+    return m.Extent();
+}
+
+std::string kind_name(GeomAbs_SurfaceType t) {
+    if (t == GeomAbs_Plane) return "plane";
+    if (t == GeomAbs_Cylinder) return "cylinder";
+    if (t == GeomAbs_Cone) return "cone";
+    if (t == GeomAbs_Sphere) return "sphere";
+    if (t == GeomAbs_Torus) return "torus";
+    return "other";
+}
+
+// Which input a face of the result lies on: input faces (by distance to their surface), then holes (wall
+// or floor), then fillets (within their radius of both faces, on a surface of that radius).
+std::string name_face(const TopoDS_Face& f, const BuildInput& in) {
+    const auto p = point_on(f);
+    if (!p) return {};
+    constexpr double kTol = 1e-4;
+    for (const auto& fi : in.faces)
+        if (std::abs(fit::signed_distance(fi.surface, *p)) < kTol) return fi.name;
+    for (const auto& h : in.holes) {
+        const Vec3 v = *p - h.entry;
+        const double depth = v.dot(h.axis);
+        const double rho = (v - depth * h.axis).norm();
+        if (std::abs(rho - 0.5 * h.diameter) < kTol) return h.name;
+        if (h.depth && std::abs(depth - *h.depth) < kTol && rho < 0.5 * h.diameter + kTol) return h.name + " floor";
+    }
+    BRepAdaptor_Surface ad(f);
+    for (const auto& fl : in.fillets) {
+        const auto fa = static_cast<std::size_t>(fl.face_a), fb = static_cast<std::size_t>(fl.face_b);
+        if (fa >= in.faces.size() || fb >= in.faces.size()) continue;
+        const double da = std::abs(fit::signed_distance(in.faces[fa].surface, *p));
+        const double db = std::abs(fit::signed_distance(in.faces[fb].surface, *p));
+        const bool radius_ok = ad.GetType() != GeomAbs_Cylinder || std::abs(ad.Cylinder().Radius() - fl.radius) < 1e-3;
+        if (da <= fl.radius + kTol && db <= fl.radius + kTol && radius_ok) return fl.name;
+    }
+    return {};
+}
+
+}  // namespace
+
+BuildResult build(const BuildInput& in) {
+    BuildResult out;
+    if (in.faces.empty()) {
+        out.log.push_back("no faces");
+        return out;
+    }
+    Eigen::AlignedBox3d box;
+    for (const auto& f : in.faces)
+        for (const auto& p : f.points) box.extend(p);
+    if (box.isEmpty()) {
+        out.log.push_back("no scan points: the part's extent is unknown");
+        return out;
+    }
+    const Vec3 center = box.center();
+    const double reach = 0.5 * box.diagonal().norm() + in.margin_mm;
+
+    // 1. The arrangement of the extended faces.
+    std::vector<TopoDS_Face> inputs;
+    TopTools_ListOfShape args;
+    for (const auto& f : in.faces) {
+        inputs.push_back(extended_face(f.surface, center, reach));
+        args.Append(inputs.back());
+    }
+    BOPAlgo_MakerVolume mv;
+    mv.SetArguments(args);
+    mv.SetIntersect(true);
+    mv.SetRunParallel(true);
+    mv.SetFuzzyValue(1e-5);
+    mv.Perform();
+    if (mv.HasErrors()) {
+        out.log.push_back("the faces could not be intersected into cells");
+        return out;
+    }
+    const TopoDS_Shape cells = mv.Shape();
+
+    // Pieces of each input face, and how many of its scan points each piece holds.
+    TopTools_DataMapOfShapeInteger piece_owner;  // piece -> input face
+    std::vector<std::vector<TopoDS_Face>> pieces(in.faces.size());
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+        const TopTools_ListOfShape& images = mv.Modified(inputs[i]);
+        if (images.IsEmpty()) pieces[i].push_back(inputs[i]);
+        for (const auto& img : images) pieces[i].push_back(TopoDS::Face(img));
+        for (const auto& pc : pieces[i]) piece_owner.Bind(pc, static_cast<int>(i));
+    }
+    struct Support {
+        int count = 0;
+        Vec3 sample = Vec3::Zero();
+    };
+    TopTools_DataMapOfShapeInteger piece_index;
+    std::vector<Support> support;
+    std::vector<int> outward(in.faces.size(), 0);  // material side: +1 along the surface normal, -1 against
+    for (std::size_t i = 0; i < in.faces.size(); ++i) {
+        const FaceInput& f = in.faces[i];
+        double side = 0;
+        for (std::size_t k = 0; k < f.points.size() && k < f.normals.size(); ++k) side += fit::normal_at(f.surface, f.points[k]).dot(f.normals[k]);
+        outward[i] = side > 0 ? 1 : side < 0 ? -1 : 0;
+        for (const auto& pc : pieces[i]) {
+            piece_index.Bind(pc, static_cast<int>(support.size()));
+            support.push_back({});
+        }
+        if (outward[i] == 0) continue;
+        const std::size_t stride = f.points.size() > in.max_vote_points ? (f.points.size() + in.max_vote_points - 1) / in.max_vote_points : 1;
+        for (std::size_t k = 0; k < f.points.size(); k += stride) {
+            const Vec3 p = fit::project(f.surface, f.points[k]);
+            for (const auto& pc : pieces[i])
+                if (face_contains(pc, p)) {
+                    Support& s = support[static_cast<std::size_t>(piece_index.Find(pc))];
+                    if (s.count++ == 0) s.sample = p;
+                    break;
+                }
+        }
+    }
+
+    // 2. Material cells: each supported piece votes with its points, for the cell on its material side.
+    std::vector<TopoDS_Shape> cell_shapes;
+    std::vector<std::vector<int>> cell_pieces;
+    std::vector<bool> is_material;
+    for (TopExp_Explorer ex(cells, TopAbs_SOLID); ex.More(); ex.Next()) {
+        long vote = 0;
+        std::vector<int> pcs;
+        for (TopExp_Explorer fx(ex.Current(), TopAbs_FACE); fx.More(); fx.Next()) {
+            const TopoDS_Face& face = TopoDS::Face(fx.Current());
+            if (!piece_index.IsBound(face)) continue;
+            pcs.push_back(piece_index.Find(face));
+            const Support& s = support[static_cast<std::size_t>(pcs.back())];
+            if (s.count == 0) continue;
+            const auto i = static_cast<std::size_t>(piece_owner.Find(face));
+            const auto n = face_normal(face, s.sample);
+            if (!n) continue;
+            const Vec3 material_out = outward[i] * fit::normal_at(in.faces[i].surface, s.sample);
+            vote += n->dot(material_out) > 0 ? s.count : -s.count;
+        }
+        cell_shapes.push_back(ex.Current());
+        cell_pieces.push_back(std::move(pcs));
+        is_material.push_back(vote > 0);
+    }
+    TopTools_ListOfShape material;
+    for (std::size_t c = 0; c < cell_shapes.size(); ++c)
+        if (is_material[c]) material.Append(cell_shapes[c]);
+    out.log.push_back(std::format("{} faces split space into {} cells, {} of them material", in.faces.size(), cell_shapes.size(), material.Extent()));
+
+    // How much of the scan ends up on the solid's boundary (pieces with material on exactly one side). Where
+    // the scan is open (a bottom never seen) the faces enclose nothing there, and the scanned faces around
+    // the opening bound no cell.
+    {
+        std::vector<int> material_sides(support.size(), 0);
+        for (std::size_t c = 0; c < cell_shapes.size(); ++c)
+            if (is_material[c])
+                for (const int pc : cell_pieces[c]) ++material_sides[static_cast<std::size_t>(pc)];
+        long total = 0, bounding = 0;
+        for (std::size_t pc = 0; pc < support.size(); ++pc) {
+            total += support[pc].count;
+            if (material_sides[pc] == 1) bounding += support[pc].count;
+        }
+        out.scan_coverage = total > 0 ? static_cast<double>(bounding) / static_cast<double>(total) : 0;
+        if (out.scan_coverage < 0.9)
+            out.log.push_back(std::format("only {:.0f}% of the scanned faces bound the solid: the faces do not enclose the part. "
+                                          "Add a face where the scan is open (e.g. the bottom it stood on).",
+                                          100 * out.scan_coverage));
+    }
+    if (material.IsEmpty()) {
+        out.log.push_back("no cell is on the material side of the scan");
+        return out;
+    }
+
+    TopoDS_Shape shape;
+    if (material.Extent() == 1) {
+        shape = material.First();
+    } else {
+        BOPAlgo_CellsBuilder cb;
+        cb.SetArguments(material);
+        cb.SetRunParallel(true);
+        cb.Perform();
+        if (cb.HasErrors()) {
+            out.log.push_back("the material cells could not be joined");
+            return out;
+        }
+        cb.AddAllToResult(1, false);
+        cb.RemoveInternalBoundaries();
+        shape = cb.Shape();
+    }
+    {
+        ShapeUpgrade_UnifySameDomain unify(shape, true, true, false);
+        unify.Build();
+        shape = unify.Shape();
+    }
+
+    // 3. Fillets on the edges between their two faces.
+    if (!in.fillets.empty()) {
+        TopTools_IndexedDataMapOfShapeListOfShape edge_faces;
+        TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, edge_faces);
+        const auto owner = [&](const TopoDS_Shape& f) -> int {
+            const auto p = point_on(TopoDS::Face(f));
+            if (!p) return -1;
+            for (std::size_t i = 0; i < in.faces.size(); ++i)
+                if (std::abs(fit::signed_distance(in.faces[i].surface, *p)) < 1e-4) return static_cast<int>(i);
+            return -1;
+        };
+        std::vector<std::vector<TopoDS_Edge>> fillet_edges(in.fillets.size());
+        for (int e = 1; e <= edge_faces.Extent(); ++e) {
+            const TopTools_ListOfShape& faces = edge_faces(e);
+            if (faces.Extent() != 2) continue;
+            const int a = owner(faces.First()), b = owner(faces.Last());
+            for (std::size_t k = 0; k < in.fillets.size(); ++k)
+                if ((in.fillets[k].face_a == a && in.fillets[k].face_b == b) || (in.fillets[k].face_a == b && in.fillets[k].face_b == a))
+                    fillet_edges[k].push_back(TopoDS::Edge(edge_faces.FindKey(e)));
+        }
+        BRepFilletAPI_MakeFillet all(shape);
+        int added = 0;
+        for (std::size_t k = 0; k < in.fillets.size(); ++k)
+            for (const auto& e : fillet_edges[k]) {
+                all.Add(in.fillets[k].radius, e);
+                ++added;
+            }
+        if (added > 0) {
+            all.Build();
+            if (all.IsDone()) {
+                shape = all.Shape();
+                out.log.push_back(std::format("{} fillets on {} edges", in.fillets.size(), added));
+            } else {
+                // One fillet at a time, to keep the ones that work and name the ones that do not.
+                out.log.push_back("the fillets failed together; trying them one at a time");
+                for (std::size_t k = 0; k < in.fillets.size(); ++k) {
+                    if (fillet_edges[k].empty()) {
+                        out.log.push_back(std::format("fillet '{}': its faces share no edge", in.fillets[k].name));
+                        continue;
+                    }
+                    // Edges must be found again on the current shape.
+                    TopTools_IndexedDataMapOfShapeListOfShape ef;
+                    TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, ef);
+                    BRepFilletAPI_MakeFillet one(shape);
+                    int n = 0;
+                    for (int e = 1; e <= ef.Extent(); ++e) {
+                        const TopTools_ListOfShape& faces = ef(e);
+                        if (faces.Extent() != 2) continue;
+                        const int a = owner(faces.First()), b = owner(faces.Last());
+                        if ((in.fillets[k].face_a == a && in.fillets[k].face_b == b) || (in.fillets[k].face_a == b && in.fillets[k].face_b == a)) {
+                            one.Add(in.fillets[k].radius, TopoDS::Edge(ef.FindKey(e)));
+                            ++n;
+                        }
+                    }
+                    one.Build();
+                    if (n > 0 && one.IsDone()) shape = one.Shape();
+                    else out.log.push_back(std::format("fillet '{}' (R{}) could not be made", in.fillets[k].name, in.fillets[k].radius));
+                }
+            }
+        }
+    }
+
+    // 4. Holes.
+    const double through = 2 * reach + 10;
+    for (const auto& h : in.holes) {
+        constexpr double kLead = 1.0;  // the cutter starts outside the entry face
+        const Vec3 start = h.entry - kLead * h.axis;
+        const double length = h.depth ? *h.depth + kLead : through;
+        const TopoDS_Shape tool = BRepPrimAPI_MakeCylinder(gp_Ax2(to_pnt(start), to_dir(h.axis)), 0.5 * h.diameter, length).Shape();
+        BRepAlgoAPI_Cut cut(shape, tool);
+        cut.SetRunParallel(true);
+        cut.Build();
+        if (cut.IsDone() && !cut.HasErrors()) shape = cut.Shape();
+        else out.log.push_back(std::format("hole '{}' could not be cut", h.name));
+    }
+
+    // 5. Check and describe.
+    out.shape = std::make_shared<Shape>(Shape{shape});
+    out.ok = BRepCheck_Analyzer(shape).IsValid();
+    if (!out.ok) out.log.push_back("the result is not a valid shape");
+    out.solids = count_of(shape, TopAbs_SOLID);
+    out.faces = count_of(shape, TopAbs_FACE);
+    out.edges = count_of(shape, TopAbs_EDGE);
+    out.closed = out.solids > 0;
+    if (out.closed) {
+        GProp_GProps props;
+        BRepGProp::VolumeProperties(shape, props);
+        out.volume = props.Mass();
+    }
+    for (TopExp_Explorer fx(shape, TopAbs_FACE); fx.More(); fx.Next()) out.face_names.push_back(name_face(TopoDS::Face(fx.Current()), in));
+    return out;
+}
+
+Result<void> write_step(const BuildResult& result, const std::filesystem::path& path, const std::string& part_name) {
+    if (!result.shape) return make_error(Errc::invalid_argument, "nothing to export");
+    const TopoDS_Shape& shape = result.shape->shape;
+    Handle(TDocStd_Document) doc;
+    XCAFApp_Application::GetApplication()->NewDocument("MDTV-XCAF", doc);
+    const Handle(XCAFDoc_ShapeTool) tool = XCAFDoc_DocumentTool::ShapeTool(doc->Main());
+    const TDF_Label label = tool->AddShape(shape, false);
+    TDataStd_Name::Set(label, TCollection_ExtendedString(part_name.c_str()));
+    std::size_t i = 0;
+    for (TopExp_Explorer fx(shape, TopAbs_FACE); fx.More(); fx.Next(), ++i) {
+        if (i >= result.face_names.size() || result.face_names[i].empty()) continue;
+        const TDF_Label sub = tool->AddSubShape(label, fx.Current());
+        if (!sub.IsNull()) TDataStd_Name::Set(sub, TCollection_ExtendedString(result.face_names[i].c_str()));
+    }
+    quiet_occt();
+    STEPCAFControl_Writer writer;  // (defines the STEP parameters, which are set after it)
+    Interface_Static::SetCVal("write.step.schema", "AP242DIS");
+    Interface_Static::SetCVal("write.step.unit", "MM");
+    Interface_Static::SetIVal("write.stepcaf.subshapes.name", 1);
+    writer.SetNameMode(true);
+    if (!writer.Transfer(doc, STEPControl_AsIs)) return make_error(Errc::io, "the shape could not be translated to STEP");
+    if (writer.Write(path.string().c_str()) != IFSelect_RetDone) return make_error(Errc::io, "could not write " + path.string());
+    return {};
+}
+
+Tessellation tessellate(const BuildResult& result, double deflection_mm) {
+    Tessellation out;
+    if (!result.shape) return out;
+    const TopoDS_Shape& shape = result.shape->shape;
+    BRepMesh_IncrementalMesh mesher(shape, deflection_mm, false, 0.3, true);
+    int face_index = 0;
+    for (TopExp_Explorer fx(shape, TopAbs_FACE); fx.More(); fx.Next(), ++face_index) {
+        const TopoDS_Face& face = TopoDS::Face(fx.Current());
+        TopLoc_Location loc;
+        const Handle(Poly_Triangulation) tri = BRep_Tool::Triangulation(face, loc);
+        if (tri.IsNull()) continue;
+        const auto base = static_cast<std::uint32_t>(out.mesh.vertices.size());
+        const gp_Trsf T = loc.Transformation();
+        for (int n = 1; n <= tri->NbNodes(); ++n) out.mesh.vertices.push_back(to_vec(tri->Node(n).Transformed(T)).cast<float>());
+        const bool reversed = face.Orientation() == TopAbs_REVERSED;
+        for (int t = 1; t <= tri->NbTriangles(); ++t) {
+            int a, b, c;
+            tri->Triangle(t).Get(a, b, c);
+            if (reversed) std::swap(b, c);
+            out.mesh.triangles.push_back({base + static_cast<std::uint32_t>(a - 1), base + static_cast<std::uint32_t>(b - 1), base + static_cast<std::uint32_t>(c - 1)});
+            out.triangle_face.push_back(face_index);
+        }
+    }
+    out.mesh.compute_normals();
+    TopTools_IndexedMapOfShape edges;
+    TopExp::MapShapes(shape, TopAbs_EDGE, edges);
+    for (int e = 1; e <= edges.Extent(); ++e) {
+        const TopoDS_Edge& edge = TopoDS::Edge(edges(e));
+        if (BRep_Tool::Degenerated(edge)) continue;
+        BRepAdaptor_Curve curve(edge);
+        GCPnts_TangentialDeflection pts(curve, 0.1, deflection_mm);
+        for (int i = 1; i < pts.NbPoints(); ++i) out.edges.push_back({to_vec(pts.Value(i)).cast<float>(), to_vec(pts.Value(i + 1)).cast<float>()});
+    }
+    return out;
+}
+
+StepSummary read_step(const std::filesystem::path& path) {
+    StepSummary s;
+    quiet_occt();
+    STEPCAFControl_Reader reader;
+    Interface_Static::SetIVal("read.stepcaf.subshapes.name", 1);
+    reader.SetNameMode(true);
+    if (reader.ReadFile(path.string().c_str()) != IFSelect_RetDone) {
+        s.error = "could not read " + path.string();
+        return s;
+    }
+    Handle(TDocStd_Document) doc;
+    XCAFApp_Application::GetApplication()->NewDocument("MDTV-XCAF", doc);
+    if (!reader.Transfer(doc)) {
+        s.error = "could not translate the file";
+        return s;
+    }
+    const Handle(XCAFDoc_ShapeTool) tool = XCAFDoc_DocumentTool::ShapeTool(doc->Main());
+    TDF_LabelSequence free;
+    tool->GetFreeShapes(free);
+    TopoDS_Compound all;
+    BRep_Builder builder;
+    builder.MakeCompound(all);
+    for (int i = 1; i <= free.Length(); ++i) {
+        builder.Add(all, XCAFDoc_ShapeTool::GetShape(free.Value(i)));
+        TDF_LabelSequence subs;
+        XCAFDoc_ShapeTool::GetSubShapes(free.Value(i), subs);
+        for (int k = 1; k <= subs.Length(); ++k) {
+            Handle(TDataStd_Name) name;
+            if (subs.Value(k).FindAttribute(TDataStd_Name::GetID(), name)) {
+                const TCollection_AsciiString ascii(name->Get());
+                s.face_names.emplace_back(ascii.ToCString());
+            }
+        }
+    }
+    s.solids = count_of(all, TopAbs_SOLID);
+    s.shells = count_of(all, TopAbs_SHELL);
+    s.faces = count_of(all, TopAbs_FACE);
+    s.edges = count_of(all, TopAbs_EDGE);
+    s.valid = BRepCheck_Analyzer(all).IsValid();
+    if (s.solids > 0) {
+        GProp_GProps props;
+        BRepGProp::VolumeProperties(all, props);
+        s.volume = props.Mass();
+    }
+    TopTools_IndexedMapOfShape faces;
+    TopExp::MapShapes(all, TopAbs_FACE, faces);
+    for (int i = 1; i <= faces.Extent(); ++i) {
+        BRepAdaptor_Surface ad(TopoDS::Face(faces(i)));
+        ++s.surface_kinds[kind_name(ad.GetType())];
+        if (ad.GetType() == GeomAbs_Cylinder) s.cylinder_radii.push_back(ad.Cylinder().Radius());
+    }
+    std::ranges::sort(s.cylinder_radii);
+    s.cylinder_radii.erase(std::unique(s.cylinder_radii.begin(), s.cylinder_radii.end(), [](double a, double b) { return std::abs(a - b) < 1e-6; }),
+                           s.cylinder_radii.end());
+    s.ok = true;
+    return s;
+}
+
+}  // namespace einstar::brep

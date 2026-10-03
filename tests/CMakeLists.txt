@@ -72,6 +72,11 @@ target_link_libraries(debug_depth_errors PRIVATE einstar::pipeline einstar::synt
 einstar_add_test(test_fit fit/test_topology.cpp fit/test_primitive_fit.cpp fit/test_grow.cpp fit/test_holes_detect.cpp fit/test_solve.cpp)
 target_link_libraries(test_fit PRIVATE einstar::fit)
 
+if(TARGET einstar::brep)
+  einstar_add_test(test_brep brep/test_brep.cpp)
+  target_link_libraries(test_brep PRIVATE einstar::brep einstar::fit)
+endif()
+
 if(EINSTAR_BUILD_APP)
   einstar_add_test(test_agent agent/test_agent.cpp)
   target_link_libraries(test_agent PRIVATE einstar::agent)
