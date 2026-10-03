@@ -8,6 +8,7 @@
 
 #include "einstar/brep/brep.hpp"
 #include "einstar/core/timing.hpp"
+#include "einstar/fit/deviation.hpp"
 #include "einstar/fit/grow.hpp"
 #include "einstar/fit/primitive_fit.hpp"
 #include "einstar/fit/synthetic_part.hpp"
@@ -136,4 +137,50 @@ TEST_CASE("without a face where the scan is open, the build says so") {
     std::println("open: ok {} closed {} solids {} volume {:.1f}, scan coverage {:.2f}", r.ok, r.closed, r.solids, r.volume, r.scan_coverage);
     CHECK(r.scan_coverage < 0.9);
     CHECK(std::ranges::any_of(r.log, [](const std::string& l) { return l.find("Add a face where the scan is open") != std::string::npos; }));
+}
+
+TEST_CASE("deviation of the scan from the model: small where it fits, a bump is one hot spot, the unseen bottom is unsupported") {
+    const brep::BuildResult model = brep::build(flanged_box(true));
+    REQUIRE(model.ok);
+    const brep::Tessellation tess = brep::tessellate(model, 0.01);
+    const fit::TriangleBvh model_bvh(tess.mesh);
+
+    // The scan with a 0.5 mm high bump (raised cosine, 3 mm radius) on the body's top at (12, -8).
+    recon::TriangleMesh scan = part().mesh;
+    const Vec3f bump(12, -8, 20);
+    for (std::size_t v = 0; v < scan.vertices.size(); ++v) {
+        const float r = (scan.vertices[v] - bump).norm();
+        if (r < 3 && scan.vertices[v].z() > 19.5f) scan.vertices[v].z() += 0.25f * (1 + std::cos(std::numbers::pi_v<float> * r / 3));
+    }
+    const fit::MeshTopology topo(scan);
+    Stopwatch sw;
+    const fit::DeviationField field = fit::scan_to_model(scan, model_bvh, tess.triangle_face);
+    const fit::DeviationReport rep = fit::summarise(topo, field, {});
+    std::println("deviation of {} vertices in {:.0f} ms: rms {:.4f} p95 {:.4f} max {:.4f} within 0.1 mm {:.1f}%, {} unmatched, {} hot spots",
+                 scan.vertices.size(), sw.elapsed_ms(), rep.overall.rms, rep.overall.p95, rep.overall.max_abs, 100 * rep.overall.within_tolerance,
+                 rep.unmatched, rep.hot_spots.size());
+    for (const auto& h : rep.hot_spots)
+        if (!h.edge_band)
+            std::println("  hot spot at ({:.2f}, {:.2f}, {:.2f}) {:.2f} mm2 ({:.1f} x {:.1f} mm), mean {:+.3f} peak {:+.3f} mm, face '{}'", h.centroid.x(),
+                         h.centroid.y(), h.centroid.z(), h.area_mm2, h.length_mm, h.width_mm, h.mean_mm, h.peak_mm,
+                         h.model_face >= 0 ? model.face_names[static_cast<std::size_t>(h.model_face)] : "-");
+    std::println("  {} edge bands", std::ranges::count_if(rep.hot_spots, &fit::HotSpot::edge_band));
+    CHECK(rep.overall.p95 < 0.1);
+    REQUIRE(!rep.hot_spots.empty());
+    const fit::HotSpot& h = rep.hot_spots.front();
+    CHECK((h.centroid - bump.cast<double>()).norm() < 0.5);
+    CHECK(h.mean_mm > 0.15);
+    CHECK(std::abs(h.peak_mm - 0.5) < 0.06);
+    CHECK(model.face_names[static_cast<std::size_t>(h.model_face)] == "box0 +z");
+    // Only the bump stands out; the scan's rounding of sharp edges shows as edge bands.
+    CHECK(!h.edge_band);
+    for (std::size_t i = 1; i < rep.hot_spots.size(); ++i) CHECK(rep.hot_spots[i].edge_band);
+
+    // The model's bottom has no scan behind it; its top does.
+    const fit::TriangleBvh scan_bvh(scan);
+    const fit::Coverage cov = fit::model_coverage(tess.mesh, tess.triangle_face, static_cast<int>(model.face_names.size()), scan_bvh);
+    for (std::size_t f = 0; f < model.face_names.size(); ++f) {
+        if (model.face_names[f] == "bottom") CHECK(cov.unsupported_area[f] > 0.9 * cov.face_area[f]);
+        if (model.face_names[f] == "box0 +z") CHECK(cov.unsupported_area[f] < 0.01 * cov.face_area[f]);
+    }
 }
