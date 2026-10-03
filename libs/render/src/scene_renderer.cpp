@@ -142,10 +142,20 @@ void SceneRenderer::set_frame_buffer(gpu::Ref<MTL::Buffer> buffer, std::size_t c
     frame_.capacity = 0;
 }
 
+void SceneRenderer::set_mesh_colors(std::span<const Rgba8> colors) {
+    mesh_colors_ = {};
+    if (colors.empty() || !mesh_vertices_ || colors.size() * sizeof(MeshVertex) != mesh_vertices_->length()) return;  // one per vertex
+    mesh_colors_ = ctx_->mirrored_buffer(colors.size_bytes());
+    if (!mesh_colors_) return;
+    std::memcpy(mesh_colors_->contents(), colors.data(), colors.size_bytes());
+    gpu::Context::cpu_modified(mesh_colors_.get());
+}
+
 void SceneRenderer::set_mesh(std::span<const MeshVertex> vertices, std::span<const std::uint32_t> indices) {
     mesh_index_count_ = 0;
     mesh_vertices_ = {};
     mesh_indices_ = {};
+    mesh_colors_ = {};
     if (vertices.empty() || indices.empty()) return;
     mesh_vertices_ = ctx_->mirrored_buffer(vertices.size_bytes());
     mesh_indices_ = ctx_->mirrored_buffer(indices.size_bytes());
@@ -206,6 +216,9 @@ void SceneRenderer::encode(MTL::RenderCommandEncoder* enc, const ViewCamera& cam
     if (s.show_mesh && mesh_index_count_ > 0) {
         enc->setRenderPipelineState(mesh_pso_.get());
         enc->setVertexBuffer(mesh_vertices_.get(), 0, 0);
+        const std::uint32_t colored = mesh_colors_ ? 1u : 0u;
+        enc->setVertexBuffer(mesh_colors_ ? mesh_colors_.get() : mesh_vertices_.get(), 0, 2);
+        enc->setVertexBytes(&colored, sizeof(colored), 3);
         enc->drawIndexedPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(mesh_index_count_), MTL::IndexTypeUInt32,
                                    mesh_indices_.get(), NS::UInteger(0));
     }

@@ -71,6 +71,22 @@ variants on discrete GPUs.
 - Headless: `--snapshot out.png [seconds] [--complete] [--write] [--tab live|coverage]
   [--load <captures dir>] [--reference <calibration>]`.
 
+### Einstar Model: scan to CAD
+
+![Einstar Model](docs/images/einstar-model.png)
+
+`build/apps/EinstarModel.app` (needs `brew install opencascade`)
+- **From a scan to a STEP solid:** faces, holes and fillets you can pick in CAD, not a mesh.
+- **Labels:** *Detect faces* proposes every plane, cylinder, cone, sphere and torus, and sorts out fillets,
+  hole walls and holes. A brush paints a few mm of a face, and it grows into the whole face.
+- **What you know about the part:** square to a datum, measured diameters, radii, distances and depths,
+  faces the scanner could not see. All of it is held exactly when the faces are fitted together, and each
+  constraint reports what it costs.
+- **Deviation map:** the scan against the built solid, with hot spots where the model departs from it.
+- **Agents:** every modelling command is an MCP tool. An agent can work headless, or attach to the window you
+  have open.
+- Headless: `--snapshot out.png` (the demo part, modelled). See `docs/model.md`.
+
 ### einstar-cli: command-line tools
 
 `build/apps/einstar-cli <command>`. Calibrations are given as a directory of
@@ -144,11 +160,13 @@ cmake -B build && cmake --build build -j && ctest --test-dir build --output-on-f
 ```
 
 - **Requirements:** the Xcode Command Line Tools and Homebrew `libusb eigen ceres-solver tbb zstd
-  nlohmann-json`. CMake fetches GLFW, Dear ImGui, Catch2, metal-cpp and nanoflann.
+  nlohmann-json`, plus `opencascade` for Einstar Model (optional). CMake fetches GLFW, Dear ImGui, Catch2,
+  metal-cpp and nanoflann.
 - **Intel Macs:** Homebrew has no prebuilt packages for several of these; build the missing ones with
   `brew install --build-from-source`. Older Command Line Tools keep `std::jthread` experimental; CMake detects
   that and adds `-fexperimental-library`.
-- **Outputs:** `build/apps/` (Einstar.app, EinstarCalibration.app, einstar-cli, einstar-firmware) and
+- **Outputs:** `build/apps/` (Einstar.app, EinstarCalibration.app, EinstarModel.app, einstar-cli,
+  einstar-firmware) and
   `build/tools/einstar-bench`. The default build type is RelWithDebInfo. For a debug build with the
   sanitizers, use a separate directory:
   `cmake -B build-debug -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"`.
@@ -162,10 +180,14 @@ cmake -B build && cmake --build build -j && ctest --test-dir build --output-on-f
 
 ## Agent control
 
-Both apps can be driven headless by an agent (e.g. Claude Code) through `einstar-mcp`, an MCP server (Python,
-run with `uv`) registered in `.mcp.json`: build the apps, launch them, connect the emulator or the scanner,
-scan, edit, process, calibrate, take screenshots, click widgets and read the app's state and log. See
-`docs/agent.md`.
+The apps can be driven by an agent (e.g. Claude Code) through `einstar-mcp`, an MCP server (Python, run with
+`uv`) registered in `.mcp.json`. It can:
+- build the apps, launch them, and connect the emulator or the scanner;
+- scan, edit, process and calibrate;
+- model a part and export it, either headless or attached to the modelling window you have open;
+- take screenshots, click widgets, and read each app's state and log.
+
+See `docs/agent.md` and `docs/model.md`.
 
 ## Safety
 
@@ -179,4 +201,5 @@ Projector and strobe levels are clamped, and the light sources are switched off 
 
 `docs/` describes the USB protocol (`protocol-transport.md`, `protocol-device.md`), the firmware
 (`firmware.md`), the calibration format and procedure (`calibration.md`), the algorithms (`algorithms.md`),
-recording and processing (`process.md`), and the current state of the project (`status.md`).
+recording and processing (`process.md`), scan-to-CAD modelling (`model.md`), and the current state of the project
+(`status.md`).

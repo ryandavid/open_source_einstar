@@ -68,7 +68,36 @@ def main() -> int:
         captured = result(m, "calib_state")["captured"]
         assert result(m, "calib_capture")["count"] == captured + 1
 
-        assert len(result(m, "app_list")) == 2
+        # The modelling app: the demo part from scan to STEP, as an agent would do it, then the scan made above.
+        ok(m, "app_launch", app="model")
+        ok(m, "model_open_demo")
+        ok(m, "model_begin_change", description="detect the faces and square the part")
+        assert len(result(m, "model_detect")["holes"]) == 5
+        top = result(m, "model_raycast", origin=[10, 8, 100], direction=[0, 0, -1])["label"]
+        right = result(m, "model_raycast", origin=[80, 3, 12], direction=[-1, 0, 0])["label"]
+        ok(m, "model_label_update", label=top, name="top")
+        ok(m, "model_label_update", label=right, name="right")
+        ok(m, "model_datum_create", name="part", z="top", x="right")
+        assert len(result(m, "model_square", datum="part")["added"]) == 10
+        ok(m, "model_face_add_plane", name="bottom", datum="part", axis="z", offset=-20, facing="-")
+        ok(m, "model_end_change")
+        history = result(m, "model_history")
+        assert len(history["undo"]) == 1 and history["undo"][0]["author"] == "agent"
+        assert result(m, "model_solve")["converged"]
+        built = result(m, "model_build")
+        assert built["ok"] and built["closed"], built
+        assert result(m, "model_deviation")["overall"]["p95_mm"] < 0.15
+        ok(m, "model_view", mode="deviation", preset="iso", frame="all")
+        shot = ok(m, "ui_screenshot", app="model", max_size=400)
+        assert shot.content[0].type == "image"
+        step = data / "part.step"
+        assert result(m, "model_export_step", path=str(step))["read_back"]["valid"]
+        assert step.stat().st_size > 10000
+        assert result(m, "model_open", path=str(mesh))["scan"]["triangles"] > 1000
+        assert m.call("model_grow", {}).is_error  # refused: nothing painted, said so
+
+        assert len(result(m, "app_list")) == 3
+        ok(m, "app_quit", app="model")
         ok(m, "app_quit", app="scan")
         ok(m, "app_quit", app="calibration")
         assert m.call("scan_state", {}).is_error

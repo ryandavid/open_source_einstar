@@ -53,8 +53,10 @@ public:
     // spec would be invisible to the agent).
     void handle(std::string_view method, Handler handler);
 
-    // Listens on `socket_path` (replacing a stale socket file). False with the reason in `why`.
-    bool start(const std::string& socket_path, std::string& why);
+    // Listens on `socket_path` (replacing a stale socket file; only this user may connect). False with the
+    // reason in `why`. `quit_with_parent`: the app quits when the process that launched it goes away (an agent's
+    // headless run); an app the user started for an agent to attach to passes false.
+    bool start(const std::string& socket_path, std::string& why, bool quit_with_parent = true);
     void stop();
 
     // Once per frame on the UI thread, before ImGui::NewFrame().

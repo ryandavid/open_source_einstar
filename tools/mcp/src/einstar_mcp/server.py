@@ -16,14 +16,34 @@ from .client import AgentError
 from .supervisor import LaunchError, Supervisor
 
 INSTRUCTIONS = """\
-Drives the Einstar apps (the open EXStar replacement) headless: 'scan' (scanning: connect, scan, edit, process,
-export) and 'calibration' (the camera calibration). Start with app_launch(app); if the apps are not built yet,
-app_build() builds them. The built-in emulator needs no hardware: device_connect(emulator=true) /
-calib_connect(emulator=true). Look with ui_screenshot and the app's own state (scan_state / calib_state); find
-widgets with ui_snapshot and drive them with input_* (window points, origin top left). Methods answer once their
-effect has been drawn. app_logs reads the app's log with a cursor; app_output shows what a crashed app printed."""
+Drives the Einstar apps (the open EXStar replacement): 'scan' (scanning: connect, scan, edit, process, export),
+'calibration' (the camera calibration) and 'model' (scan to CAD: faces, holes, fillets, constraints, a solid, STEP).
+Start with app_launch(app) (headless unless visible=true); to work in the modelling window the user has open, use
+app_attach(app="model") instead. If the apps are not built yet, app_build() builds them. The built-in emulator needs no
+hardware: device_connect(emulator=true) / calib_connect(emulator=true). Look with ui_screenshot and the app's own
+state (scan_state / calib_state / model_summary); find widgets with ui_snapshot and drive them with input_* (window
+points, origin top left). Methods answer once their effect has been drawn. app_logs reads the app's log with a cursor;
+app_output shows what a crashed app printed.
 
-APP_PARAM = {"type": "string", "enum": ["scan", "calibration"], "description": "Which app: scan or calibration."}
+Modelling (the model app) -- the user describes the part in words and measurements; you turn that into the model:
+- model_summary first and after changes: labels (named regions of the scan, each with a fitted surface and a role),
+  holes, fillets, datums, constraints (with their status from the last solve), the built model.
+- Wrap each request you carry out in model_begin_change(description) .. model_end_change: the user undoes it as one
+  step and sees it as yours in the history.
+- Faces: model_detect proposes them all; rename labels to what the user calls them (model_label_update). To pick out a
+  face yourself: model_raycast or model_label for positions, then model_paint (a few mm on the face) and model_grow.
+- 'Make it square': model_datum_create (z from the main face, x from a side), then model_square. Prefer one datum
+  with aligned faces over pairwise perpendicular constraints.
+- Measurements: model_hole_update(diameter) for a measured hole, model_fillet_update(radius), and
+  model_constraint_add (distance between faces, offset from the datum, diameter, angle ...).
+- Where the scan is open (the bottom it stood on, a blind hole's floor), the model needs the user's knowledge:
+  model_face_add_plane for an unseen face, model_hole_update(depth) for a blind hole. Ask when you do not know.
+- model_solve, then model_build; check model_deviation (hot spots: where the model departs from the scan; edge bands
+  are the scan rounding sharp edges, not errors) and model_view + ui_screenshot to look. Report conflicts and what
+  each measurement cost (how far it moved the surfaces off the scan) rather than hiding them.
+- model_export_step writes the STEP file the user imports into CAD."""
+
+APP_PARAM = {"type": "string", "enum": ["scan", "calibration", "model"], "description": "Which app: scan, calibration or model."}
 
 # Lifecycle tools (this server's own); every other tool is an agent method of the same (dotted) name.
 LIFECYCLE: dict[str, tuple[str, dict[str, Any]]] = {
@@ -46,7 +66,12 @@ LIFECYCLE: dict[str, tuple[str, dict[str, Any]]] = {
             "required": ["app"],
         },
     ),
-    "app_quit": ("Quits an app.", {"type": "object", "properties": {"app": APP_PARAM}, "required": ["app"]}),
+    "app_attach": (
+        "Connects to the modelling app the user has open, so you work in their window alongside them (their undo history "
+        "shows your changes as yours). Fails if it is not open: then ask the user to open it, or app_launch it.",
+        {"type": "object", "properties": {"app": {"type": "string", "enum": ["model"], "description": "The app (model)."}}, "required": ["app"]},
+    ),
+    "app_quit": ("Quits an app (an attached one is only let go of).", {"type": "object", "properties": {"app": APP_PARAM}, "required": ["app"]}),
     "app_list": ("The apps this server runs, and whether they are still running.", {"type": "object", "properties": {}}),
     "app_output": (
         "The last lines the app process printed (stdout and stderr, as captured here): what preceded a crash. For the "
@@ -123,13 +148,17 @@ class EinstarMcp:
         sup = self.supervisor
         app = args.get("app")
         if app is not None and app not in paths.APPS:
-            return fail("app is scan or calibration")
+            return fail("app is scan, calibration or model")
         try:
             if name == "app_build":
                 return build(args.get("target"))
+            if name == "app_attach":
+                if not app:
+                    return fail("app is model")
+                return ok(json.dumps(sup.attach(app), indent=1))
             if name == "app_launch":
                 if not app:
-                    return fail("app is scan or calibration")
+                    return fail("app is scan, calibration or model")
                 return ok(json.dumps(sup.launch(app, bool(args.get("visible", False)), args.get("data_dir")), indent=1))
             if name == "app_quit":
                 return ok(json.dumps(sup.quit(app)))
@@ -146,7 +175,7 @@ class EinstarMcp:
                 return fail(f"no tool '{name}'")
             target = app if m["app"] == "any" else m["app"]
             if not target:
-                return fail("app is scan or calibration")
+                return fail("app is scan, calibration or model")
             params = {k: v for k, v in args.items() if k != "app"}
             # Waits answer within their own timeout; everything else within a minute (a stuck UI answers `busy`).
             timeout = max(60.0, params.get("timeout_ms", 0) / 1000.0 + 10.0)

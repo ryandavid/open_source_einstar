@@ -239,6 +239,7 @@ struct Document::Impl {
         for (const char* key : {"label", "a", "b"})
             if (spec.contains(key) && spec[key].is_number_integer()) spec[key] = label_name(spec[key].get<int>());
         if (spec.contains("datum")) spec["datum"] = datum_name(spec["datum"].get<int>());
+        if (spec.contains("axis") && spec["axis"].is_number_integer()) spec["axis"] = std::string(1, "xyz"[std::clamp(spec["axis"].get<int>(), 0, 2)]);
         if (spec.contains("hole")) {
             const int hole = spec["hole"].get<int>();
             for (const auto& h : d.state_.holes)

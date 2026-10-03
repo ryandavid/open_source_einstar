@@ -60,6 +60,17 @@ app_launch(app="calibration"); calib_connect(emulator=true); calib_state()
 Agent-run scans and captures go to a temporary folder unless `app_launch` is given `data_dir` (or the
 app's `EINSTAR_SCAN_DIR` / `EINSTAR_CALIBRATION_DIR` is set).
 
+## Attaching to an open app
+
+Einstar Model can also be driven in the window the user has open, rather than in a headless copy:
+- **Started by the user** (not with `--mcp`), it listens on
+  `~/Library/Application Support/Einstar/model-agent.sock`. The socket is mode 0600, and it is not tied to the
+  process that launched the app.
+- **`app_attach(app="model")`** connects to it. `app_quit` then only lets go: the app stays open for the user.
+- **A second instance** of the app leaves the first one's socket alone.
+- **Changes the agent makes** show in the app's history as the agent's. `model.begin_change` / `model.end_change`
+  around a request make it one undo step.
+
 ## By hand
 
 ```

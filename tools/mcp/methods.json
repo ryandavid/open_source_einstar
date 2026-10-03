@@ -1929,6 +1929,61 @@
   },
   {
     "app": "model",
+    "description": "What the modelling app's 3D view shows and from where (then ui.screenshot to see it). mode: labels (each label's colour; painted seeds brighter), deviation (green within tolerance, yellow-red where the scan is outside the model, cyan-blue inside), model (the built solid). preset: look from top, bottom, front, back, left, right or iso (in the first datum's axes when there is one). frame: fit a label (or 'all') in the view.",
+    "kind": "mutating",
+    "name": "model.view",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "edges": {
+          "description": "Draw the model's edges.",
+          "type": "boolean"
+        },
+        "frame": {
+          "description": "A label's name, or 'all'.",
+          "type": "string"
+        },
+        "mode": {
+          "description": "What to show.",
+          "enum": [
+            "labels",
+            "deviation",
+            "model"
+          ],
+          "type": "string"
+        },
+        "orbit": {
+          "description": "[dx, dy] radians, as a left-drag would.",
+          "items": {
+            "type": "number"
+          },
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array"
+        },
+        "preset": {
+          "description": "Look from.",
+          "enum": [
+            "top",
+            "bottom",
+            "front",
+            "back",
+            "left",
+            "right",
+            "iso"
+          ],
+          "type": "string"
+        },
+        "zoom": {
+          "description": "Multiply the distance by this (0.5: twice as close).",
+          "type": "number"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
     "description": "Starts a change: everything until model.end_change is one undo step (use it around each request you carry out).",
     "kind": "mutating",
     "name": "model.begin_change",

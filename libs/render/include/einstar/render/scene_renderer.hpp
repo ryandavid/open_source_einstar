@@ -45,6 +45,9 @@ public:
     void set_frame_buffer(gpu::Ref<MTL::Buffer> buffer, std::size_t count);
     // Processed triangle mesh (replaces any previous one; empty clears it).
     void set_mesh(std::span<const MeshVertex> vertices, std::span<const std::uint32_t> indices);
+    // A colour per mesh vertex (labels, a deviation map); empty: the default grey. Set after set_mesh (which
+    // clears them); recolouring does not upload the geometry again.
+    void set_mesh_colors(std::span<const Rgba8> colors);
     [[nodiscard]] bool has_mesh() const { return mesh_index_count_ > 0; }
     // Model points the selection contains are highlighted (an empty selection highlights nothing).
     void set_selection(const LassoSelection& selection);
@@ -75,7 +78,7 @@ private:
     std::optional<Mat4f> scanner_pose_;
     gpu::Ref<MTL::Buffer> lasso_strokes_, lasso_masks_;
     std::uint32_t lasso_count_ = 0;
-    gpu::Ref<MTL::Buffer> mesh_vertices_, mesh_indices_;
+    gpu::Ref<MTL::Buffer> mesh_vertices_, mesh_indices_, mesh_colors_;
     std::size_t mesh_index_count_ = 0;
     gpu::Ref<MTL::DepthStencilState> depth_state_;
     Layer model_, frame_, markers_, lines_;

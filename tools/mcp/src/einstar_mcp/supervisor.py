@@ -27,7 +27,7 @@ class LaunchError(Exception):
 @dataclass
 class _Proc:
     app: str
-    popen: subprocess.Popen
+    popen: subprocess.Popen | None  # None: an app the user started, attached to
     socket: str
     visible: bool
     tail: collections.deque = field(default_factory=lambda: collections.deque(maxlen=TAIL_LINES))
@@ -60,7 +60,7 @@ class Supervisor:
             raise LaunchError(f"{exe} does not exist: the apps are not built. app_build() builds them (or `cmake -B build && cmake --build build`).")
         sock = f"/tmp/einstar_mcp_{app}_{os.getpid()}.sock"
         env = dict(os.environ)
-        if data_dir:
+        if data_dir and paths.APPS[app][2]:
             env[paths.APPS[app][2]] = data_dir
         args = [str(exe), f"--mcp={sock}"] + (["--visible"] if visible else [])
         popen = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True, errors="replace")
@@ -87,6 +87,27 @@ class Supervisor:
             pass
         return info
 
+    def attach(self, app: str) -> dict[str, Any]:
+        """Connects to an app the user started (it listens on a well-known socket); the user keeps working in it."""
+        if app not in paths.ATTACHABLE:
+            raise LaunchError(f"the {app} app cannot be attached to (only: {', '.join(paths.ATTACHABLE)})")
+        if app in self._procs:
+            self.quit(app)
+        sock = paths.attach_socket(app)
+        try:
+            client = AgentClient(str(sock))
+        except OSError as e:
+            raise LaunchError(f"no {app} app is open to attach to ({sock}: {e}). Ask the user to open it, or app_launch it.") from e
+        proc = _Proc(app, None, str(sock), True)
+        proc.client = client
+        self._procs[app] = proc
+        info = {"app": app, "attached": True, "socket": str(sock)}
+        try:
+            info["info"] = client.call("app.info", timeout_s=10)
+        except AgentError:
+            pass
+        return info
+
     @staticmethod
     def _pump(proc: _Proc, stream) -> None:
         for line in stream:
@@ -94,6 +115,11 @@ class Supervisor:
 
     def _stop(self, proc: _Proc) -> int | None:
         p = proc.popen
+        if p is None:  # attached: let go, the app stays open
+            if proc.client:
+                proc.client.close()
+                proc.client = None
+            return None
         if p.poll() is None:
             if proc.client:
                 try:
@@ -120,6 +146,8 @@ class Supervisor:
         if proc is None:
             raise LaunchError(f"the {app} app is not running")
         status = self._stop(proc)
+        if proc.popen is None:
+            return {"detached": True}
         self._gone[app] = proc
         return {"quit": True, "exit_status": status}
 
@@ -133,6 +161,9 @@ class Supervisor:
     def list(self) -> list[dict[str, Any]]:
         out = []
         for app, proc in self._procs.items():
+            if proc.popen is None:
+                out.append({"app": app, "attached": True})
+                continue
             status = proc.popen.poll()
             entry = {"app": app, "pid": proc.popen.pid, "running": status is None, "visible": proc.visible}
             if status is not None:
@@ -144,11 +175,16 @@ class Supervisor:
         proc = self._procs.get(app)
         if proc is None:
             raise AgentError(-32003, f'the {app} app is not running: app_launch(app="{app}") first')
-        if proc.popen.poll() is not None:
+        if proc.popen is not None and proc.popen.poll() is not None:
             raise AgentError(-32003, f"the {app} app has exited (status {proc.popen.returncode}); its last output:\n{proc.last(80)}")
         try:
             return proc.client.call(method, params, timeout_s)
         except (AgentError, OSError) as e:
+            if proc.popen is None:
+                if isinstance(e, AgentError):
+                    raise
+                self._procs.pop(app, None)
+                raise AgentError(-32003, f"lost the {app} app ({e}): was it closed? app_attach again once it is open") from e
             time.sleep(0.2)  # (a crash takes a moment to be reaped)
             if proc.popen.poll() is not None:
                 raise AgentError(-32003, f"{e}\nthe {app} app has exited (status {proc.popen.returncode}); its last output:\n{proc.last(80)}") from e

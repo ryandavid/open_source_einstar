@@ -327,6 +327,17 @@ std::vector<MethodSpec> build() {
         object({{"tolerance_mm", num("Deviation tolerance (default 0.1).")}, {"deflection_mm", num("Tessellation accuracy (default 0.02).")}}));
     add("model.export_step", model, read_only, "Writes the built solid as STEP (AP242, mm, faces named after labels) and reads it back to check.",
         object({{"path", str("The .step file.")}}, {"path"}));
+    add("model.view", model, mutating,
+        "What the modelling app's 3D view shows and from where (then ui.screenshot to see it). mode: labels (each label's "
+        "colour; painted seeds brighter), deviation (green within tolerance, yellow-red where the scan is outside the model, "
+        "cyan-blue inside), model (the built solid). preset: look from top, bottom, front, back, left, right or iso (in the "
+        "first datum's axes when there is one). frame: fit a label (or 'all') in the view.",
+        object({{"mode", one_of({"labels", "deviation", "model"}, "What to show.")},
+                {"preset", one_of({"top", "bottom", "front", "back", "left", "right", "iso"}, "Look from.")},
+                {"frame", str("A label's name, or 'all'.")},
+                {"edges", boolean("Draw the model's edges.")},
+                {"orbit", point("[dx, dy] radians, as a left-drag would.")},
+                {"zoom", num("Multiply the distance by this (0.5: twice as close).")}}));
     add("model.begin_change", model, mutating,
         "Starts a change: everything until model.end_change is one undo step (use it around each request you carry out).",
         object({{"description", str("What the change does, as the user sees it in the history.")}}));

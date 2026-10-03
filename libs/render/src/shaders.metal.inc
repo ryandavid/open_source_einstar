@@ -143,14 +143,18 @@ struct MeshOut {
     float4 position [[position]];
     float3 view_pos;
     float3 view_normal;
+    float3 color;
 };
 
-vertex MeshOut mesh_vs(uint vid [[vertex_id]], const device MeshVertex* vs [[buffer(0)]], constant Uniforms& u [[buffer(1)]]) {
+// Per-vertex colours (labels, a deviation map) when `colored`, else light grey.
+vertex MeshOut mesh_vs(uint vid [[vertex_id]], const device MeshVertex* vs [[buffer(0)]], constant Uniforms& u [[buffer(1)]],
+                       const device uchar4* colors [[buffer(2)]], constant uint& colored [[buffer(3)]]) {
     MeshOut o;
     const float4 vp = u.view * float4(float3(vs[vid].pos), 1.0);
     o.position = u.proj * vp;
     o.view_pos = vp.xyz;
     o.view_normal = (u.view * float4(float3(vs[vid].normal), 0.0)).xyz;
+    o.color = colored != 0 ? float4(colors[vid]).rgb / 255.0 : float3(0.82, 0.83, 0.86);
     return o;
 }
 
@@ -186,7 +190,7 @@ fragment float4 mesh_fs(MeshOut in [[stage_in]]) {
     const float3 l = normalize(-in.view_pos);
     const float d = dot(n, l);
     // Front faces light grey, back faces (inside of the surface) tinted so holes are recognisable.
-    const float3 base = d >= 0 ? float3(0.82, 0.83, 0.86) : kBackColor;
+    const float3 base = d >= 0 ? in.color : kBackColor;
     const float shade = 0.2 + 0.8 * abs(d);
     const float3 h = normalize(l + l);
     const float spec = pow(max(abs(dot(n, h)), 0.0), 40.0) * 0.25;

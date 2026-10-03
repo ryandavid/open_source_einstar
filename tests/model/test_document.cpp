@@ -43,7 +43,7 @@ std::string label_along(model::Document& doc, json origin, json direction) {
 TEST_CASE("the agent's method table and the document's commands are the same list") {
     std::set<std::string> specs, commands;
     for (const auto& s : agent::method_specs())
-        if (s.app == agent::App::model) specs.insert(s.name.substr(std::string("model.").size()));
+        if (s.app == agent::App::model && s.name != "model.view") specs.insert(s.name.substr(std::string("model.").size()));  // view: the app's
     for (const auto& c : model::Document::commands()) commands.insert(c);
     CHECK(specs == commands);
 }

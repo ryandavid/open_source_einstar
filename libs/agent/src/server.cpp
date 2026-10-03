@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -337,7 +338,7 @@ void Server::register_builtins() {
 
 // ---- the socket ----
 
-bool Server::start(const std::string& path, std::string& why) {
+bool Server::start(const std::string& path, std::string& why, bool quit_with_parent) {
     std::signal(SIGPIPE, SIG_IGN);  // a client going away must not kill the app
     sockaddr_un addr{};
     if (path.size() >= sizeof(addr.sun_path)) {
@@ -356,8 +357,9 @@ bool Server::start(const std::string& path, std::string& why) {
         listen_fd_ = -1;
         return false;
     }
+    ::chmod(path.c_str(), 0600);
     socket_path_ = path;
-    parent_pid_ = ::getppid();
+    parent_pid_ = quit_with_parent ? ::getppid() : 0;
     acceptor_ = std::thread([this] { accept_loop(); });
     return true;
 }

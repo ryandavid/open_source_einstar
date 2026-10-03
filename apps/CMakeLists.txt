@@ -24,6 +24,22 @@ target_link_libraries(einstar-calibrate PRIVATE einstar::agent einstar::render_t
   "-framework Cocoa" "-framework Metal" "-framework QuartzCore" "-framework ImageIO" "-framework CoreGraphics")
 target_compile_options(einstar-calibrate PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
 einstar_target_defaults(einstar-calibrate)
+
+# Scan to CAD (needs OpenCASCADE for solids and STEP: libs/brep, libs/model).
+if(TARGET einstar::model)
+add_executable(einstar-model MACOSX_BUNDLE
+  einstar-model/main.mm
+  einstar-model/model_app.cpp
+  einstar-model/dialogs.mm
+  einstar-model/agent_methods.cpp)
+set_target_properties(einstar-model PROPERTIES OUTPUT_NAME EinstarModel)
+target_include_directories(einstar-model PRIVATE einstar-model common)
+target_link_libraries(einstar-model PRIVATE einstar::agent einstar::render einstar::model imgui glfw
+  "-framework Cocoa" "-framework Metal" "-framework QuartzCore" "-framework ImageIO" "-framework CoreGraphics"
+  "-framework UniformTypeIdentifiers")
+target_compile_options(einstar-model PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
+einstar_target_defaults(einstar-model)
+endif()
 endif()
 
 # Firmware: report the scanner's version, check an update package, flash one (docs/firmware.md 4).
