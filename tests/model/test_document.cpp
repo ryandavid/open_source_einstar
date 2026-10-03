@@ -1,17 +1,21 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <numbers>
 #include <print>
 #include <set>
 
+#include <unistd.h>
+
 #include "einstar/agent/protocol.hpp"
 #include "einstar/brep/brep.hpp"
 #include "einstar/core/timing.hpp"
 #include "einstar/fit/synthetic_part.hpp"
 #include "einstar/model/document.hpp"
+#include "einstar/recon/mesh.hpp"
 
 using namespace einstar;
 using model::json;
@@ -416,4 +420,57 @@ TEST_CASE("sketch-like constraints: fillets tangent to their faces, all of one r
     CHECK(std::abs(r0 - 2.0) < 0.1);
     // The datum's origin moved to the middle between the sides (x = 0 on the part).
     CHECK(std::abs(s["datums"][0]["origin"][0].get<double>()) < 0.02);
+}
+
+TEST_CASE("a scan whose source changed is processed again with its modelling carried over") {
+    const auto dir = std::filesystem::temp_directory_path() / std::format("einstar_reprocess_{}", ::getpid());
+    std::filesystem::create_directories(dir);
+    const auto path = dir / "part.stl";
+    auto spec = fit::flanged_box_spec();
+    REQUIRE(recon::save_mesh(fit::make_synthetic_part(spec).mesh, path));
+
+    model::Document doc;
+    run(doc, "open", {{"path", path.string()}});
+    squared_demo(doc);
+    run(doc, "face.add_plane", {{"name", "bottom"}, {"datum", "part"}, {"axis", "z"}, {"offset", -20}, {"facing", "-"}});
+    run(doc, "hole.update", {{"hole", hole_near(run(doc, "summary"), 0, 0)["name"]}, {"diameter", 8.0}});
+    const json before = run(doc, "summary");
+    CHECK(before["scan"]["source"] == "unchanged");
+    REQUIRE(run(doc, "build")["ok"].get<bool>());
+
+    // The scan is processed again at another resolution (another noise draw): every triangle is new.
+    spec.voxel_mm = 0.4;
+    spec.seed = 2;
+    REQUIRE(recon::save_mesh(fit::make_synthetic_part(spec).mesh, path));
+    std::filesystem::last_write_time(path, std::filesystem::last_write_time(path) + std::chrono::seconds(2));
+    CHECK(run(doc, "summary")["scan"]["source"] == "changed");
+
+    Stopwatch sw;
+    const json re = run(doc, "reprocess");
+    std::println("reprocess: {} triangles carried in {:.0f} ms", re["carried_triangles"].get<std::size_t>(), sw.elapsed_ms());
+    const json after = run(doc, "summary");
+    CHECK(after["scan"]["source"] == "unchanged");
+    CHECK(after["scan"]["triangles"].get<std::size_t>() > before["scan"]["triangles"].get<std::size_t>());
+    CHECK(run(doc, "history")["undo"].empty());
+    REQUIRE(after["labels"].size() == before["labels"].size());
+    for (std::size_t i = 0; i < before["labels"].size(); ++i) {
+        const auto& a = before["labels"][i];
+        const auto& b = after["labels"][i];
+        CHECK(a["name"] == b["name"]);
+        // The same area, in smaller triangles: (0.5 / 0.4)^2 as many, give or take the edges.
+        const double ratio = b["triangles"].get<double>() / std::max(1.0, a["triangles"].get<double>());
+        INFO(a["name"] << ": " << a["triangles"] << " -> " << b["triangles"]);
+        if (a["triangles"].get<int>() > 200) CHECK((ratio > 1.2 && ratio < 1.9));
+    }
+    for (const auto& r : re["labels"])
+        if (r.contains("moved_mm")) CHECK(r["moved_mm"].get<double>() < 0.1);
+    CHECK(after["holes"].size() == before["holes"].size());
+    CHECK(hole_near(after, 0, 0)["diameter"].get<double>() == 8.0);
+
+    REQUIRE(run(doc, "solve")["converged"].get<bool>());
+    const json built = run(doc, "build");
+    CHECK(built["ok"].get<bool>());
+    CHECK(built["closed"].get<bool>());
+    CHECK(run(doc, "deviation")["overall"]["p95_mm"].get<double>() < 0.15);
+    std::filesystem::remove_all(dir);
 }

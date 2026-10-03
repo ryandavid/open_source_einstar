@@ -32,12 +32,34 @@ std::string_view author_name(Author a) {
 Document::Document() = default;
 Document::~Document() = default;
 
+std::string ScanSource::status() const {
+    if (path.empty()) return "none";
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) return "missing";
+    const auto t = std::filesystem::last_write_time(path, ec);
+    const auto now_mtime = ec ? 0 : static_cast<std::int64_t>(t.time_since_epoch().count());
+    return std::filesystem::file_size(path, ec) != size || now_mtime != mtime ? "changed" : "unchanged";
+}
+
 void Document::set_scan(recon::TriangleMesh mesh, ScanSource source) {
+    adopt_mesh(std::move(mesh));
+    source_ = std::move(source);
+    state_ = State{};
+    state_.paint = std::make_shared<const std::vector<std::uint16_t>>(mesh_->triangles.size(), 0);
+    state_.region = std::make_shared<const std::vector<std::uint16_t>>(mesh_->triangles.size(), 0);
+    undo_.clear();
+    redo_.clear();
+    change_depth_ = 0;
+    built_.reset();
+    ++revision_;
+}
+
+void Document::adopt_mesh(recon::TriangleMesh mesh) {
     if (mesh.normals.size() != mesh.vertices.size()) mesh.compute_normals();
+    bvh_.reset();
     mesh_ = std::make_unique<recon::TriangleMesh>(std::move(mesh));
     topo_ = std::make_unique<fit::MeshTopology>(*mesh_);
     bvh_ = std::make_unique<fit::TriangleBvh>(*mesh_);
-    source_ = std::move(source);
     // The scan's resolution: the median edge length is about the processing voxel.
     std::vector<float> edges;
     for (std::size_t t = 0; t < mesh_->triangles.size(); t += std::max<std::size_t>(1, mesh_->triangles.size() / 2000)) {
@@ -48,14 +70,6 @@ void Document::set_scan(recon::TriangleMesh mesh, ScanSource source) {
         std::ranges::nth_element(edges, edges.begin() + static_cast<std::ptrdiff_t>(edges.size() / 2));
         voxel_mm_ = std::clamp(static_cast<double>(edges[edges.size() / 2]), 0.05, 5.0);
     }
-    state_ = State{};
-    state_.paint = std::make_shared<const std::vector<std::uint16_t>>(mesh_->triangles.size(), 0);
-    state_.region = std::make_shared<const std::vector<std::uint16_t>>(mesh_->triangles.size(), 0);
-    undo_.clear();
-    redo_.clear();
-    change_depth_ = 0;
-    built_.reset();
-    ++revision_;
 }
 
 void Document::scale_scan(double k) {

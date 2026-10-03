@@ -6,6 +6,9 @@
 #include <numbers>
 #include <set>
 
+#include <tbb/blocked_range.h>
+#include <tbb/parallel_for.h>
+
 #include "einstar/fit/detect.hpp"
 #include "einstar/fit/grow.hpp"
 #include "einstar/fit/holes.hpp"
@@ -187,6 +190,7 @@ struct Document::Impl {
                        {"triangles", d.mesh().triangles.size()},
                        {"voxel_mm", d.voxel_mm()},
                        {"scale_applied", d.source_.scale},
+                       {"source", d.source_.status()},
                        {"bounds", {{"min", vec_to_json(box.min().cast<double>())}, {"max", vec_to_json(box.max().cast<double>())}}}};
         std::vector<std::uint32_t> counts(65536, 0), painted(65536, 0);
         std::size_t unlabelled = 0;
@@ -1281,6 +1285,101 @@ struct Document::Impl {
         return {{"scale", d.source_.scale}, {"note", "the scan and everything on it were scaled; the undo history was cleared"}};
     }
 
+    // Makes the mesh again from the scan's source (an .estr that has since been continued or edited, or a
+    // re-exported mesh), and carries the modelling over: each new triangle takes the label of the old triangle
+    // nearest to it (within two voxels, facing the same way), holes' openings move to the nearest new vertices,
+    // and every fitted face is refitted to its carried region. The undo history is cleared.
+    json reprocess(const json& p) {
+        need_scan();
+        const std::filesystem::path path = opt<std::string>(p, "path").value_or(d.source_.path.string());
+        if (path.empty()) refuse("this scan has no source file to process again (the demo part)");
+        const double voxel_before = d.source_.process.is_object() ? d.source_.process.value("voxel_mm", 0.5) : 0.5;
+        const bool fine = opt<bool>(p, "fine").value_or(voxel_before < 0.4);
+        auto loaded = load_scan_mesh(path, fine);
+        if (!loaded) refuse(loaded.error().message);
+        auto& [mesh, source] = *loaded;
+        // The modelling is in the scaled scan's frame (model.scale).
+        const double k = d.source_.scale;
+        if (k != 1.0)
+            for (auto& v : mesh.vertices) v *= static_cast<float>(k);
+        source.scale = k;
+
+        // The old scan, kept while the modelling moves across.
+        auto old_mesh = std::move(d.mesh_);
+        auto old_bvh = std::move(d.bvh_);
+        auto old_topo = std::move(d.topo_);
+        const auto old_paint = d.state_.paint;
+        const auto old_region = d.state_.region;
+        const float reach = static_cast<float>(2 * std::max(d.voxel_mm_, 0.1));
+        d.adopt_mesh(std::move(mesh));
+        d.source_ = std::move(source);
+
+        const auto& nm = d.mesh();
+        std::vector<std::uint16_t> paint(nm.triangles.size(), 0), region(nm.triangles.size(), 0);
+        tbb::parallel_for(tbb::blocked_range<std::size_t>(0, nm.triangles.size(), 4096), [&](const auto& r) {
+            for (std::size_t t = r.begin(); t < r.end(); ++t) {
+                const auto u = static_cast<std::uint32_t>(t);
+                const auto hit = old_bvh->closest(d.topology().centroid(u), reach);
+                if (!hit || d.topology().normal(u).dot(old_topo->normal(hit->triangle)) < 0.5f) continue;
+                paint[t] = (*old_paint)[hit->triangle];
+                region[t] = (*old_region)[hit->triangle];
+            }
+        });
+        std::size_t carried = 0;
+        for (const auto r : region) carried += r != 0;
+        set_paint(std::move(paint));
+        set_region(std::move(region));
+
+        // Holes' openings: the nearest new vertex to each old one.
+        for (auto& h : d.state_.holes) {
+            std::vector<std::uint32_t> rim;
+            for (const auto v : h.rim) {
+                const Vec3f q = old_mesh->vertices[v];
+                const auto hit = d.bvh().closest(q, reach);
+                if (!hit) continue;
+                const auto& tri = nm.triangles[hit->triangle];
+                std::uint32_t best = tri[0];
+                for (const auto c : tri)
+                    if ((nm.vertices[c] - q).squaredNorm() < (nm.vertices[best] - q).squaredNorm()) best = c;
+                if (std::ranges::find(rim, best) == rim.end()) rim.push_back(best);
+            }
+            h.rim = std::move(rim);
+        }
+
+        // Refit each fitted face to its region on the new scan.
+        json labels = json::array();
+        for (auto& l : d.state_.labels) {
+            if (l.given || !l.fit) continue;
+            const auto tris = triangles_of(l.id);
+            json j = {{"label", l.name}, {"triangles", tris.size()}};
+            if (fit::kind_of(*l.fit) != fit::SurfaceKind::freeform && tris.size() >= 12) {
+                const fit::RegionPoints pts = fit::region_points(d.topology(), tris, 20000);
+                const auto r = fit::refine_surface(*l.fit, pts.view());
+                double moved = 0;  // how far the face moved, over its region
+                for (const auto& q : pts.points) moved = std::max(moved, std::abs(fit::signed_distance(r.surface, fit::project(*l.fit, q))));
+                j["moved_mm"] = moved;
+                l.fit = r.surface;
+                l.sigma = r.sigma;
+                l.rms = r.rms;
+                j["rms"] = r.rms;
+            } else {
+                j["refit"] = false;  // freeform, or too little of it carried over: kept as it was
+            }
+            labels.push_back(j);
+        }
+        d.state_.solved.clear();
+        d.state_.solve_report = json();
+        d.undo_.clear();
+        d.redo_.clear();
+        d.change_depth_ = 0;
+        d.built_.reset();
+        ++d.revision_;
+        return {{"scan", summary()["scan"]},
+                {"carried_triangles", carried},
+                {"labels", labels},
+                {"note", "the labels were carried to the new scan and refitted; solve and build again. The undo history was cleared"}};
+    }
+
     json build(const json& p) {
         need_scan();
         brep::BuildInput in;
@@ -1420,6 +1519,7 @@ const std::map<std::string, CommandInfo, std::less<>>& table() {
         {"solve", {[](I& i, const json& p) { return i.solve(p); }, true}},
         {"build", {[](I& i, const json& p) { return i.build(p); }, true}},
         {"scale", {[](I& i, const json& p) { return i.scale(p); }, false}},
+        {"reprocess", {[](I& i, const json& p) { return i.reprocess(p); }, false}},
         {"export_step", {[](I& i, const json& p) { return i.export_step(p); }, false}},
     };
     return t;

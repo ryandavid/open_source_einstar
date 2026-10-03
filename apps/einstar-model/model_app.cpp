@@ -109,7 +109,7 @@ void ModelApp::open(const std::filesystem::path& path, bool fine) {
 }
 
 bool ModelApp::is_slow(std::string_view command) {
-    for (const char* c : {"detect", "grow", "solve", "build", "find_holes", "export_step", "freeform"})
+    for (const char* c : {"detect", "grow", "solve", "build", "find_holes", "export_step", "freeform", "reprocess"})
         if (command == c) return true;
     return false;
 }
@@ -121,7 +121,7 @@ bool ModelApp::start(std::string_view command, json params, model::Author author
         return true;
     }
     command_name_ = std::string(command);
-    busy_text_ = command == "detect" ? "Detecting faces ..." : command == "build" ? "Building the solid ..." : std::format("{} ...", command);
+    busy_text_ = command == "detect" ? "Detecting faces ..." : command == "build" ? "Building the solid ..." : command == "reprocess" ? "Processing the scan again ..." : std::format("{} ...", command);
     command_job_ = std::async(std::launch::async, [this, c = command_name_, p = std::move(params), author] { return doc.apply(c, p, author); });
     return true;
 }
@@ -382,6 +382,12 @@ void ModelApp::draw_ui(render::ViewCamera& camera) {
     const json summary = doc.apply("summary", {}).result;
     ImGui::TextDisabled("%s  %zu triangles, voxel %.2f mm", summary["scan"]["kind"].get<std::string>().c_str(),
                         summary["scan"]["triangles"].get<std::size_t>(), doc.voxel_mm());
+    if (const auto source = summary["scan"]["source"].get<std::string>(); source == "changed") {
+        ImGui::TextColored(ImVec4(1, 0.85f, 0.3f, 1), "The scan's file has changed since this mesh was made from it.");
+        if (ImGui::Button("Process it again (labels carried over)")) start("reprocess", json::object());
+    } else if (source == "missing") {
+        ImGui::TextDisabled("The scan's file is gone: the model keeps its own copy of the mesh.");
+    }
 
     // ---- View ----
     if (ImGui::CollapsingHeader("View", ImGuiTreeNodeFlags_DefaultOpen)) {

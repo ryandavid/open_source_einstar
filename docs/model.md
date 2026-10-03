@@ -85,6 +85,20 @@ The MCP server's instructions describe the modelling workflow. A typical exchang
 3. `model_solve`, `model_build`.
 4. `model_deviation`, a screenshot, and a report of any conflicts and of what each measurement cost.
 
+## When the scan changes
+
+The model keeps its own copy of the mesh, so a changed source cannot move the labels underneath it. When
+the source file has changed since, e.g. an `.estr` opened again in the scanning app and scanned further or
+edited, the panel says so (`model.summary`'s `scan.source` is `changed`). *Process it again*
+(`model.reprocess`) then:
+1. makes the mesh again;
+2. gives each new triangle the label of the nearest old triangle (within two voxels, facing the same way);
+3. moves hole openings to the nearest new vertices;
+4. refits every fitted face to its carried region, reporting how far each one moved.
+
+Datums, constraints, measurements and unseen faces stay as they are. Solve and build again afterwards. A
+`model.scale` correction already applied carries over to the new mesh. The undo history is cleared.
+
 ## Holes
 
 - **Finding them:** holes are found as round openings in a plane face. The diameter comes from the scanned

@@ -2010,6 +2010,26 @@
   },
   {
     "app": "model",
+    "description": "Makes the scan's mesh again from its source file, when it has changed (model.summary's scan.source is 'changed': e.g. an .estr scanned further or edited in the scanning app). Labels move to the new mesh by nearest triangle, hole openings to the nearest vertices, and fitted faces are refitted; solve and build again after. Clears the undo history. Seconds to minutes for an .estr.",
+    "kind": "mutating",
+    "name": "model.reprocess",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "fine": {
+          "description": "For .estr: 0.3 mm voxels (default: as it was processed before).",
+          "type": "boolean"
+        },
+        "path": {
+          "description": "The source (default: the scan's own, e.g. after it was moved).",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
     "description": "Writes the built solid as STEP (AP242, mm, faces named after labels) and reads it back to check.",
     "kind": "read_only",
     "name": "model.export_step",

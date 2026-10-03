@@ -82,6 +82,7 @@ public:
 
 private:
     struct Job;
+    std::shared_ptr<Job> enqueue(std::string line, std::future<std::string>& reply);
     void start_job(const std::shared_ptr<Job>& job);
     void finish(const std::shared_ptr<Job>& job, Result result);
     void serve(int fd);

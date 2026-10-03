@@ -15,6 +15,9 @@ from . import paths
 from .client import AgentError
 from .supervisor import LaunchError, Supervisor
 
+# Methods that may work for minutes before answering (processing a scan): the app keeps the call open meanwhile.
+LONG_WORK = {"model.open", "model.reprocess", "scan.open"}
+
 INSTRUCTIONS = """\
 Drives the Einstar apps (the open EXStar replacement): 'scan' (scanning: connect, scan, edit, process, export),
 'calibration' (the camera calibration) and 'model' (scan to CAD: faces, holes, fillets, constraints, a solid, STEP).
@@ -46,7 +49,10 @@ Modelling (the model app) -- the user describes the part in words and measuremen
 - model_solve, then model_build; check model_deviation (hot spots: where the model departs from the scan; edge bands
   are the scan rounding sharp edges, not errors) and model_view + ui_screenshot to look. Report conflicts and what
   each measurement cost (how far it moved the surfaces off the scan) rather than hiding them.
-- model_export_step writes the STEP file the user imports into CAD."""
+- model_export_step writes the STEP file the user imports into CAD.
+- When model_summary's scan.source is 'changed' (the .estr was scanned further or edited since), model_reprocess
+  makes the mesh again and carries the labels over; solve and build again after. In the scanning app, scan_open
+  brings a recording back as a paused scan (edit it, process it, or connect the scanner and continue it)."""
 
 APP_PARAM = {"type": "string", "enum": ["scan", "calibration", "model"], "description": "Which app: scan, calibration or model."}
 
@@ -182,8 +188,11 @@ class EinstarMcp:
             if not target:
                 return fail("app is scan, calibration or model")
             params = {k: v for k, v in args.items() if k != "app"}
-            # Waits answer within their own timeout; everything else within a minute (a stuck UI answers `busy`).
+            # Waits answer within their own timeout; processing a scan can take minutes; everything else answers within
+            # a minute (a stuck UI answers `busy`).
             timeout = max(60.0, params.get("timeout_ms", 0) / 1000.0 + 10.0)
+            if m["name"] in LONG_WORK:
+                timeout = 1800.0
             return self._result(sup.call(target, m["name"], params, timeout), m["name"] == "ui.screenshot")
         except (AgentError, LaunchError) as e:
             return fail(str(e))

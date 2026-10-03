@@ -358,6 +358,13 @@ std::vector<MethodSpec> build() {
         "Scales the scan and everything modelled on it (a calibration correction), e.g. by the factor model.solve's "
         "'scale' check suggests from the user's measurements. Clears the undo history.",
         object({{"factor", num("0.9-1.1.")}}, {"factor"}));
+    add("model.reprocess", model, mutating,
+        "Makes the scan's mesh again from its source file, when it has changed (model.summary's scan.source is "
+        "'changed': e.g. an .estr scanned further or edited in the scanning app). Labels move to the new mesh by "
+        "nearest triangle, hole openings to the nearest vertices, and fitted faces are refitted; solve and build "
+        "again after. Clears the undo history. Seconds to minutes for an .estr.",
+        object({{"path", str("The source (default: the scan's own, e.g. after it was moved).")},
+                {"fine", boolean("For .estr: 0.3 mm voxels (default: as it was processed before).")}}));
     add("model.export_step", model, read_only, "Writes the built solid as STEP (AP242, mm, faces named after labels) and reads it back to check.",
         object({{"path", str("The .step file.")}}, {"path"}));
     add("model.view", model, mutating,

@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <csignal>
 #include <cstring>
@@ -22,6 +24,7 @@ namespace einstar::agent {
 namespace {
 constexpr int kSettleFrames = 2;         // a mutating method answers after this many more frames
 constexpr int kDefaultTimeoutMs = 15000;  // how long a caller waits for the UI thread
+constexpr int kLongWorkMs = 30 * 60 * 1000;  // ... and for long work (a Poll) it has started
 }  // namespace
 
 struct Server::Job {
@@ -32,6 +35,7 @@ struct Server::Job {
     Poll poll;
     std::optional<Result> result;
     std::uint64_t release_at = 0;
+    std::atomic<bool> working = false;  // the UI thread took it and is polling for its answer
 };
 
 Server::Server(App app, std::string name) : app_(app), name_(std::move(name)) {
@@ -54,12 +58,18 @@ void Server::handle(std::string_view method, Handler handler) {
 // ---- dispatch (UI thread) ----
 
 std::future<std::string> Server::submit(std::string line) {
+    std::future<std::string> f;
+    (void)enqueue(std::move(line), f);
+    return f;
+}
+
+std::shared_ptr<Server::Job> Server::enqueue(std::string line, std::future<std::string>& reply) {
     auto job = std::make_shared<Job>();
     job->line = std::move(line);
-    auto f = job->reply.get_future();
+    reply = job->reply.get_future();
     std::lock_guard lock(mutex_);
-    incoming_.push_back(std::move(job));
-    return f;
+    incoming_.push_back(job);
+    return job;
 }
 
 void Server::pump() {
@@ -133,6 +143,7 @@ void Server::start_job(const std::shared_ptr<Job>& job) {
     }
     if (auto* p = std::get_if<Poll>(&out)) {
         job->poll = std::move(*p);
+        job->working = true;
         active_.push_back(job);
     } else if (auto* j = std::get_if<json>(&out)) {
         finish(job, std::move(*j));
@@ -420,9 +431,15 @@ void Server::serve(int fd) {
                     if (params.contains("_timeout_ms")) timeout_ms = params.value("_timeout_ms", timeout_ms);  // the caller's say
                 }
             }
-            auto reply = submit(std::move(line));
+            std::future<std::string> reply;
+            const auto job = enqueue(std::move(line), reply);
+            auto ready = reply.wait_for(std::chrono::milliseconds(timeout_ms)) == std::future_status::ready;
+            // Work the UI thread has started and is polling (processing a scan, ...) is not a stuck frame.
+            for (const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(kLongWorkMs);
+                 !ready && job->working && std::chrono::steady_clock::now() < until;)
+                ready = reply.wait_for(std::chrono::milliseconds(500)) == std::future_status::ready;
             std::string out;
-            if (reply.wait_for(std::chrono::milliseconds(timeout_ms)) == std::future_status::ready) {
+            if (ready) {
                 out = reply.get();
             } else {
                 out = response_line(id, error(ErrorCode::busy, std::format("the {} app's UI thread did not answer within {} ms (a stuck frame?)", name_, timeout_ms)));

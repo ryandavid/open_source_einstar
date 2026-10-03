@@ -122,6 +122,8 @@ struct ScanSource {
     std::int64_t mtime = 0;
     json process;                // process settings used (estr)
     double scale = 1.0;          // applied to the mesh since it was loaded (model.scale)
+    // Whether the file has changed (size or modification time) or gone since the mesh was made from it.
+    [[nodiscard]] std::string status() const;  // "unchanged", "changed", "missing" or "none" (the demo part)
 };
 
 struct Built {
@@ -190,6 +192,7 @@ public:
 private:
     friend struct Impl;
     void snapshot(std::string description, Author author);
+    void adopt_mesh(recon::TriangleMesh mesh);  // the mesh, its topology, BVH and resolution
 
     std::unique_ptr<recon::TriangleMesh> mesh_;
     std::unique_ptr<fit::MeshTopology> topo_;
