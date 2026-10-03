@@ -56,7 +56,7 @@ brep::BuildInput flanged_box(bool exact) {
         for (const int b : {py, my}) in.fillets.push_back({std::format("fillet {} {}", a, b), a, b, 2.0});
     for (const auto& h : fit::flanged_box_spec().holes)
         in.holes.push_back({std::format("hole {:.0f} {:.0f}", h.entry.x(), h.entry.y()), h.entry, h.axis, h.diameter,
-                            h.depth < 100 ? std::optional(h.depth) : std::nullopt});
+                            h.depth < 100 ? std::optional(h.depth) : std::nullopt, {}, {}, {}, {}, {}});
     return in;
 }
 

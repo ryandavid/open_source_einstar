@@ -17,6 +17,7 @@
 #include <BRepFilletAPI_MakeFillet.hxx>
 #include <BRepGProp.hxx>
 #include <BRepMesh_IncrementalMesh.hxx>
+#include <BRepPrimAPI_MakeCone.hxx>
 #include <BRepPrimAPI_MakeCylinder.hxx>
 #include <BRepTools.hxx>
 #include <BRep_Tool.hxx>
@@ -179,8 +180,23 @@ std::string name_face(const TopoDS_Face& f, const BuildInput& in) {
         const Vec3 v = *p - h.entry;
         const double depth = v.dot(h.axis);
         const double rho = (v - depth * h.axis).norm();
-        if (std::abs(rho - 0.5 * h.diameter) < kTol) return h.name;
-        if (h.depth && std::abs(depth - *h.depth) < kTol && rho < 0.5 * h.diameter + kTol) return h.name + " floor";
+        const double r = 0.5 * h.diameter;
+        if (h.counterbore_diameter && h.counterbore_depth) {
+            const double rc = 0.5 * *h.counterbore_diameter;
+            if (std::abs(rho - rc) < kTol && depth < *h.counterbore_depth + kTol) return h.name + " counterbore";
+            if (std::abs(depth - *h.counterbore_depth) < kTol && rho > r - kTol && rho < rc + kTol) return h.name + " counterbore floor";
+        }
+        if (h.countersink_diameter) {
+            const double t = std::tan(0.5 * h.countersink_angle_deg.value_or(90) * std::numbers::pi / 180);
+            if (std::abs(rho - (0.5 * *h.countersink_diameter - depth * t)) < kTol && rho > r - kTol) return h.name + " countersink";
+        }
+        if (std::abs(rho - r) < kTol) return h.name;
+        if (h.depth && h.point_angle_deg) {
+            const double t = std::tan(0.5 * *h.point_angle_deg * std::numbers::pi / 180);
+            if (depth > *h.depth - kTol && std::abs(rho - (*h.depth + r / t - depth) * t) < kTol) return h.name + " point";
+        } else if (h.depth && std::abs(depth - *h.depth) < kTol && rho < r + kTol) {
+            return h.name + " floor";
+        }
     }
     BRepAdaptor_Surface ad(f);
     for (const auto& fl : in.fillets) {
@@ -539,15 +555,30 @@ static BuildResult build_unguarded(const BuildInput& in) {
     // 4. Holes.
     const double through = 2 * reach + 10;
     for (const auto& h : in.holes) {
-        constexpr double kLead = 1.0;  // the cutter starts outside the entry face
+        constexpr double kLead = 1.0;  // the cutters start outside the entry face
         const Vec3 start = h.entry - kLead * h.axis;
-        const double length = h.depth ? *h.depth + kLead : through;
-        const TopoDS_Shape tool = BRepPrimAPI_MakeCylinder(gp_Ax2(to_pnt(start), to_dir(h.axis)), 0.5 * h.diameter, length).Shape();
-        BRepAlgoAPI_Cut cut(shape, tool);
-        cut.SetRunParallel(true);
-        cut.Build();
-        if (cut.IsDone() && !cut.HasErrors()) shape = cut.Shape();
-        else out.log.push_back(std::format("hole '{}' could not be cut", h.name));
+        const double r = 0.5 * h.diameter;
+        std::vector<std::pair<TopoDS_Shape, std::string>> tools;
+        tools.emplace_back(BRepPrimAPI_MakeCylinder(gp_Ax2(to_pnt(start), to_dir(h.axis)), r, h.depth ? *h.depth + kLead : through).Shape(), "");
+        if (h.counterbore_diameter && h.counterbore_depth && *h.counterbore_diameter > h.diameter)
+            tools.emplace_back(BRepPrimAPI_MakeCylinder(gp_Ax2(to_pnt(start), to_dir(h.axis)), 0.5 * *h.counterbore_diameter, *h.counterbore_depth + kLead).Shape(),
+                               "counterbore");
+        if (h.countersink_diameter && *h.countersink_diameter > h.diameter) {
+            const double t = std::tan(0.5 * h.countersink_angle_deg.value_or(90) * std::numbers::pi / 180);
+            const double r_top = 0.5 * *h.countersink_diameter + kLead * t, r_end = 0.5 * r;  // ends inside the bore
+            tools.emplace_back(BRepPrimAPI_MakeCone(gp_Ax2(to_pnt(start), to_dir(h.axis)), r_top, r_end, (r_top - r_end) / t).Shape(), "countersink");
+        }
+        if (h.depth && h.point_angle_deg) {
+            const double t = std::tan(0.5 * *h.point_angle_deg * std::numbers::pi / 180);
+            tools.emplace_back(BRepPrimAPI_MakeCone(gp_Ax2(to_pnt(h.entry + *h.depth * h.axis), to_dir(h.axis)), r, 0.0, r / t).Shape(), "point");
+        }
+        for (const auto& [tool, part] : tools) {
+            BRepAlgoAPI_Cut cut(shape, tool);
+            cut.SetRunParallel(true);
+            cut.Build();
+            if (cut.IsDone() && !cut.HasErrors()) shape = cut.Shape();
+            else out.log.push_back(std::format("hole '{}'{} could not be cut", h.name, part.empty() ? "" : " " + part));
+        }
     }
 
     // 5. Check and describe.

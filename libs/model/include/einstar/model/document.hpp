@@ -65,6 +65,11 @@ struct Hole {
                                    // floor, may not have been seen: the depth is then the user's to give)
     int wall_label = 0;            // a label on its wall, if any
     std::vector<std::uint32_t> rim;  // the opening's boundary (scan vertices): its position when no wall is labelled
+    // Forms, measured from the scan or set: a counterbore, a countersink (included angle), a drill point at a blind
+    // hole's bottom (included angle; the depth is then to the shoulder).
+    std::optional<double> counterbore_diameter, counterbore_depth;
+    std::optional<double> countersink_diameter, countersink_angle_deg;
+    std::optional<double> point_angle_deg;
     [[nodiscard]] double used_diameter() const { return diameter.value_or(measured_diameter); }
 };
 

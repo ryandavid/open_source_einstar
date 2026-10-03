@@ -1487,12 +1487,28 @@
   },
   {
     "app": "model",
-    "description": "Sets a hole's true size from a measurement (overrides the scan's), its depth, or makes it through.",
+    "description": "Sets a hole's true size from a measurement (overrides the scan's), its depth, or makes it through; and its forms: a counterbore (diameter and depth), a countersink (diameter at the face and included angle, default 90), a drill point at a blind hole's bottom (included angle, 118 for a twist drill; the depth is then to the shoulder). Detection measures the forms it sees; null removes one.",
     "kind": "mutating",
     "name": "model.hole.update",
     "params": {
       "additionalProperties": false,
       "properties": {
+        "counterbore_depth": {
+          "description": "mm, from the face.",
+          "type": "number"
+        },
+        "counterbore_diameter": {
+          "description": "mm.",
+          "type": "number"
+        },
+        "countersink_angle_deg": {
+          "description": "Included angle.",
+          "type": "number"
+        },
+        "countersink_diameter": {
+          "description": "mm, at the face.",
+          "type": "number"
+        },
         "depth": {
           "description": "Blind hole depth, mm.",
           "type": "number"
@@ -1511,6 +1527,10 @@
         "name": {
           "description": "New name.",
           "type": "string"
+        },
+        "point_angle_deg": {
+          "description": "Included angle of a drill point.",
+          "type": "number"
         },
         "through": {
           "description": "A through hole.",

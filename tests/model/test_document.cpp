@@ -3,10 +3,12 @@
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
+#include <numbers>
 #include <print>
 #include <set>
 
 #include "einstar/agent/protocol.hpp"
+#include "einstar/brep/brep.hpp"
 #include "einstar/core/timing.hpp"
 #include "einstar/fit/synthetic_part.hpp"
 #include "einstar/model/document.hpp"
@@ -263,4 +265,39 @@ TEST_CASE("holes seen only at their rim take part in the solve by their opening"
     const auto ha = hole_near(s, 42, -19), hb = hole_near(s, 42, 19);
     CHECK(std::abs(centre_distance(ha, hb) - 38.0) < 2e-4);
     CHECK(std::hypot(ha["center"][0].get<double>() - 42, ha["center"][1].get<double>() + 19) < 0.08);
+}
+
+TEST_CASE("hole forms through the document: detected, built, named in the STEP file") {
+    const fit::SyntheticPart part = fit::make_synthetic_part(fit::hole_forms_spec());
+    model::Document doc;
+    doc.set_scan(part.mesh, model::ScanSource{{}, "demo", 0, 0, {}});
+    run(doc, "detect");
+    json s = run(doc, "summary");
+    REQUIRE(s["holes"].size() == 3);
+    const auto count_role = [&](const char* role) { return std::ranges::count_if(s["labels"], [&](const json& l) { return l["role"] == role; }); };
+    CHECK(count_role("face") == 6);  // the plate's faces; the holes' surfaces belong to the holes
+    for (const auto& h : s["holes"]) std::println("  {}", h.dump());
+    CHECK(hole_near(s, -18, 0).contains("counterbore_diameter"));
+    CHECK(hole_near(s, 0, 0).contains("countersink_diameter"));
+    CHECK(hole_near(s, 18, 0).contains("point_angle_deg"));
+
+    const json built = run(doc, "build");
+    for (const auto& line : built["log"]) std::println("  {}", line.get<std::string>());
+    REQUIRE(built["ok"].get<bool>());
+    // The plate less: the bores, the counterbore around one, the countersink's cone, the drilled hole and its point.
+    const double pi = std::numbers::pi;
+    const double t45 = 1.0, t59 = std::tan(59 * pi / 180);
+    const double cs_h = (4.5 - 2.25) / t45;
+    const double volume = 60 * 40 * 12 - pi * 3.3 * 3.3 * 12 - pi * (5.5 * 5.5 - 3.3 * 3.3) * 6.5 - pi * 2.25 * 2.25 * 12 -
+                          (pi * cs_h / 3 * (4.5 * 4.5 + 4.5 * 2.25 + 2.25 * 2.25) - pi * 2.25 * 2.25 * cs_h) - pi * 2.5 * 2.5 * 8 - pi * 2.5 * 2.5 * (2.5 / t59) / 3;
+    std::println("hole forms: volume {:.2f} vs {:.2f} ({:+.3f}%)", built["volume_mm3"].get<double>(), volume, 100 * (built["volume_mm3"].get<double>() / volume - 1));
+    CHECK(std::abs(built["volume_mm3"].get<double>() - volume) < 0.004 * volume);
+
+    const auto step = std::filesystem::temp_directory_path() / "einstar_hole_forms.step";
+    const json exported = run(doc, "export_step", {{"path", step.string()}});
+    CHECK(exported["read_back"]["valid"].get<bool>());
+    const brep::StepSummary summary = brep::read_step(step);
+    CHECK(summary.surface_kinds.at("cone") >= 2);
+    for (const char* form : {"counterbore", "countersink", "point"})
+        CHECK(std::ranges::any_of(summary.face_names, [&](const std::string& n) { return n.find(form) != std::string::npos; }));
 }

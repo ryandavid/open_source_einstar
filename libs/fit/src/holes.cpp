@@ -128,6 +128,131 @@ double covered_arc_deg(std::span<const Vec2> p, const Vec2& center) {
 
 }  // namespace
 
+// The hole's wall, from the triangles reached from its opening: the bore's diameter, and its forms where the scan
+// shows them.
+//  - A counterbore: the straight wall at two radii (the larger above), with a floor between them.
+//  - A countersink: a conical band between the opening and a narrower bore; its line in (depth, radius) gives
+//    the angle and the diameter at the face.
+//  - A drill point: the floor of a blind hole sloping to a tip; its line in (radius, depth) gives the angle and
+//    the depth of the shoulder.
+template <class To2>
+void analyse_wall(const MeshTopology& topo, HoleCandidate& h, const std::vector<std::uint32_t>& straight, const Circle2& opening, const To2& to2,
+                  const Vec3& origin, const Vec3& u, const Vec3& v, const HoleOptions& o) {
+    const double vox = o.voxel_mm;
+    const auto radial = [&](const Vec3& p) { return (to2(p) - opening.center).norm(); };
+    const auto depth_of = [&](const Vec3& p) { return (p - h.center).dot(h.axis); };
+    const auto fit_wall = [&](const std::vector<Vec2>& pts, const std::vector<double>& w) -> std::optional<Circle2> {
+        if (pts.size() < o.min_wall_triangles) return std::nullopt;
+        const auto c = fit_circle_2d(pts, w);
+        if (!c || covered_arc_deg(pts, c->center) < o.min_wall_arc_deg) return std::nullopt;
+        return c;
+    };
+    std::optional<Circle2> bore;
+    if (straight.size() >= o.min_wall_triangles) {
+        const RegionPoints wp = region_points(topo, straight, 0);
+        std::vector<std::pair<double, std::size_t>> by_radius;
+        for (std::size_t i = 0; i < wp.points.size(); ++i) by_radius.emplace_back(radial(wp.points[i]), i);
+        std::ranges::sort(by_radius);
+        // The largest gap in radius splits a counterbore's wall from the bore's.
+        std::size_t split = 0;
+        double gap = 0;
+        for (std::size_t i = 1; i < by_radius.size(); ++i)
+            if (by_radius[i].first - by_radius[i - 1].first > gap) {
+                gap = by_radius[i].first - by_radius[i - 1].first;
+                split = i;
+            }
+        const auto subset = [&](std::size_t from, std::size_t to) {
+            std::pair<std::vector<Vec2>, std::vector<double>> out;
+            for (std::size_t i = from; i < to; ++i) {
+                out.first.push_back(to2(wp.points[by_radius[i].second]));
+                out.second.push_back(wp.weights[by_radius[i].second]);
+            }
+            return out;
+        };
+        if (gap > 3 * vox) {
+            const auto [in_p, in_w] = subset(0, split);
+            const auto [out_p, out_w] = subset(split, by_radius.size());
+            const auto inner = fit_wall(in_p, in_w), outer = fit_wall(out_p, out_w);
+            if (inner && outer) {
+                bore = inner;
+                h.counterbore_diameter = 2 * outer->radius;
+                // Its floor: faces looking back out of the hole between the two walls.
+                double sum = 0, area = 0;
+                for (const auto t : h.wall) {
+                    const Vec3 c = topo.centroid(t).cast<double>();
+                    const double r = radial(c);
+                    if (topo.normal(t).cast<double>().dot(h.axis) < -0.9 && r > inner->radius + vox && r < outer->radius - vox) {
+                        sum += topo.area(t) * depth_of(c);
+                        area += topo.area(t);
+                    }
+                }
+                if (area > 0) h.counterbore_depth = sum / area;
+            }
+        }
+        if (!bore) {
+            const auto [all_p, all_w] = subset(0, by_radius.size());
+            bore = fit_wall(all_p, all_w);
+        }
+    }
+    // A countersink: a cone between a bore clearly narrower than the opening and the face.
+    if (bore && !h.counterbore_diameter && bore->radius < opening.radius - 2 * vox) {
+        Eigen::Matrix2d A = Eigen::Matrix2d::Zero();
+        Eigen::Vector2d b = Eigen::Vector2d::Zero();
+        int n = 0;
+        for (const auto t : h.wall) {
+            const Vec3 c = topo.centroid(t).cast<double>();
+            const double r = radial(c), dn = -topo.normal(t).cast<double>().dot(h.axis);  // a countersink looks back out
+            if (dn < 0.3 || dn > 0.97 || r < bore->radius + vox || r > opening.radius + vox) continue;
+            const Eigen::Vector2d row(1.0, depth_of(c));
+            A += topo.area(t) * row * row.transpose();
+            b += topo.area(t) * row * r;
+            ++n;
+        }
+        if (n >= 10) {
+            const Eigen::Vector2d x = A.ldlt().solve(b);  // radius = x0 + x1 depth
+            const double half = std::atan(-x[1]);
+            if (x.allFinite() && half > 15 * std::numbers::pi / 180 && half < 75 * std::numbers::pi / 180) {
+                h.countersink_diameter = 2 * x[0];
+                h.countersink_angle_deg = 2 * half * 180 / std::numbers::pi;
+            }
+        }
+    }
+    const bool formed = h.counterbore_diameter || h.countersink_diameter;
+    if (bore && (formed || std::abs(bore->radius - opening.radius) < 2 * vox)) {
+        h.wall_diameter = 2 * bore->radius;
+        h.center = origin + bore->center.x() * u + bore->center.y() * v;
+    }
+    h.diameter = h.wall_diameter ? *h.wall_diameter : 2 * (opening.radius - o.rim_bias_voxels * vox);
+
+    // A blind hole's floor: flat, or a drill point.
+    const double r = 0.5 * h.diameter;
+    Eigen::Matrix2d A = Eigen::Matrix2d::Zero();
+    Eigen::Vector2d bb = Eigen::Vector2d::Zero();
+    double area = 0;
+    for (const auto t : h.wall) {
+        const Vec3 c = topo.centroid(t).cast<double>();
+        const double rr = radial(c), d = depth_of(c);
+        if (-topo.normal(t).cast<double>().dot(h.axis) < 0.45 || rr > r - 0.5 * vox || d < std::max(0.5 * r, 2 * vox)) continue;
+        if (h.counterbore_depth && d < *h.counterbore_depth + vox) continue;
+        const Eigen::Vector2d row(1.0, rr);
+        A += topo.area(t) * row * row.transpose();
+        bb += topo.area(t) * row * d;
+        area += topo.area(t);
+    }
+    if (area > 4 * vox * vox) {
+        const Eigen::Vector2d x = A.ldlt().solve(bb);  // depth = x0 + x1 radius
+        if (x.allFinite()) {
+            if (x[1] < -0.15) {
+                const double half = std::atan(-1.0 / x[1]);
+                h.point_angle_deg = 2 * half * 180 / std::numbers::pi;
+                h.floor_depth = x[0] + x[1] * r;  // the shoulder
+            } else {
+                h.floor_depth = bb[0] / A(0, 0);
+            }
+        }
+    }
+}
+
 std::vector<HoleCandidate> find_holes(const recon::TriangleMesh& mesh, const MeshTopology& topo, const TriangleBvh& bvh,
                                       std::span<const std::uint32_t> plane_region, const Plane& plane, const HoleOptions& o) {
     std::vector<std::uint8_t> in_region(topo.triangle_count(), 0);
@@ -170,8 +295,10 @@ std::vector<HoleCandidate> find_holes(const recon::TriangleMesh& mesh, const Mes
         // The wall: triangles off the face, inside the opening's cylinder, reached from the opening.
         const double r_max = circle->radius + o.voxel_mm;
         const double depth_max = 6 * h.opening_diameter;
+        // (A hole's surfaces look back towards its entry or across it; a face looking away from the entry is the
+        // outside of the part where a through hole comes out.)
         const auto on_wall = [&](std::uint32_t t) {
-            if (in_region[t]) return false;
+            if (in_region[t] || topo.normal(t).cast<double>().dot(h.axis) > 0.5) return false;
             const Vec3 c = topo.centroid(t).cast<double>() - h.center;
             const double depth = c.dot(h.axis);
             return depth > -o.voxel_mm && depth < depth_max && (c - depth * h.axis).norm() < r_max;
@@ -201,24 +328,16 @@ std::vector<HoleCandidate> find_holes(const recon::TriangleMesh& mesh, const Mes
                 }
         }
         std::ranges::sort(h.wall);
-        if (straight.size() >= o.min_wall_triangles) {
-            const RegionPoints wp = region_points(topo, straight, 0);
-            std::vector<Vec2> wall_pts(wp.points.size());
-            for (std::size_t i = 0; i < wall_pts.size(); ++i) wall_pts[i] = to2(wp.points[i]);
-            const std::vector<double>& wall_w = wp.weights;
-            const auto wall = fit_circle_2d(wall_pts, wall_w);
-            if (wall && covered_arc_deg(wall_pts, wall->center) >= o.min_wall_arc_deg && std::abs(wall->radius - circle->radius) < o.voxel_mm * 2) {
-                h.wall_diameter = 2 * wall->radius;
-                h.center = origin + wall->center.x() * u + wall->center.y() * v;
-            }
-        }
-        h.diameter = h.wall_diameter ? *h.wall_diameter : 2 * (circle->radius - o.rim_bias_voxels * o.voxel_mm);
+        analyse_wall(topo, h, straight, *circle, to2, origin, u, v, o);
 
-        // A floor: looking down the axis from above the face, the first surface facing back up the axis.
-        const Vec3 from = h.center - 2.0 * h.axis;
-        if (const auto hit = bvh.raycast(from.cast<float>(), h.axis.cast<float>(), 0.0f, static_cast<float>(depth_max + 2.0))) {
-            const double depth = hit->t - 2.0;
-            if (depth > o.voxel_mm && std::abs(topo.normal(hit->triangle).cast<double>().dot(h.axis)) > 0.8) h.floor_depth = depth;
+        // A floor: looking down the axis from above the face, the first surface facing back up the axis (unless the
+        // wall analysis found a pointed one).
+        if (!h.floor_depth) {
+            const Vec3 from = h.center - 2.0 * h.axis;
+            if (const auto hit = bvh.raycast(from.cast<float>(), h.axis.cast<float>(), 0.0f, static_cast<float>(depth_max + 2.0))) {
+                const double depth = hit->t - 2.0;
+                if (depth > o.voxel_mm && std::abs(topo.normal(hit->triangle).cast<double>().dot(h.axis)) > 0.8) h.floor_depth = depth;
+            }
         }
         holes.push_back(std::move(h));
     }

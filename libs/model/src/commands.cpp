@@ -233,6 +233,11 @@ struct Document::Impl {
                   {"through", !h.depth.has_value()}};
         if (h.diameter) j["set_diameter"] = *h.diameter;
         if (h.depth) j["depth"] = *h.depth;
+        if (h.counterbore_diameter) j["counterbore_diameter"] = *h.counterbore_diameter;
+        if (h.counterbore_depth) j["counterbore_depth"] = *h.counterbore_depth;
+        if (h.countersink_diameter) j["countersink_diameter"] = *h.countersink_diameter;
+        if (h.countersink_angle_deg) j["countersink_angle_deg"] = *h.countersink_angle_deg;
+        if (h.point_angle_deg) j["point_angle_deg"] = *h.point_angle_deg;
         if (h.wall_label) j["wall_label"] = label_name(h.wall_label);
         return j;
     }
@@ -635,31 +640,64 @@ struct Document::Impl {
         const auto found = fit::find_holes(d.mesh(), d.topology(), d.bvh(), triangles_of(host_id), std::get<fit::Plane>(*plane), ho);
         std::vector<json> out;
         for (const auto& c : found) {
-            // Already known (found again)?
-            if (std::ranges::any_of(d.state_.holes, [&](const Hole& h) { return (h.center - c.center).norm() < 0.5 * c.diameter && h.host == host_id; }))
-                continue;
+            // Already known: found again, or from the other end of a through hole (on the same axis).
+            const auto same_axis = [&](const Hole& h) {
+                const Vec3 d0 = c.center - h.center;
+                return h.axis.cross(c.axis).norm() < 0.02 && (d0 - d0.dot(h.axis) * h.axis).norm() < 0.25 * std::min(c.diameter, h.used_diameter());
+            };
+            // A through hole is found from each end; the end with a counterbore or countersink is its entry (the hole
+            // keeps its name and constraints).
+            const bool formed = c.counterbore_diameter || c.countersink_diameter;
+            const auto known = std::ranges::find_if(d.state_.holes, same_axis);
+            if (known != d.state_.holes.end() && (!formed || known->counterbore_diameter || known->countersink_diameter)) continue;
             Hole h;
-            h.id = new_id();
-            h.name = unique_name(std::format("hole {}", d.state_.holes.size() + 1));
+            if (known != d.state_.holes.end()) {
+                h.id = known->id;
+                h.name = known->name;
+                h.diameter = known->diameter;
+            } else {
+                h.id = new_id();
+                h.name = unique_name(std::format("hole {}", d.state_.holes.size() + 1));
+            }
             h.host = host_id;
             h.center = c.center;
             h.axis = c.axis;
             h.measured_diameter = c.diameter;
             h.wall_seen = c.wall_diameter.has_value();
             h.rim = c.opening;
+            h.counterbore_diameter = c.counterbore_diameter;
+            h.counterbore_depth = c.counterbore_depth;
+            h.countersink_diameter = c.countersink_diameter;
+            h.countersink_angle_deg = c.countersink_angle_deg;
+            h.point_angle_deg = c.point_angle_deg;
             h.seen_depth = c.wall_depth;
             if (c.floor_depth) h.depth = *c.floor_depth;
-            // The label most of its wall belongs to.
+            // Labels lying (mostly) on the hole's surfaces are part of the hole, not faces of the part: its wall
+            // (the cylinder label of the bore's radius), a counterbore's wall and floor, a countersink.
             std::map<int, int> votes;
             for (const auto t : c.wall)
                 if (const int r = (*d.state_.region)[t]; r != 0 && r != host_id) ++votes[r];
-            if (!votes.empty()) {
-                const auto best = std::ranges::max_element(votes, {}, &std::pair<const int, int>::second);
-                if (best->second * 2 > static_cast<int>(c.wall.size())) {
-                    h.wall_label = best->first;
-                    Label& wl = *std::ranges::find(d.state_.labels, best->first, &Label::id);
-                    wl.role = Role::hole;
+            std::map<int, int> sizes;
+            for (const auto r : *d.state_.region)
+                if (votes.contains(r)) ++sizes[r];
+            double best_radius_error = 1e9;
+            for (const auto& [id, n] : votes) {
+                if (2 * n < sizes[id]) continue;
+                Label& l = *std::ranges::find(d.state_.labels, id, &Label::id);
+                l.role = Role::hole;
+                if (const auto* cyl = l.fit ? std::get_if<fit::Cylinder>(&*l.fit) : nullptr) {
+                    const double e = std::abs(2 * cyl->radius - c.diameter);
+                    if (e < best_radius_error && e < 0.25 * c.diameter) {
+                        best_radius_error = e;
+                        h.wall_label = id;
+                    }
                 }
+            }
+            if (!h.wall_label && known != d.state_.holes.end()) h.wall_label = known->wall_label;
+            if (known != d.state_.holes.end()) {
+                *known = h;
+                out.push_back(hole_json(h));
+                continue;
             }
             d.state_.holes.push_back(h);
             out.push_back(hole_json(h));
@@ -690,6 +728,24 @@ struct Document::Impl {
                 h.diameter = v;
             }
         }
+        // Forms: a number sets one, null removes it.
+        const auto form = [&](const char* key, std::optional<double>& field) {
+            if (!p.contains(key)) return;
+            if (p[key].is_null()) {
+                field.reset();
+                return;
+            }
+            const auto x = get<double>(p, key);
+            if (!(x > 0)) fail(std::format("{} must be positive", key));
+            field = x;
+        };
+        form("counterbore_diameter", h.counterbore_diameter);
+        form("counterbore_depth", h.counterbore_depth);
+        form("countersink_diameter", h.countersink_diameter);
+        form("countersink_angle_deg", h.countersink_angle_deg);
+        form("point_angle_deg", h.point_angle_deg);
+        if (h.counterbore_diameter.has_value() != h.counterbore_depth.has_value()) fail("a counterbore needs both its diameter and its depth");
+        if (h.countersink_diameter && !h.countersink_angle_deg) h.countersink_angle_deg = 90.0;
         if (opt<bool>(p, "through").value_or(false)) h.depth.reset();
         if (const auto depth = opt<double>(p, "depth")) {
             if (!(*depth > 0)) fail("the depth must be positive");
@@ -1098,7 +1154,9 @@ struct Document::Impl {
             in.faces.push_back(std::move(f));
         }
         if (in.faces.empty()) refuse("no face labels with surfaces: paint and grow faces, or run model.detect");
-        for (const auto& h : d.state_.holes) in.holes.push_back({h.name, h.center, h.axis, h.used_diameter(), h.depth});
+        for (const auto& h : d.state_.holes)
+            in.holes.push_back({h.name, h.center, h.axis, h.used_diameter(), h.depth, h.counterbore_diameter, h.counterbore_depth, h.countersink_diameter,
+                                h.countersink_angle_deg, h.point_angle_deg});
         for (const auto& f : d.state_.fillets)
             if (face_of.contains(f.face_a) && face_of.contains(f.face_b))
                 in.fillets.push_back({f.name, face_of[f.face_a], face_of[f.face_b], f.used_radius()});

@@ -276,9 +276,15 @@ std::vector<MethodSpec> build() {
         "from the opening), through or blind.",
         object({{"label", kLabel}}, {"label"}));
     add("model.hole.update", model, mutating,
-        "Sets a hole's true size from a measurement (overrides the scan's), its depth, or makes it through.",
+        "Sets a hole's true size from a measurement (overrides the scan's), its depth, or makes it through; and its forms: "
+        "a counterbore (diameter and depth), a countersink (diameter at the face and included angle, default 90), a drill "
+        "point at a blind hole's bottom (included angle, 118 for a twist drill; the depth is then to the shoulder). "
+        "Detection measures the forms it sees; null removes one.",
         object({{"hole", ref("A hole: its name or id.")}, {"diameter", num("Measured diameter, mm (null: back to the scan's).")},
-                {"depth", num("Blind hole depth, mm.")}, {"through", boolean("A through hole.")}, {"name", str("New name.")}},
+                {"depth", num("Blind hole depth, mm.")}, {"through", boolean("A through hole.")}, {"name", str("New name.")},
+                {"counterbore_diameter", num("mm.")}, {"counterbore_depth", num("mm, from the face.")},
+                {"countersink_diameter", num("mm, at the face.")}, {"countersink_angle_deg", num("Included angle.")},
+                {"point_angle_deg", num("Included angle of a drill point.")}},
                {"hole"}));
     add("model.hole.delete", model, mutating, "Deletes a hole.", object({{"hole", ref("A hole: its name or id.")}}, {"hole"}));
     add("model.fillet.add", model, mutating,

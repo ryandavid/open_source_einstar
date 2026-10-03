@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <format>
+#include <numbers>
 #include <random>
 
 #include <tbb/parallel_for.h>
@@ -58,22 +59,55 @@ BoxEval eval_box(const PartBox& b, const Vec3& p) {
     return {d, face};
 }
 
-// Hole solid: a capped cylinder from just outside the entry to the bottom.
+// Hole cutters: the bore (a capped cylinder from just outside the entry), with a counterbore, a countersink and a
+// drill point when given. Face indices within a hole: 0 wall, 1 flat bottom, 2 counterbore wall, 3 counterbore
+// floor, 4 countersink, 5 drill point.
 constexpr double kHoleLead = 1.0;  // mm the cutter starts outside the entry face
+constexpr int kFacesPerHole = 6;
 
 struct HoleEval {
     double distance;  // signed distance of the cutter solid
-    bool bottom;      // nearest cutter face is the bottom cap
+    int face;
 };
+
+// A capped cylinder along the hole's axis from -lead to `bottom`: distance, and whether the bottom cap is nearest.
+std::pair<double, bool> capped(double rho, double h, double radius, double bottom) {
+    const double half = 0.5 * (bottom + kHoleLead), mid = 0.5 * (bottom - kHoleLead);
+    const Vec2 d(rho - radius, std::abs(h - mid) - half);
+    return {d.cwiseMax(0.0).norm() + std::min(d.maxCoeff(), 0.0), d.y() > d.x() && h > mid};
+}
+
+// One nappe of a cone opening towards the entry (decreasing depth) from its apex at depth `apex`.
+double cone_towards_entry(double rho, double h, double apex, double half_angle) {
+    const double t = apex - h;  // height above the apex
+    if (t < 0) return std::hypot(rho, t);
+    return rho * std::cos(half_angle) - t * std::sin(half_angle);
+}
 
 HoleEval eval_hole(const PartHole& hole, const Vec3& p) {
     const Vec3 v = p - hole.entry;
     const double h = v.dot(hole.axis);
     const double rho = (v - h * hole.axis).norm();
-    const double half = 0.5 * (hole.depth + kHoleLead), mid = 0.5 * (hole.depth - kHoleLead);
-    const Vec2 d(rho - 0.5 * hole.diameter, std::abs(h - mid) - half);
-    const double dist = d.cwiseMax(0.0).norm() + std::min(d.maxCoeff(), 0.0);
-    return {dist, d.y() > d.x() && h > mid};
+    const double r = 0.5 * hole.diameter;
+    const auto [bore, bottom] = capped(rho, h, r, hole.depth);
+    HoleEval best{bore, bottom && hole.point_angle_deg <= 0 ? 1 : 0};
+    const auto consider = [&](double d, int face) {
+        if (d < best.distance) best = {d, face};
+    };
+    if (hole.counterbore_diameter > 0) {
+        const auto [cb, floor] = capped(rho, h, 0.5 * hole.counterbore_diameter, hole.counterbore_depth);
+        consider(cb, floor ? 3 : 2);
+    }
+    if (hole.countersink_diameter > 0) {
+        const double a = 0.5 * hole.countersink_angle_deg * std::numbers::pi / 180;
+        consider(cone_towards_entry(rho, h, 0.5 * hole.countersink_diameter / std::tan(a), a), 4);
+    }
+    if (hole.point_angle_deg > 0 && hole.depth < 1e8) {
+        const double b = 0.5 * hole.point_angle_deg * std::numbers::pi / 180;
+        // The tip below the shoulder (above it the bore covers).
+        consider(std::max(cone_towards_entry(rho, h, hole.depth + r / std::tan(b), b), hole.depth - h), 5);
+    }
+    return best;
 }
 
 struct PartEval {
@@ -100,7 +134,7 @@ public:
             const HoleEval e = eval_hole(spec_.holes[k], p);
             if (-e.distance > d) {
                 d = -e.distance;
-                face = hole_base + static_cast<int>(k) * 2 + (e.bottom ? 1 : 0);
+                face = hole_base + static_cast<int>(k) * kFacesPerHole + e.face;
             }
         }
         return {d, face};
@@ -217,9 +251,20 @@ std::vector<TruthFace> truth_faces(const PartSpec& spec) {
     const int hole_base = static_cast<int>(spec.boxes.size()) * kFacesPerBox;
     for (std::size_t k = 0; k < spec.holes.size(); ++k) {
         const PartHole& hole = spec.holes[k];
-        faces.push_back({hole_base + static_cast<int>(k) * 2, std::format("hole{} wall", k), Cylinder{hole.entry, hole.axis, 0.5 * hole.diameter}, true});
+        const int base = hole_base + static_cast<int>(k) * kFacesPerHole;
+        const Vec3 out = -hole.axis;
+        faces.push_back({base, std::format("hole{} wall", k), Cylinder{hole.entry, hole.axis, 0.5 * hole.diameter}, true});
         const Vec3 bottom = hole.entry + hole.depth * hole.axis;
-        faces.push_back({hole_base + static_cast<int>(k) * 2 + 1, std::format("hole{} bottom", k), Plane{-hole.axis, (-hole.axis).dot(bottom)}, true});
+        faces.push_back({base + 1, std::format("hole{} bottom", k), Plane{out, out.dot(bottom)}, true});
+        faces.push_back({base + 2, std::format("hole{} counterbore", k), Cylinder{hole.entry, hole.axis, 0.5 * hole.counterbore_diameter}, true});
+        const Vec3 cb_floor = hole.entry + hole.counterbore_depth * hole.axis;
+        faces.push_back({base + 3, std::format("hole{} counterbore floor", k), Plane{out, out.dot(cb_floor)}, true});
+        const double a = 0.5 * hole.countersink_angle_deg * std::numbers::pi / 180;
+        faces.push_back({base + 4, std::format("hole{} countersink", k),
+                         Cone{hole.entry + 0.5 * hole.countersink_diameter / std::tan(a) * hole.axis, out, a}, true});
+        const double b = std::max(0.5 * hole.point_angle_deg, 1.0) * std::numbers::pi / 180;
+        faces.push_back({base + 5, std::format("hole{} point", k),
+                         Cone{hole.entry + (hole.depth + 0.5 * hole.diameter / std::tan(b)) * hole.axis, out, b}, true});
     }
     std::ranges::sort(faces, [](const TruthFace& a, const TruthFace& b) { return a.id < b.id; });
     return faces;
@@ -275,6 +320,22 @@ PartSpec flanged_box_spec() {
         for (const double y : {-19.0, 19.0}) spec.holes.push_back({Vec3(x, y, 4), -Vec3::UnitZ(), 5.5, 1e9});
     spec.holes.push_back({Vec3(0, 0, 20), -Vec3::UnitZ(), 8.0, 10.0});
     spec.unseen_below_z = 0.3;
+    return spec;
+}
+
+PartSpec hole_forms_spec() {
+    PartSpec spec;
+    spec.boxes.push_back({Vec3(-30, -20, 0), Vec3(30, 20, 12), 0.0});
+    PartHole cb{Vec3(-18, 0, 12), -Vec3::UnitZ(), 6.6, 1e9};
+    cb.counterbore_diameter = 11;
+    cb.counterbore_depth = 6.5;
+    PartHole cs{Vec3(0, 0, 12), -Vec3::UnitZ(), 4.5, 1e9};
+    cs.countersink_diameter = 9;
+    cs.countersink_angle_deg = 90;
+    PartHole drilled{Vec3(18, 0, 12), -Vec3::UnitZ(), 5.0, 8.0};
+    drilled.point_angle_deg = 118;
+    spec.holes = {cb, cs, drilled};
+    spec.hole_wall_depth = 4;  // a careful scan: the holes seen to the bottom
     return spec;
 }
 

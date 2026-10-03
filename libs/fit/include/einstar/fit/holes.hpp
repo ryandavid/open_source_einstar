@@ -38,7 +38,11 @@ struct HoleCandidate {
     double roundness_error = 0;  // of the opening, relative
     std::vector<std::uint32_t> wall;   // wall triangles (between the opening and the deepest wall seen)
     double wall_depth = 0;             // how deep the wall was scanned, mm
-    std::optional<double> floor_depth; // a floor normal to the axis was seen at this depth (blind hole)
+    std::optional<double> floor_depth; // a floor was seen: a blind hole this deep (to the shoulder, if pointed)
+    // The hole's forms, when the scan shows them.
+    std::optional<double> counterbore_diameter, counterbore_depth;
+    std::optional<double> countersink_diameter, countersink_angle_deg;  // included angle
+    std::optional<double> point_angle_deg;                               // a drill point's included angle
     std::vector<std::uint32_t> opening;  // the opening's boundary loop (vertex indices)
 };
 

@@ -120,3 +120,38 @@ TEST_CASE("auto-detect finds every face of the flanged box") {
     for (const auto& r : regions)
         std::println("  region {:8} {:6.1f} mm2 sigma {:.3f}", kind_name(kind_of(r.fit.surface)), r.area_mm2, r.fit.sigma);
 }
+
+TEST_CASE("hole forms: counterbore, countersink and drill point measured from the scan") {
+    const Scan s(hole_forms_spec());
+    const GrownRegion top = grow_face(s, {8, 12, 50}, {0, 0, -1});
+    auto holes = find_holes(s.part.mesh, s.topo, s.bvh, top.triangles, std::get<Plane>(top.fit.surface));
+    REQUIRE(holes.size() == 3);
+    std::ranges::sort(holes, [](const HoleCandidate& a, const HoleCandidate& b) { return a.center.x() < b.center.x(); });
+    for (const auto& h : holes) {
+        const auto opt = [](const std::optional<double>& v) { return v ? std::format("{:.3f}", *v) : std::string("-"); };
+        std::println("hole at x {:.2f}: dia {:.3f} (wall {}), counterbore {} x {}, countersink {} at {}, point {}, floor {}", h.center.x(), h.diameter,
+                     opt(h.wall_diameter), opt(h.counterbore_diameter), opt(h.counterbore_depth), opt(h.countersink_diameter),
+                     opt(h.countersink_angle_deg), opt(h.point_angle_deg), opt(h.floor_depth));
+    }
+    const auto& cb = holes[0];
+    CHECK(std::abs(cb.diameter - 6.6) < 0.06);
+    REQUIRE(cb.counterbore_diameter);
+    REQUIRE(cb.counterbore_depth);
+    CHECK(std::abs(*cb.counterbore_diameter - 11) < 0.1);
+    CHECK(std::abs(*cb.counterbore_depth - 6.5) < 0.1);
+    CHECK(!cb.floor_depth);
+
+    const auto& cs = holes[1];
+    CHECK(std::abs(cs.diameter - 4.5) < 0.08);
+    REQUIRE(cs.countersink_diameter);
+    CHECK(std::abs(*cs.countersink_diameter - 9) < 0.2);
+    CHECK(std::abs(*cs.countersink_angle_deg - 90) < 3);
+    CHECK(!cs.counterbore_diameter);
+
+    const auto& dr = holes[2];
+    CHECK(std::abs(dr.diameter - 5) < 0.06);
+    REQUIRE(dr.point_angle_deg);
+    CHECK(std::abs(*dr.point_angle_deg - 118) < 6);
+    REQUIRE(dr.floor_depth);
+    CHECK(std::abs(*dr.floor_depth - 8) < 0.15);
+}

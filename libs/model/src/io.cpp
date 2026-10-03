@@ -300,6 +300,14 @@ Result<void> Document::save(const std::filesystem::path& path) const {
                       {"seen_depth", h.seen_depth}, {"rim", h.rim}};
             if (h.diameter) j["diameter"] = *h.diameter;
             if (h.depth) j["depth"] = *h.depth;
+            const auto put = [&](const char* key, const std::optional<double>& v) {
+                if (v) j[key] = *v;
+            };
+            put("counterbore_diameter", h.counterbore_diameter);
+            put("counterbore_depth", h.counterbore_depth);
+            put("countersink_diameter", h.countersink_diameter);
+            put("countersink_angle_deg", h.countersink_angle_deg);
+            put("point_angle_deg", h.point_angle_deg);
             doc["holes"].push_back(j);
         }
         for (const auto& fl : state_.fillets) {
@@ -391,6 +399,14 @@ Result<void> Document::load(const std::filesystem::path& path) {
             h.rim = j.value("rim", std::vector<std::uint32_t>{});
             if (j.contains("diameter")) h.diameter = j["diameter"].get<double>();
             if (j.contains("depth")) h.depth = j["depth"].get<double>();
+            const auto take = [&](const char* key, std::optional<double>& v) {
+                if (j.contains(key)) v = j[key].get<double>();
+            };
+            take("counterbore_diameter", h.counterbore_diameter);
+            take("counterbore_depth", h.counterbore_depth);
+            take("countersink_diameter", h.countersink_diameter);
+            take("countersink_angle_deg", h.countersink_angle_deg);
+            take("point_angle_deg", h.point_angle_deg);
             s.holes.push_back(h);
         }
         for (const auto& j : doc.at("fillets")) {

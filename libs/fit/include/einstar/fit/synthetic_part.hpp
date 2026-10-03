@@ -26,7 +26,10 @@ struct PartHole {
     Vec3 entry = Vec3::Zero();  // centre of the opening, on the entry face
     Vec3 axis = -Vec3::UnitZ(); // unit, pointing into the material
     double diameter = 5;
-    double depth = 1e9;         // flat-bottomed blind hole; larger than the material: through
+    double depth = 1e9;         // blind hole (to the shoulder, if it has a point); larger than the material: through
+    double counterbore_diameter = 0, counterbore_depth = 0;   // 0: none
+    double countersink_diameter = 0, countersink_angle_deg = 90;  // 0: none; the included angle
+    double point_angle_deg = 0;  // a drill point's included angle at a blind hole's bottom (118 for a drill); 0: flat
 };
 
 struct PartSpec {
@@ -67,5 +70,11 @@ struct SyntheticPart {
 //   an 8 mm blind hole 10 mm deep in the top of the body.
 // The bottom (z < 0.3) is unseen, as if the part stood on a table.
 [[nodiscard]] PartSpec flanged_box_spec();
+
+// A 60 x 40 x 12 mm plate with hole forms, all scanned to the bottom:
+//   x = -18: 6.6 mm through hole, counterbored 11 mm x 6.5 mm deep (an M6 socket head screw);
+//   x = 0:   4.5 mm through hole, countersunk 9 mm at 90 degrees;
+//   x = 18:  5 mm blind hole 8 mm deep (to the shoulder) with a 118 degree drill point.
+[[nodiscard]] PartSpec hole_forms_spec();
 
 }  // namespace einstar::fit

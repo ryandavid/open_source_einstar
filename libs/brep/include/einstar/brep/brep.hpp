@@ -34,7 +34,10 @@ struct HoleInput {
     Vec3 entry = Vec3::Zero();   // centre of the opening, on the entry face
     Vec3 axis = -Vec3::UnitZ();  // unit, into the material
     double diameter = 5;
-    std::optional<double> depth; // flat-bottomed blind hole; nullopt: through
+    std::optional<double> depth; // blind hole (to the shoulder if it has a point); nullopt: through
+    std::optional<double> counterbore_diameter, counterbore_depth;
+    std::optional<double> countersink_diameter, countersink_angle_deg;  // included angle
+    std::optional<double> point_angle_deg;                               // a drill point at a blind hole's bottom
 };
 
 struct FilletInput {
