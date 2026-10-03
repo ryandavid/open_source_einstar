@@ -20,6 +20,8 @@ struct DetectOptions {
     float seed_radius_mm = 1.5f;
     double min_plane_area_mm2 = 12.0;
     double min_curved_area_mm2 = 3.0;
+    // Curved regions bending tighter than this are the scan rounding an edge, not a face (0: keep all).
+    double min_radius_mm = 0.0;
     bool curved = true;
     // Triangles to leave alone (already labelled); may be empty.
     std::span<const std::uint8_t> blocked;

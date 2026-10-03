@@ -4,6 +4,7 @@
 #include <cmath>
 #include <format>
 #include <numbers>
+#include <tuple>
 
 #include <BOPAlgo_CellsBuilder.hxx>
 #include <BOPAlgo_MakerVolume.hxx>
@@ -39,6 +40,7 @@
 #include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
 #include <TopTools_IndexedMapOfShape.hxx>
 #include <TopoDS.hxx>
+#include <Standard_Failure.hxx>
 #include <XCAFApp_Application.hxx>
 #include <XCAFDoc_DocumentTool.hxx>
 #include <XCAFDoc_ShapeTool.hxx>
@@ -60,6 +62,12 @@ namespace {
 template <class... Ts>
 struct Overloaded : Ts... {
     using Ts::operator()...;
+};
+
+// Scan points of a face lying on one piece of it, and one of them (to look at the piece's side there).
+struct Support {
+    int count = 0;
+    Vec3 sample = Vec3::Zero();
 };
 
 gp_Pnt to_pnt(const Vec3& v) { return {v.x(), v.y(), v.z()}; }
@@ -186,9 +194,112 @@ std::string name_face(const TopoDS_Face& f, const BuildInput& in) {
     return {};
 }
 
+// Area of every piece (indexed as piece_index).
+std::vector<double> piece_area(const std::vector<std::vector<TopoDS_Face>>& pieces, const TopTools_DataMapOfShapeInteger& index, std::size_t count) {
+    std::vector<double> area(count, 0);
+    for (const auto& list : pieces)
+        for (const auto& pc : list) {
+            GProp_GProps props;
+            BRepGProp::SurfaceProperties(pc, props);
+            area[static_cast<std::size_t>(index.Find(pc))] = props.Mass();
+        }
+    return area;
+}
+
+// Pieces of faces the scan did not see but the user gave (e.g. the bottom): bounding the solid there is
+// intended, not a guess.
+std::vector<bool> given_piece(const BuildInput& in, const std::vector<std::vector<TopoDS_Face>>& pieces, const TopTools_DataMapOfShapeInteger& index,
+                              std::size_t count) {
+    std::vector<bool> given(count, false);
+    for (std::size_t i = 0; i < in.faces.size(); ++i)
+        if (in.faces[i].points.empty())
+            for (const auto& pc : pieces[i]) given[static_cast<std::size_t>(index.Find(pc))] = true;
+    return given;
+}
+
+// Minimum s-t cut (Edmonds-Karp) on a small graph; returns the nodes on the source side.
+std::vector<bool> min_cut_source_side(std::size_t nodes, std::size_t s, std::size_t t,
+                                      const std::vector<std::tuple<std::size_t, std::size_t, double>>& edges) {
+    struct Arc {
+        std::size_t to, rev;
+        double cap;
+    };
+    std::vector<std::vector<Arc>> g(nodes);
+    for (const auto& [a, b, c] : edges) {
+        g[a].push_back({b, g[b].size(), c});
+        g[b].push_back({a, g[a].size() - 1, 0.0});
+    }
+    std::vector<std::pair<std::size_t, std::size_t>> parent(nodes);
+    for (;;) {
+        std::vector<bool> seen(nodes, false);
+        std::vector<std::size_t> queue{s};
+        seen[s] = true;
+        for (std::size_t q = 0; q < queue.size() && !seen[t]; ++q)
+            for (std::size_t k = 0; k < g[queue[q]].size(); ++k) {
+                const Arc& a = g[queue[q]][k];
+                if (a.cap > 1e-12 && !seen[a.to]) {
+                    seen[a.to] = true;
+                    parent[a.to] = {queue[q], k};
+                    queue.push_back(a.to);
+                }
+            }
+        if (!seen[t]) return seen;  // the source side
+        double flow = 1e300;
+        for (std::size_t v = t; v != s; v = parent[v].first) flow = std::min(flow, g[parent[v].first][parent[v].second].cap);
+        for (std::size_t v = t; v != s; v = parent[v].first) {
+            Arc& a = g[parent[v].first][parent[v].second];
+            a.cap -= flow;
+            g[a.to][a.rev].cap += flow;
+        }
+    }
+}
+
+// Material or air per cell: a two-label graph cut. Each cell's vote is the evidence (scan points on its
+// boundary, on the side the scan says material is). Making a boundary through a piece the scan did not see
+// costs that piece's area at about half the scan's point density: a cell hidden inside the part (the flange
+// under the body), which no point can vote for, goes with its neighbours rather than becoming a void, and
+// the solid does not grow faces where the scan saw none.
+std::vector<bool> choose_material(const std::vector<std::vector<int>>& cell_pieces, const std::vector<long>& votes,
+                                  const std::vector<Support>& support, const std::vector<double>& area, const std::vector<bool>& given) {
+    const std::size_t nc = cell_pieces.size();
+    double points = 0, supported_area = 0;
+    for (std::size_t pc = 0; pc < support.size(); ++pc)
+        if (support[pc].count > 0) {
+            points += support[pc].count;
+            supported_area += area[pc];
+        }
+    const double density = supported_area > 0 ? points / supported_area : 0;
+    const double lambda = 0.5 * density;
+    std::vector<std::vector<std::size_t>> cells_of(support.size());
+    for (std::size_t c = 0; c < nc; ++c)
+        for (const int pc : cell_pieces[c]) cells_of[static_cast<std::size_t>(pc)].push_back(c);
+    const std::size_t s = nc, t = nc + 1;
+    std::vector<std::tuple<std::size_t, std::size_t, double>> edges;
+    for (std::size_t c = 0; c < nc; ++c) {
+        if (votes[c] > 0) edges.emplace_back(s, c, static_cast<double>(votes[c]));
+        if (votes[c] < 0) edges.emplace_back(c, t, static_cast<double>(-votes[c]));
+    }
+    for (std::size_t pc = 0; pc < support.size(); ++pc) {
+        if (given[pc]) continue;
+        // The unseen share of the piece (a piece with some support is partly seen).
+        const double unseen = std::max(0.0, area[pc] - (density > 0 ? support[pc].count / density : 0.0));
+        const double w = lambda * unseen;
+        if (w <= 0) continue;
+        const auto& cs = cells_of[pc];
+        if (cs.size() == 2) {
+            edges.emplace_back(cs[0], cs[1], w);
+            edges.emplace_back(cs[1], cs[0], w);
+        } else if (cs.size() == 1) {
+            edges.emplace_back(cs[0], t, w);  // outside the arrangement is air
+        }
+    }
+    const std::vector<bool> side = min_cut_source_side(nc + 2, s, t, edges);
+    return {side.begin(), side.begin() + static_cast<std::ptrdiff_t>(nc)};
+}
+
 }  // namespace
 
-BuildResult build(const BuildInput& in) {
+static BuildResult build_unguarded(const BuildInput& in) {
     BuildResult out;
     if (in.faces.empty()) {
         out.log.push_back("no faces");
@@ -232,10 +343,6 @@ BuildResult build(const BuildInput& in) {
         for (const auto& img : images) pieces[i].push_back(TopoDS::Face(img));
         for (const auto& pc : pieces[i]) piece_owner.Bind(pc, static_cast<int>(i));
     }
-    struct Support {
-        int count = 0;
-        Vec3 sample = Vec3::Zero();
-    };
     TopTools_DataMapOfShapeInteger piece_index;
     std::vector<Support> support;
     std::vector<int> outward(in.faces.size(), 0);  // material side: +1 along the surface normal, -1 against
@@ -265,6 +372,7 @@ BuildResult build(const BuildInput& in) {
     std::vector<TopoDS_Shape> cell_shapes;
     std::vector<std::vector<int>> cell_pieces;
     std::vector<bool> is_material;
+    std::vector<long> votes;
     for (TopExp_Explorer ex(cells, TopAbs_SOLID); ex.More(); ex.Next()) {
         long vote = 0;
         std::vector<int> pcs;
@@ -282,8 +390,10 @@ BuildResult build(const BuildInput& in) {
         }
         cell_shapes.push_back(ex.Current());
         cell_pieces.push_back(std::move(pcs));
-        is_material.push_back(vote > 0);
+        votes.push_back(vote);
     }
+    is_material = choose_material(cell_pieces, votes, support, piece_area(pieces, piece_index, support.size()),
+                                  given_piece(in, pieces, piece_index, support.size()));
     TopTools_ListOfShape material;
     for (std::size_t c = 0; c < cell_shapes.size(); ++c)
         if (is_material[c]) material.Append(cell_shapes[c]);
@@ -355,27 +465,50 @@ BuildResult build(const BuildInput& in) {
                 if ((in.fillets[k].face_a == a && in.fillets[k].face_b == b) || (in.fillets[k].face_a == b && in.fillets[k].face_b == a))
                     fillet_edges[k].push_back(TopoDS::Edge(edge_faces.FindKey(e)));
         }
-        BRepFilletAPI_MakeFillet all(shape);
-        int added = 0;
-        for (std::size_t k = 0; k < in.fillets.size(); ++k)
-            for (const auto& e : fillet_edges[k]) {
-                all.Add(in.fillets[k].radius, e);
-                ++added;
-            }
-        if (added > 0) {
-            all.Build();
-            if (all.IsDone()) {
-                shape = all.Shape();
-                out.log.push_back(std::format("{} fillets on {} edges", in.fillets.size(), added));
-            } else {
-                // One fillet at a time, to keep the ones that work and name the ones that do not.
-                out.log.push_back("the fillets failed together; trying them one at a time");
-                for (std::size_t k = 0; k < in.fillets.size(); ++k) {
-                    if (fillet_edges[k].empty()) {
-                        out.log.push_back(std::format("fillet '{}': its faces share no edge", in.fillets[k].name));
-                        continue;
+        // All at once with the radii given; then with near-equal radii made equal (fillets meeting at a corner
+        // need consistent radii, and measured ones differ slightly); then one at a time, keeping those that work.
+        const auto try_all = [&](const std::vector<double>& radii) -> bool {
+            try {
+                BRepFilletAPI_MakeFillet mk(shape);
+                int added = 0;
+                for (std::size_t k = 0; k < in.fillets.size(); ++k)
+                    for (const auto& e : fillet_edges[k]) {
+                        mk.Add(radii[k], e);
+                        ++added;
                     }
-                    // Edges must be found again on the current shape.
+                if (added == 0) return true;
+                mk.Build();
+                if (!mk.IsDone() || !BRepCheck_Analyzer(mk.Shape()).IsValid()) return false;
+                shape = mk.Shape();
+                out.log.push_back(std::format("{} fillets on {} edges", in.fillets.size(), added));
+                return true;
+            } catch (const Standard_Failure&) {
+                return false;
+            }
+        };
+        std::vector<double> radii;
+        for (const auto& f : in.fillets) radii.push_back(f.radius);
+        bool done = try_all(radii);
+        if (!done) {
+            std::vector<double> equal = radii;
+            std::vector<double> sorted = radii;
+            std::ranges::sort(sorted);
+            for (std::size_t k = 0; k < equal.size(); ++k) {
+                std::vector<double> near;
+                for (const double r : sorted)
+                    if (std::abs(r - radii[k]) <= 0.1 * radii[k]) near.push_back(r);
+                equal[k] = near[near.size() / 2];
+            }
+            if (equal != radii && try_all(equal)) {
+                done = true;
+                out.log.push_back("fillets of nearly equal radius were made equal (where they meet, they must agree): set the radii to make this exact");
+            }
+        }
+        if (!done) {
+            out.log.push_back("the fillets failed together; trying them one at a time");
+            for (std::size_t k = 0; k < in.fillets.size(); ++k) {
+                const FilletInput& fl = in.fillets[k];
+                try {
                     TopTools_IndexedDataMapOfShapeListOfShape ef;
                     TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, ef);
                     BRepFilletAPI_MakeFillet one(shape);
@@ -384,14 +517,20 @@ BuildResult build(const BuildInput& in) {
                         const TopTools_ListOfShape& faces = ef(e);
                         if (faces.Extent() != 2) continue;
                         const int a = owner(faces.First()), b = owner(faces.Last());
-                        if ((in.fillets[k].face_a == a && in.fillets[k].face_b == b) || (in.fillets[k].face_a == b && in.fillets[k].face_b == a)) {
-                            one.Add(in.fillets[k].radius, TopoDS::Edge(ef.FindKey(e)));
+                        if ((fl.face_a == a && fl.face_b == b) || (fl.face_a == b && fl.face_b == a)) {
+                            one.Add(fl.radius, TopoDS::Edge(ef.FindKey(e)));
                             ++n;
                         }
                     }
+                    if (n == 0) {
+                        out.log.push_back(std::format("fillet '{}': its faces share no edge", fl.name));
+                        continue;
+                    }
                     one.Build();
-                    if (n > 0 && one.IsDone()) shape = one.Shape();
-                    else out.log.push_back(std::format("fillet '{}' (R{}) could not be made", in.fillets[k].name, in.fillets[k].radius));
+                    if (one.IsDone() && BRepCheck_Analyzer(one.Shape()).IsValid()) shape = one.Shape();
+                    else out.log.push_back(std::format("fillet '{}' (R{:.3f}) could not be made", fl.name, fl.radius));
+                } catch (const Standard_Failure& e) {
+                    out.log.push_back(std::format("fillet '{}' (R{:.3f}) could not be made: {}", fl.name, fl.radius, e.GetMessageString()));
                 }
             }
         }
@@ -426,6 +565,17 @@ BuildResult build(const BuildInput& in) {
     }
     for (TopExp_Explorer fx(shape, TopAbs_FACE); fx.More(); fx.Next()) out.face_names.push_back(name_face(TopoDS::Face(fx.Current()), in));
     return out;
+}
+
+// OpenCASCADE reports failures by throwing (Standard_Failure); none of them may reach the caller.
+BuildResult build(const BuildInput& in) {
+    try {
+        return build_unguarded(in);
+    } catch (const Standard_Failure& e) {
+        BuildResult out;
+        out.log.push_back(std::format("the geometry kernel failed: {} ({})", e.GetMessageString(), e.DynamicType()->Name()));
+        return out;
+    }
 }
 
 Result<void> write_step(const BuildResult& result, const std::filesystem::path& path, const std::string& part_name) {

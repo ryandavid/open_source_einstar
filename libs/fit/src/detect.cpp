@@ -22,6 +22,14 @@ std::vector<float> roughness(const MeshTopology& topo) {
     return r;
 }
 
+// The tightest radius of curvature of a surface (infinite for a plane).
+double smallest_radius(const Surface& s) {
+    if (const auto* c = std::get_if<Cylinder>(&s)) return c->radius;
+    if (const auto* sp = std::get_if<Sphere>(&s)) return sp->radius;
+    if (const auto* t = std::get_if<Torus>(&s)) return t->minor;
+    return 1e30;
+}
+
 constexpr std::array kAnyKind{SurfaceKind::plane, SurfaceKind::cylinder, SurfaceKind::sphere};
 
 double area_of(const MeshTopology& topo, std::span<const std::uint32_t> tris) {
@@ -135,6 +143,7 @@ std::vector<DetectedRegion> detect_regions(const MeshTopology& topo, const Detec
             const double area = area_of(topo, g.regions[0].triangles);
             // A surface that does not fit (a plane laid on a fillet) shows as noise well above the scan's.
             if (area < min_area || (noise > 0 && g.regions[0].fit.sigma > (planes_only ? 1.5 : 2.0) * noise)) continue;
+            if (o.min_radius_mm > 0 && smallest_radius(g.regions[0].fit.surface) < o.min_radius_mm) continue;
             for (const auto t : g.regions[0].triangles) taken[t] = 1;
             out.push_back({g.regions[0].triangles, g.regions[0].fit, area});
         }

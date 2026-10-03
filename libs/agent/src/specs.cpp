@@ -17,6 +17,9 @@ json num(std::string d) { return {{"type", "number"}, {"description", std::move(
 json integer(std::string d) { return {{"type", "integer"}, {"description", std::move(d)}}; }
 json boolean(std::string d) { return {{"type", "boolean"}, {"description", std::move(d)}}; }
 json one_of(std::vector<std::string> values, std::string d) { return {{"type", "string"}, {"enum", std::move(values)}, {"description", std::move(d)}}; }
+json vec3(std::string d) { return {{"type", "array"}, {"items", {{"type", "number"}}}, {"minItems", 3}, {"maxItems", 3}, {"description", std::move(d)}}; }
+json ref(std::string d) { return {{"type", {"string", "integer"}}, {"description", std::move(d)}}; }
+json refs(std::string d) { return {{"type", "array"}, {"items", {{"type", {"string", "integer"}}}}, {"description", std::move(d)}}; }
 json point(std::string d) { return {{"type", "array"}, {"items", {{"type", "number"}}}, {"minItems", 2}, {"maxItems", 2}, {"description", std::move(d)}}; }
 json modifiers() {
     return {{"type", "array"}, {"items", {{"type", "string"}, {"enum", {"shift", "ctrl", "alt", "super"}}}},
@@ -212,6 +215,124 @@ std::vector<MethodSpec> build() {
                 {"ring_light", integer("0-9000.")}, {"white_leds", integer("0-9000.")}}));
     add("calib.tab", calibration, mutating, "Shows a tab of the main view.",
         object({{"tab", one_of({"live", "captures", "results"}, "The tab.")}}, {"tab"}));
+
+    // ---- the modelling app: scan -> faces, holes, fillets -> constraints -> solid -> STEP ----
+    // These are the document's commands (libs/model, Document::apply); a test keeps the two lists equal.
+    const json kLabel = ref("A label: its name or id.");
+    const json kAxis = one_of({"x", "y", "z"}, "A datum axis.");
+    add("model.summary", model, read_only,
+        "The whole document: the scan (size, bounds, voxel), every label (role, triangles, painted seeds, fitted and solved "
+        "surface, noise), holes, fillets, datums, constraints with their status from the last solve, the built model's state, "
+        "and undo depth. Start here, and check it after changes.");
+    add("model.label", model, read_only, "One label in detail: its surface, area, centroid, bounds and the labels it borders.",
+        object({{"label", kLabel}}, {"label"}));
+    add("model.deviation", model, read_only,
+        "How far the scan is from the built model: overall and per label (rms, p95, max, share within tolerance), hot spots "
+        "(patches beyond tolerance: centroid, size, mean and peak, the model face and label), the number of edge bands (thin "
+        "strips where the scan rounds sharp edges: expected, not errors), and model faces the scan does not cover. "
+        "+ means the scan lies outside the model (material missing from the model).",
+        object({{"max_hot_spots", integer("At most this many hot spots (default 10).")},
+                {"include_edge_bands", boolean("List edge bands too (default false).")}}));
+    add("model.raycast", model, read_only, "The scan point (and its label) where a ray first meets the scan.",
+        object({{"origin", vec3("Ray start, mm.")}, {"direction", vec3("Ray direction.")}}, {"origin", "direction"}));
+    add("model.history", model, read_only, "The undo and redo steps (description and author).");
+    add("model.open", model, mutating,
+        "Opens a document (.emodel) or a scan to model: an .estr recording (processed first: seconds to minutes), or an STL/PLY "
+        "mesh. A scan starts a new document.",
+        object({{"path", str("The file.")}, {"fine", boolean("For .estr: process at 0.3 mm voxels (default 0.5).")}}, {"path"}));
+    add("model.open_demo", model, mutating, "Opens the demo part: a scanned box with mounting flanges, fillets and holes.");
+    add("model.save", model, read_only, "Saves the document (.emodel: the scan's mesh and everything modelled on it).",
+        object({{"path", str("Where (default: where it was opened or last saved).")}}));
+    add("model.label.create", model, mutating,
+        "Creates an empty label (a named region of the scan). Paint seeds into it with model.paint, then model.grow.",
+        object({{"name", str("Unique name (default 'label N').")},
+                {"role", one_of({"face", "hole", "fillet", "ignore"}, "face (default): a face of the part; hole: a hole's wall; fillet; "
+                                                                     "ignore: scan that is not the part (table, fixture).")},
+                {"kinds", {{"type", "array"}, {"items", {{"type", "string"}, {"enum", {"plane", "cylinder", "cone", "sphere", "torus"}}}},
+                           {"description", "Surface kinds it may be (default: any; the simplest that fits is chosen)."}}}}));
+    add("model.label.update", model, mutating, "Renames a label or changes its role or allowed kinds.",
+        object({{"label", kLabel}, {"name", str("New name.")}, {"role", one_of({"face", "hole", "fillet", "ignore"}, "New role.")},
+                {"kinds", {{"type", "array"}, {"items", {{"type", "string"}}}, {"description", "Allowed surface kinds."}}}},
+               {"label"}));
+    add("model.label.delete", model, mutating, "Deletes a label with its paint, its region, and the constraints, holes and fillets on it.",
+        object({{"label", kLabel}}, {"label"}));
+    add("model.paint", model, mutating,
+        "Paints seed triangles of a label (or erases paint): a disc of the scan around a point, or listed triangles. A few mm "
+        "on the middle of a face is enough; model.grow extends it to the whole face.",
+        object({{"label", kLabel},
+                {"point", vec3("A point on or near the scan (mm); the disc is grown from the nearest scan triangle.")},
+                {"radius", num("Disc radius, mm.")},
+                {"triangles", {{"type", "array"}, {"items", {{"type", "integer"}}}, {"description", "Triangle indices instead of a disc."}}},
+                {"erase", boolean("Erase paint instead (of this label, or of any label when 'label' is not given).")}}));
+    add("model.grow", model, mutating,
+        "Grows painted labels into whole faces (all together, so neighbours meet at their edge) and fits each one's surface.",
+        object({{"labels", refs("Only these (default: every label with paint).")}}));
+    add("model.detect", model, mutating,
+        "Finds faces on the unlabelled scan automatically: planes first, then cylinders, cones, spheres and tori. Labels them "
+        "('plane 1', 'cylinder 2', ...), sorts out fillets (cylinders along the edge of two planes), hole walls and fillet "
+        "corners, and finds the holes in the planes. Rename the labels to meaningful names afterwards.");
+    add("model.find_holes", model, mutating,
+        "Finds round holes in a plane label (openings in its region): centre, axis, diameter (from the wall if scanned, else "
+        "from the opening), through or blind.",
+        object({{"label", kLabel}}, {"label"}));
+    add("model.hole.update", model, mutating,
+        "Sets a hole's true size from a measurement (overrides the scan's), its depth, or makes it through.",
+        object({{"hole", ref("A hole: its name or id.")}, {"diameter", num("Measured diameter, mm (null: back to the scan's).")},
+                {"depth", num("Blind hole depth, mm.")}, {"through", boolean("A through hole.")}, {"name", str("New name.")}},
+               {"hole"}));
+    add("model.hole.delete", model, mutating, "Deletes a hole.", object({{"hole", ref("A hole: its name or id.")}}, {"hole"}));
+    add("model.fillet.add", model, mutating,
+        "A fillet on the edge between two faces: from a fillet label (its faces and radius found from it), or between labels "
+        "'a' and 'b' with a radius.",
+        object({{"label", kLabel}, {"a", kLabel}, {"b", kLabel}, {"radius", num("Radius, mm (default: measured from the label).")},
+                {"name", str("Name.")}}));
+    add("model.fillet.update", model, mutating, "Sets a fillet's radius (null: back to the measured one).",
+        object({{"fillet", ref("A fillet: its name or id.")}, {"radius", num("Radius, mm.")}}, {"fillet"}));
+    add("model.fillet.delete", model, mutating, "Deletes a fillet.", object({{"fillet", ref("A fillet: its name or id.")}}, {"fillet"}));
+    add("model.datum.create", model, mutating,
+        "A coordinate frame for the part: z along label 'z' (a face's normal or an axis), x as near label 'x''s direction as "
+        "possible. Solved with the faces; constraints align faces to its axes and offset them from its origin, and the "
+        "exported part sits in it.",
+        object({{"name", str("Name (default 'datum').")}, {"z", kLabel}, {"x", kLabel}}, {"z", "x"}));
+    add("model.datum.delete", model, mutating, "Deletes a datum and its constraints.", object({{"datum", ref("A datum: its name or id.")}}, {"datum"}));
+    add("model.face.add_plane", model, mutating,
+        "Adds a face the scan did not see (e.g. the bottom the part stood on), as a plane square to a datum axis at an offset "
+        "from its origin. Needed where the scan is open, or the solid cannot be closed.",
+        object({{"name", str("Name.")}, {"datum", ref("The datum.")}, {"axis", kAxis}, {"offset", num("Along the axis from the datum origin, mm.")},
+                {"facing", one_of({"+", "-"}, "Which way the face looks out of the part: along (+, default) or against (-) the axis.")}},
+               {"datum", "axis", "offset"}));
+    add("model.constraint.add", model, mutating,
+        "Adds a constraint (held exactly by model.solve): aligned {label, datum, axis}: a face's normal or an axis along a "
+        "datum axis; parallel / perpendicular / coplanar / coaxial {a, b}; angle {a, b, degrees}; radius {label, value}; "
+        "diameter {label or hole, value} (a measured hole size); distance {a, b, value}: between parallel planes; offset "
+        "{label, datum, axis, value}: a face or axis at a position along a datum axis. Prefer one datum with aligned faces "
+        "over many pairwise perpendicular constraints.",
+        object({{"type", one_of({"aligned", "parallel", "perpendicular", "angle", "coplanar", "coaxial", "radius", "diameter", "distance", "offset"},
+                                "The constraint.")},
+                {"label", kLabel}, {"a", kLabel}, {"b", kLabel}, {"hole", ref("A hole (diameter).")}, {"datum", ref("A datum.")},
+                {"axis", kAxis}, {"value", num("mm.")}, {"degrees", num("0-90.")}},
+               {"type"}));
+    add("model.constraint.remove", model, mutating, "Removes a constraint.", object({{"constraint", integer("Its id.")}}, {"constraint"}));
+    add("model.square", model, mutating,
+        "Aligns plane faces to the nearest axis of a datum (the usual first step for a machined part: 'make the box square').",
+        object({{"datum", ref("The datum.")}, {"labels", refs("Only these (default: every plane face).")},
+                {"max_angle_deg", num("Leave out faces further than this from every axis (default 10).")}},
+               {"datum"}));
+    add("model.solve", model, mutating,
+        "Fits every face together under the constraints. Per constraint: satisfied / redundant / conflict / invalid, and what "
+        "it costs (how far it moved surfaces off the scan); per label: rms, movement from its own best fit, uncertainty.");
+    add("model.build", model, mutating,
+        "Builds the solid from the faces, holes and fillets, then measures the scan's deviation from it (see model.deviation). "
+        "Says when the faces do not enclose the part (add the missing face where the scan is open).",
+        object({{"tolerance_mm", num("Deviation tolerance (default 0.1).")}, {"deflection_mm", num("Tessellation accuracy (default 0.02).")}}));
+    add("model.export_step", model, read_only, "Writes the built solid as STEP (AP242, mm, faces named after labels) and reads it back to check.",
+        object({{"path", str("The .step file.")}}, {"path"}));
+    add("model.begin_change", model, mutating,
+        "Starts a change: everything until model.end_change is one undo step (use it around each request you carry out).",
+        object({{"description", str("What the change does, as the user sees it in the history.")}}));
+    add("model.end_change", model, mutating, "Ends the change begun with model.begin_change.");
+    add("model.undo", model, mutating, "Undoes the last change.");
+    add("model.redo", model, mutating, "Redoes the last undone change.");
     return m;
 }
 
@@ -222,12 +343,13 @@ std::string_view app_name(App a) {
         case App::any: return "any";
         case App::scan: return "scan";
         case App::calibration: return "calibration";
+        case App::model: return "model";
     }
     return "any";
 }
 
 std::optional<App> app_from_name(std::string_view name) {
-    for (const App a : {App::any, App::scan, App::calibration})
+    for (const App a : {App::any, App::scan, App::calibration, App::model})
         if (app_name(a) == name) return a;
     return std::nullopt;
 }

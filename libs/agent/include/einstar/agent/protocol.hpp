@@ -24,8 +24,8 @@ namespace einstar::agent {
 using json = nlohmann::json;
 
 // Which app answers a method. `any`: the generic layer every app has (ui.*, input.*, app.*).
-enum class App { any, scan, calibration };
-[[nodiscard]] std::string_view app_name(App a);  // "any", "scan", "calibration"
+enum class App { any, scan, calibration, model };
+[[nodiscard]] std::string_view app_name(App a);  // "any", "scan", "calibration", "model"
 [[nodiscard]] std::optional<App> app_from_name(std::string_view name);
 
 // Whether a method changes state. A mutating method answers only after the app has drawn two more

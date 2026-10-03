@@ -1133,5 +1133,847 @@
       ],
       "type": "object"
     }
+  },
+  {
+    "app": "model",
+    "description": "The whole document: the scan (size, bounds, voxel), every label (role, triangles, painted seeds, fitted and solved surface, noise), holes, fillets, datums, constraints with their status from the last solve, the built model's state, and undo depth. Start here, and check it after changes.",
+    "kind": "read_only",
+    "name": "model.summary",
+    "params": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "One label in detail: its surface, area, centroid, bounds and the labels it borders.",
+    "kind": "read_only",
+    "name": "model.label",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "label": {
+          "description": "A label: its name or id.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        }
+      },
+      "required": [
+        "label"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "How far the scan is from the built model: overall and per label (rms, p95, max, share within tolerance), hot spots (patches beyond tolerance: centroid, size, mean and peak, the model face and label), the number of edge bands (thin strips where the scan rounds sharp edges: expected, not errors), and model faces the scan does not cover. + means the scan lies outside the model (material missing from the model).",
+    "kind": "read_only",
+    "name": "model.deviation",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "include_edge_bands": {
+          "description": "List edge bands too (default false).",
+          "type": "boolean"
+        },
+        "max_hot_spots": {
+          "description": "At most this many hot spots (default 10).",
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "The scan point (and its label) where a ray first meets the scan.",
+    "kind": "read_only",
+    "name": "model.raycast",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "direction": {
+          "description": "Ray direction.",
+          "items": {
+            "type": "number"
+          },
+          "maxItems": 3,
+          "minItems": 3,
+          "type": "array"
+        },
+        "origin": {
+          "description": "Ray start, mm.",
+          "items": {
+            "type": "number"
+          },
+          "maxItems": 3,
+          "minItems": 3,
+          "type": "array"
+        }
+      },
+      "required": [
+        "origin",
+        "direction"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "The undo and redo steps (description and author).",
+    "kind": "read_only",
+    "name": "model.history",
+    "params": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Opens a document (.emodel) or a scan to model: an .estr recording (processed first: seconds to minutes), or an STL/PLY mesh. A scan starts a new document.",
+    "kind": "mutating",
+    "name": "model.open",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "fine": {
+          "description": "For .estr: process at 0.3 mm voxels (default 0.5).",
+          "type": "boolean"
+        },
+        "path": {
+          "description": "The file.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Opens the demo part: a scanned box with mounting flanges, fillets and holes.",
+    "kind": "mutating",
+    "name": "model.open_demo",
+    "params": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Saves the document (.emodel: the scan's mesh and everything modelled on it).",
+    "kind": "read_only",
+    "name": "model.save",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "description": "Where (default: where it was opened or last saved).",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Creates an empty label (a named region of the scan). Paint seeds into it with model.paint, then model.grow.",
+    "kind": "mutating",
+    "name": "model.label.create",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "kinds": {
+          "description": "Surface kinds it may be (default: any; the simplest that fits is chosen).",
+          "items": {
+            "enum": [
+              "plane",
+              "cylinder",
+              "cone",
+              "sphere",
+              "torus"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "name": {
+          "description": "Unique name (default 'label N').",
+          "type": "string"
+        },
+        "role": {
+          "description": "face (default): a face of the part; hole: a hole's wall; fillet; ignore: scan that is not the part (table, fixture).",
+          "enum": [
+            "face",
+            "hole",
+            "fillet",
+            "ignore"
+          ],
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Renames a label or changes its role or allowed kinds.",
+    "kind": "mutating",
+    "name": "model.label.update",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "kinds": {
+          "description": "Allowed surface kinds.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "label": {
+          "description": "A label: its name or id.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "name": {
+          "description": "New name.",
+          "type": "string"
+        },
+        "role": {
+          "description": "New role.",
+          "enum": [
+            "face",
+            "hole",
+            "fillet",
+            "ignore"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "label"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Deletes a label with its paint, its region, and the constraints, holes and fillets on it.",
+    "kind": "mutating",
+    "name": "model.label.delete",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "label": {
+          "description": "A label: its name or id.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        }
+      },
+      "required": [
+        "label"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Paints seed triangles of a label (or erases paint): a disc of the scan around a point, or listed triangles. A few mm on the middle of a face is enough; model.grow extends it to the whole face.",
+    "kind": "mutating",
+    "name": "model.paint",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "erase": {
+          "description": "Erase paint instead (of this label, or of any label when 'label' is not given).",
+          "type": "boolean"
+        },
+        "label": {
+          "description": "A label: its name or id.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "point": {
+          "description": "A point on or near the scan (mm); the disc is grown from the nearest scan triangle.",
+          "items": {
+            "type": "number"
+          },
+          "maxItems": 3,
+          "minItems": 3,
+          "type": "array"
+        },
+        "radius": {
+          "description": "Disc radius, mm.",
+          "type": "number"
+        },
+        "triangles": {
+          "description": "Triangle indices instead of a disc.",
+          "items": {
+            "type": "integer"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Grows painted labels into whole faces (all together, so neighbours meet at their edge) and fits each one's surface.",
+    "kind": "mutating",
+    "name": "model.grow",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "labels": {
+          "description": "Only these (default: every label with paint).",
+          "items": {
+            "type": [
+              "string",
+              "integer"
+            ]
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Finds faces on the unlabelled scan automatically: planes first, then cylinders, cones, spheres and tori. Labels them ('plane 1', 'cylinder 2', ...), sorts out fillets (cylinders along the edge of two planes), hole walls and fillet corners, and finds the holes in the planes. Rename the labels to meaningful names afterwards.",
+    "kind": "mutating",
+    "name": "model.detect",
+    "params": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Finds round holes in a plane label (openings in its region): centre, axis, diameter (from the wall if scanned, else from the opening), through or blind.",
+    "kind": "mutating",
+    "name": "model.find_holes",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "label": {
+          "description": "A label: its name or id.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        }
+      },
+      "required": [
+        "label"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Sets a hole's true size from a measurement (overrides the scan's), its depth, or makes it through.",
+    "kind": "mutating",
+    "name": "model.hole.update",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "depth": {
+          "description": "Blind hole depth, mm.",
+          "type": "number"
+        },
+        "diameter": {
+          "description": "Measured diameter, mm (null: back to the scan's).",
+          "type": "number"
+        },
+        "hole": {
+          "description": "A hole: its name or id.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "name": {
+          "description": "New name.",
+          "type": "string"
+        },
+        "through": {
+          "description": "A through hole.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "hole"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Deletes a hole.",
+    "kind": "mutating",
+    "name": "model.hole.delete",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "hole": {
+          "description": "A hole: its name or id.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        }
+      },
+      "required": [
+        "hole"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "A fillet on the edge between two faces: from a fillet label (its faces and radius found from it), or between labels 'a' and 'b' with a radius.",
+    "kind": "mutating",
+    "name": "model.fillet.add",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "a": {
+          "description": "A label: its name or id.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "b": {
+          "description": "A label: its name or id.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "label": {
+          "description": "A label: its name or id.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "name": {
+          "description": "Name.",
+          "type": "string"
+        },
+        "radius": {
+          "description": "Radius, mm (default: measured from the label).",
+          "type": "number"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Sets a fillet's radius (null: back to the measured one).",
+    "kind": "mutating",
+    "name": "model.fillet.update",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "fillet": {
+          "description": "A fillet: its name or id.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "radius": {
+          "description": "Radius, mm.",
+          "type": "number"
+        }
+      },
+      "required": [
+        "fillet"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Deletes a fillet.",
+    "kind": "mutating",
+    "name": "model.fillet.delete",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "fillet": {
+          "description": "A fillet: its name or id.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        }
+      },
+      "required": [
+        "fillet"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "A coordinate frame for the part: z along label 'z' (a face's normal or an axis), x as near label 'x''s direction as possible. Solved with the faces; constraints align faces to its axes and offset them from its origin, and the exported part sits in it.",
+    "kind": "mutating",
+    "name": "model.datum.create",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "description": "Name (default 'datum').",
+          "type": "string"
+        },
+        "x": {
+          "description": "A label: its name or id.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "z": {
+          "description": "A label: its name or id.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        }
+      },
+      "required": [
+        "z",
+        "x"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Deletes a datum and its constraints.",
+    "kind": "mutating",
+    "name": "model.datum.delete",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "datum": {
+          "description": "A datum: its name or id.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        }
+      },
+      "required": [
+        "datum"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Adds a face the scan did not see (e.g. the bottom the part stood on), as a plane square to a datum axis at an offset from its origin. Needed where the scan is open, or the solid cannot be closed.",
+    "kind": "mutating",
+    "name": "model.face.add_plane",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "axis": {
+          "description": "A datum axis.",
+          "enum": [
+            "x",
+            "y",
+            "z"
+          ],
+          "type": "string"
+        },
+        "datum": {
+          "description": "The datum.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "facing": {
+          "description": "Which way the face looks out of the part: along (+, default) or against (-) the axis.",
+          "enum": [
+            "+",
+            "-"
+          ],
+          "type": "string"
+        },
+        "name": {
+          "description": "Name.",
+          "type": "string"
+        },
+        "offset": {
+          "description": "Along the axis from the datum origin, mm.",
+          "type": "number"
+        }
+      },
+      "required": [
+        "datum",
+        "axis",
+        "offset"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Adds a constraint (held exactly by model.solve): aligned {label, datum, axis}: a face's normal or an axis along a datum axis; parallel / perpendicular / coplanar / coaxial {a, b}; angle {a, b, degrees}; radius {label, value}; diameter {label or hole, value} (a measured hole size); distance {a, b, value}: between parallel planes; offset {label, datum, axis, value}: a face or axis at a position along a datum axis. Prefer one datum with aligned faces over many pairwise perpendicular constraints.",
+    "kind": "mutating",
+    "name": "model.constraint.add",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "a": {
+          "description": "A label: its name or id.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "axis": {
+          "description": "A datum axis.",
+          "enum": [
+            "x",
+            "y",
+            "z"
+          ],
+          "type": "string"
+        },
+        "b": {
+          "description": "A label: its name or id.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "datum": {
+          "description": "A datum.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "degrees": {
+          "description": "0-90.",
+          "type": "number"
+        },
+        "hole": {
+          "description": "A hole (diameter).",
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "label": {
+          "description": "A label: its name or id.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "type": {
+          "description": "The constraint.",
+          "enum": [
+            "aligned",
+            "parallel",
+            "perpendicular",
+            "angle",
+            "coplanar",
+            "coaxial",
+            "radius",
+            "diameter",
+            "distance",
+            "offset"
+          ],
+          "type": "string"
+        },
+        "value": {
+          "description": "mm.",
+          "type": "number"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Removes a constraint.",
+    "kind": "mutating",
+    "name": "model.constraint.remove",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "constraint": {
+          "description": "Its id.",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "constraint"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Aligns plane faces to the nearest axis of a datum (the usual first step for a machined part: 'make the box square').",
+    "kind": "mutating",
+    "name": "model.square",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "datum": {
+          "description": "The datum.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "labels": {
+          "description": "Only these (default: every plane face).",
+          "items": {
+            "type": [
+              "string",
+              "integer"
+            ]
+          },
+          "type": "array"
+        },
+        "max_angle_deg": {
+          "description": "Leave out faces further than this from every axis (default 10).",
+          "type": "number"
+        }
+      },
+      "required": [
+        "datum"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Fits every face together under the constraints. Per constraint: satisfied / redundant / conflict / invalid, and what it costs (how far it moved surfaces off the scan); per label: rms, movement from its own best fit, uncertainty.",
+    "kind": "mutating",
+    "name": "model.solve",
+    "params": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Builds the solid from the faces, holes and fillets, then measures the scan's deviation from it (see model.deviation). Says when the faces do not enclose the part (add the missing face where the scan is open).",
+    "kind": "mutating",
+    "name": "model.build",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "deflection_mm": {
+          "description": "Tessellation accuracy (default 0.02).",
+          "type": "number"
+        },
+        "tolerance_mm": {
+          "description": "Deviation tolerance (default 0.1).",
+          "type": "number"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Writes the built solid as STEP (AP242, mm, faces named after labels) and reads it back to check.",
+    "kind": "read_only",
+    "name": "model.export_step",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "description": "The .step file.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Starts a change: everything until model.end_change is one undo step (use it around each request you carry out).",
+    "kind": "mutating",
+    "name": "model.begin_change",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "description": "What the change does, as the user sees it in the history.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Ends the change begun with model.begin_change.",
+    "kind": "mutating",
+    "name": "model.end_change",
+    "params": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Undoes the last change.",
+    "kind": "mutating",
+    "name": "model.undo",
+    "params": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Redoes the last undone change.",
+    "kind": "mutating",
+    "name": "model.redo",
+    "params": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
   }
 ]

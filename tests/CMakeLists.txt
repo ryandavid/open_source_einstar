@@ -75,6 +75,8 @@ target_link_libraries(test_fit PRIVATE einstar::fit)
 if(TARGET einstar::brep)
   einstar_add_test(test_brep brep/test_brep.cpp)
   target_link_libraries(test_brep PRIVATE einstar::brep einstar::fit)
+  einstar_add_test(test_model model/test_document.cpp)
+  target_link_libraries(test_model PRIVATE einstar::model einstar::agent_protocol)
 endif()
 
 if(EINSTAR_BUILD_APP)
