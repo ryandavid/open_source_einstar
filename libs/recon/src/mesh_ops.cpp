@@ -273,6 +273,72 @@ std::size_t flatten_markers(TriangleMesh& mesh, const std::vector<MarkerDisc>& m
     return done;
 }
 
+std::size_t fill_small_holes(TriangleMesh& mesh, double max_perimeter_mm) {
+    if (max_perimeter_mm <= 0 || mesh.triangles.empty()) return 0;
+    // Boundary edges (one triangle), directed as in their triangle.
+    std::vector<std::pair<std::uint64_t, std::array<std::uint32_t, 2>>> edges;
+    edges.reserve(3 * mesh.triangles.size());
+    for (const auto& t : mesh.triangles)
+        for (int e = 0; e < 3; ++e) {
+            const auto a = t[static_cast<std::size_t>(e)], b = t[static_cast<std::size_t>((e + 1) % 3)];
+            edges.push_back({static_cast<std::uint64_t>(std::min(a, b)) << 32 | std::max(a, b), {a, b}});
+        }
+    std::ranges::sort(edges, {}, &decltype(edges)::value_type::first);
+    std::unordered_map<std::uint32_t, std::uint32_t> next;  // boundary vertex -> next along its loop
+    std::unordered_set<std::uint32_t> pinched;              // on more than one boundary edge pair
+    for (std::size_t i = 0; i < edges.size();) {
+        std::size_t j = i;
+        while (j < edges.size() && edges[j].first == edges[i].first) ++j;
+        if (j - i == 1) {
+            const auto [a, b] = edges[i].second;
+            if (!next.emplace(a, b).second) pinched.insert(a);
+        }
+        i = j;
+    }
+    const bool normals = mesh.normals.size() == mesh.vertices.size();
+    std::unordered_set<std::uint32_t> visited;
+    std::size_t filled = 0;
+    std::vector<std::uint32_t> loop;
+    for (const auto& [start, unused] : next) {
+        if (visited.contains(start)) continue;
+        loop.clear();
+        double perimeter = 0;
+        bool simple = true;
+        std::uint32_t v = start;
+        do {
+            if (pinched.contains(v) || !visited.insert(v).second) {
+                simple = false;
+                break;
+            }
+            loop.push_back(v);
+            const auto it = next.find(v);
+            if (it == next.end()) {
+                simple = false;
+                break;
+            }
+            perimeter += (mesh.vertices[it->second] - mesh.vertices[v]).norm();
+            v = it->second;
+        } while (v != start && perimeter <= max_perimeter_mm);
+        if (!simple || v != start || perimeter > max_perimeter_mm || loop.size() < 3) continue;
+        // The new triangles run against the boundary edges' direction (consistent orientation).
+        if (loop.size() == 3) {
+            mesh.triangles.push_back({loop[2], loop[1], loop[0]});
+        } else {
+            Vec3f c = Vec3f::Zero(), n = Vec3f::Zero();
+            for (const auto i : loop) {
+                c += mesh.vertices[i];
+                if (normals) n += mesh.normals[i];
+            }
+            const auto ci = static_cast<std::uint32_t>(mesh.vertices.size());
+            mesh.vertices.push_back(c / static_cast<float>(loop.size()));
+            if (normals) mesh.normals.push_back(n.normalized());
+            for (std::size_t k = 0; k < loop.size(); ++k) mesh.triangles.push_back({loop[(k + 1) % loop.size()], loop[k], ci});
+        }
+        ++filled;
+    }
+    return filled;
+}
+
 void taubin_smooth(TriangleMesh& mesh, int iterations, float lambda, float mu) {
     // Uniform-weight umbrella operator over the edge graph.
     const std::size_t n = mesh.vertices.size();

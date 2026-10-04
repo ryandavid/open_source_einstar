@@ -86,6 +86,10 @@ struct MarkerFlattenParams {
 };
 // Returns the number of markers flattened.
 std::size_t flatten_markers(TriangleMesh& mesh, const std::vector<MarkerDisc>& markers, const MarkerFlattenParams& params = {});
+
+// Closes holes whose boundary is a simple loop no longer than `max_perimeter_mm`: a fan around a new
+// vertex at the loop's centroid (a triangle for three edges). Returns the number of holes closed.
+std::size_t fill_small_holes(TriangleMesh& mesh, double max_perimeter_mm);
 // Taubin (lambda/mu) smoothing: reduces voxel-scale noise without shrinking the surface.
 void taubin_smooth(TriangleMesh& mesh, int iterations = 5, float lambda = 0.5f, float mu = -0.53f);
 

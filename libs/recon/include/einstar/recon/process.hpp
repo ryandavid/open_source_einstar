@@ -95,6 +95,10 @@ struct ProcessParams {
     // The surface over each identified marker sticker is replaced by the surface around it
     // (flatten_markers; positions from the frames' marker observations at the final poses).
     std::optional<MarkerFlattenParams> marker_flatten = MarkerFlattenParams{};
+    // Holes with a boundary no longer than this are closed (0 = none). 2.5 mm closes the pinholes of
+    // one or two missing cells and no real hole the model app could find (1 mm is 3.1 mm round);
+    // EXStar's meshing closes up to 10 mm.
+    double fill_holes_max_perimeter_mm = 2.5;
     int smooth_iterations = 0;
     bool simplify = true;          // error-bounded decimation: flat areas lose triangles, detail stays
     SimplifyParams simplify_params;
@@ -123,6 +127,7 @@ struct ProcessReport {
     ConsistencyStats consistency;  // depth pixels tested / dropped before the final fusion
     CleanupReport cleanup;
     int markers_flattened = 0;
+    int holes_filled = 0;
     SimplifyReport simplified;
     std::map<std::string, double> stage_ms;
 };

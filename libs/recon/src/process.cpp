@@ -664,6 +664,7 @@ Result<ProcessResult> process_session(const session::SessionReader& s, const Pro
         }
         rep.markers_flattened = static_cast<int>(flatten_markers(out.mesh, discs, *params.marker_flatten));
     }
+    rep.holes_filled = static_cast<int>(fill_small_holes(out.mesh, params.fill_holes_max_perimeter_mm));
     if (params.smooth_iterations > 0) taubin_smooth(out.mesh, params.smooth_iterations);
     if (params.simplify) {
         progress(params, "Simplifying", 0.0);

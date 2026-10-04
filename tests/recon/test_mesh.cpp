@@ -201,6 +201,38 @@ TEST_CASE("marker stickers: the bump over a sticker is flattened onto the surfac
     CHECK(moved_step == 0);
 }
 
+TEST_CASE("small holes are closed, consistently oriented; larger ones stay open") {
+    // A 20 x 20 grid of 0.5 mm squares with a pinhole of one square, one of a single triangle and a
+    // 3 x 3 square hole (6 mm round).
+    recon::TriangleMesh m;
+    const int n = 21;
+    for (int y = 0; y < n; ++y)
+        for (int x = 0; x < n; ++x) m.vertices.emplace_back(0.5f * static_cast<float>(x), 0.5f * static_cast<float>(y), 0.0f);
+    for (int y = 0; y + 1 < n; ++y)
+        for (int x = 0; x + 1 < n; ++x) {
+            if (x == 4 && y == 4) continue;                                // pinhole
+            if (x >= 10 && x < 13 && y >= 10 && y < 13) continue;          // larger hole
+            const auto i = static_cast<std::uint32_t>(y * n + x), un = static_cast<std::uint32_t>(n);
+            m.triangles.push_back({i, i + 1, i + un + 1});
+            if (!(x == 15 && y == 4)) m.triangles.push_back({i, i + un + 1, i + un});  // one missing triangle
+        }
+    m.compute_normals();
+    const auto before = m.triangles.size();
+    CHECK(recon::fill_small_holes(m, 2.5) == 2);
+    CHECK(m.triangles.size() == before + 4 + 1);  // a fan of four, one triangle
+    // Every directed edge once (orientation consistent), boundary only along the outline and the large hole.
+    std::map<std::pair<std::uint32_t, std::uint32_t>, int> directed;
+    for (const auto& t : m.triangles)
+        for (int e = 0; e < 3; ++e) ++directed[{t[static_cast<std::size_t>(e)], t[static_cast<std::size_t>((e + 1) % 3)]}];
+    int boundary = 0;
+    for (const auto& [e, c] : directed) {
+        CHECK(c == 1);
+        boundary += !directed.contains({e.second, e.first});
+    }
+    CHECK(boundary == 4 * 20 + 4 * 3);
+    CHECK(m.normals.back().z() > 0.99f);  // the pinhole's new vertex
+}
+
 TEST_CASE("simplification keeps the shape, manifoldness and orientation") {
     track::TsdfParams tp;
     tp.voxel_mm = 0.5f;
