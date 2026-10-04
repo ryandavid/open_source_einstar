@@ -1,9 +1,13 @@
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <numeric>
+#include <unordered_map>
 #include <unordered_set>
+
+#include <Eigen/Eigenvalues>
 
 #include "einstar/recon/mesh.hpp"
 
@@ -164,6 +168,109 @@ void remove_unreferenced_vertices(TriangleMesh& mesh) {
         for (auto& v : t) v = static_cast<std::uint32_t>(remap[v]);
     mesh.vertices = std::move(vertices);
     mesh.normals = std::move(normals);
+}
+
+std::size_t flatten_markers(TriangleMesh& mesh, const std::vector<MarkerDisc>& markers, const MarkerFlattenParams& p) {
+    if (markers.empty() || mesh.vertices.empty()) return 0;
+    if (mesh.normals.size() != mesh.vertices.size()) mesh.compute_normals();
+    // Vertices bucketed on a grid of the largest neighbourhood.
+    float reach = 0;
+    for (const auto& m : markers) reach = std::max(reach, p.cover_radii * m.radius + p.blend_mm + p.ring_mm);
+    if (reach <= 0) return 0;
+    const float cell = reach;
+    auto key = [](std::int64_t x, std::int64_t y, std::int64_t z) { return (x + (1 << 20)) << 42 | (y + (1 << 20)) << 21 | (z + (1 << 20)); };
+    auto coord = [&](float v) { return static_cast<std::int64_t>(std::floor(v / cell)); };
+    std::unordered_map<std::int64_t, std::vector<std::uint32_t>> grid;
+    for (std::uint32_t i = 0; i < mesh.vertices.size(); ++i) {
+        const Vec3f& v = mesh.vertices[i];
+        grid[key(coord(v.x()), coord(v.y()), coord(v.z()))].push_back(i);
+    }
+    std::size_t done = 0;
+    for (const auto& mk : markers) {
+        const Vec3f n = mk.normal.normalized();
+        const float inner = p.cover_radii * mk.radius, outer = inner + p.blend_mm, ring = outer + p.ring_mm;
+        // Vertices of the marker's surface around it (same side, near its plane).
+        std::vector<std::uint32_t> near;
+        for (std::int64_t dz = -1; dz <= 1; ++dz)
+            for (std::int64_t dy = -1; dy <= 1; ++dy)
+                for (std::int64_t dx = -1; dx <= 1; ++dx) {
+                    const auto it = grid.find(key(coord(mk.center.x()) + dx, coord(mk.center.y()) + dy, coord(mk.center.z()) + dz));
+                    if (it == grid.end()) continue;
+                    for (const auto i : it->second) {
+                        const Vec3f d = mesh.vertices[i] - mk.center;
+                        const float h = d.dot(n);
+                        if (std::abs(h) > p.max_height_mm || (d - h * n).norm() > ring || mesh.normals[i].dot(n) < 0.5f) continue;
+                        near.push_back(i);
+                    }
+                }
+        // The annulus: its plane, then a quadric height field over it.
+        Vec3 c = Vec3::Zero();
+        std::size_t na = 0;
+        std::array<int, 8> sectors{};
+        const Vec3f e0 = n.unitOrthogonal(), e1 = n.cross(e0);
+        auto radial = [&](std::uint32_t i) {
+            const Vec3f d = mesh.vertices[i] - mk.center;
+            return (d - d.dot(n) * n).norm();
+        };
+        for (const auto i : near)
+            if (const float r = radial(i); r >= outer) {
+                c += mesh.vertices[i].cast<double>();
+                ++na;
+                const Vec3f d = mesh.vertices[i] - mk.center;
+                const double a = std::atan2(d.dot(e1), d.dot(e0));
+                ++sectors[static_cast<std::size_t>(std::clamp(static_cast<int>((a + M_PI) / (2 * M_PI) * 8), 0, 7))];
+            }
+        if (na < 30 || std::ranges::count(sectors, 0) > 1) continue;  // the surround must be there on (nearly) all sides
+        c /= static_cast<double>(na);
+        Mat3 cov = Mat3::Zero();
+        for (const auto i : near)
+            if (radial(i) >= outer) {
+                const Vec3 d = mesh.vertices[i].cast<double>() - c;
+                cov += d * d.transpose();
+            }
+        const Eigen::SelfAdjointEigenSolver<Mat3> es(cov);
+        Vec3 pn = es.eigenvectors().col(0);
+        if (pn.dot(n.cast<double>()) < 0) pn = -pn;
+        if (pn.dot(n.cast<double>()) < 0.8) continue;  // the marker does not lie on that surface
+        const Vec3 u = es.eigenvectors().col(2), w = pn.cross(u);
+        auto basis = [&](const Vec3& q) {
+            const double x = (q - c).dot(u), y = (q - c).dot(w);
+            return Eigen::Matrix<double, 6, 1>(1, x, y, x * x, x * y, y * y);
+        };
+        Eigen::Matrix<double, 6, 6> AtA = Eigen::Matrix<double, 6, 6>::Zero();
+        Eigen::Matrix<double, 6, 1> Atb = Eigen::Matrix<double, 6, 1>::Zero();
+        for (const auto i : near)
+            if (radial(i) >= outer) {
+                const Vec3 q = mesh.vertices[i].cast<double>();
+                const auto b = basis(q);
+                AtA += b * b.transpose();
+                Atb += b * (q - c).dot(pn);
+            }
+        const Eigen::Matrix<double, 6, 1> co = AtA.ldlt().solve(Atb);
+        if (!co.allFinite()) continue;
+        double ss = 0;
+        for (const auto i : near)
+            if (radial(i) >= outer) {
+                const Vec3 q = mesh.vertices[i].cast<double>();
+                const double e = (q - c).dot(pn) - basis(q).dot(co);
+                ss += e * e;
+            }
+        if (std::sqrt(ss / static_cast<double>(na)) > p.max_ring_rms_mm) continue;
+        // Inside: onto the fitted surface (along its normal), blended out to `outer`.
+        for (const auto i : near) {
+            const float r = radial(i);
+            if (r >= outer) continue;
+            const double t = r <= inner ? 1.0 : 1.0 - (r - inner) / p.blend_mm;
+            const Vec3 q = mesh.vertices[i].cast<double>();
+            const double x = (q - c).dot(u), y = (q - c).dot(w);
+            const double target = co[0] + co[1] * x + co[2] * y + co[3] * x * x + co[4] * x * y + co[5] * y * y;
+            mesh.vertices[i] = (q + t * (target - (q - c).dot(pn)) * pn).cast<float>();
+            const Vec3 nq = (pn - (co[1] + 2 * co[3] * x + co[4] * y) * u - (co[2] + co[4] * x + 2 * co[5] * y) * w).normalized();
+            mesh.normals[i] = ((1 - t) * mesh.normals[i].cast<double>() + t * nq).normalized().cast<float>();
+        }
+        ++done;
+    }
+    return done;
 }
 
 void taubin_smooth(TriangleMesh& mesh, int iterations, float lambda, float mu) {

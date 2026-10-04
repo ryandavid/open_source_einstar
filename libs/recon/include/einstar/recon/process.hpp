@@ -92,6 +92,9 @@ struct ProcessParams {
     // surface is seen by dozens; stray flakes by a few). 10 cost real surface on glossy parts.
     ExtractParams extract{.min_observations = 5};
     CleanupParams cleanup;
+    // The surface over each identified marker sticker is replaced by the surface around it
+    // (flatten_markers; positions from the frames' marker observations at the final poses).
+    std::optional<MarkerFlattenParams> marker_flatten = MarkerFlattenParams{};
     int smooth_iterations = 0;
     bool simplify = true;          // error-bounded decimation: flat areas lose triangles, detail stays
     SimplifyParams simplify_params;
@@ -119,6 +122,7 @@ struct ProcessReport {
     std::size_t vertices = 0, triangles = 0;
     ConsistencyStats consistency;  // depth pixels tested / dropped before the final fusion
     CleanupReport cleanup;
+    int markers_flattened = 0;
     SimplifyReport simplified;
     std::map<std::string, double> stage_ms;
 };

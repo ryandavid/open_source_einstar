@@ -165,6 +165,42 @@ TEST_CASE("cleanup: flaps on a non-manifold edge go, near fragments stay, isolat
     CHECK(std::ranges::all_of(m.vertices, [](const Vec3f& v) { return v.x() < 100 && v.z() == 0; }));
 }
 
+TEST_CASE("marker stickers: the bump over a sticker is flattened onto the surface around it") {
+    // A gently curved surface z = (x^2 + y^2) / 400 (0.5 mm grid) with a 0.6 mm bump over a 6 mm
+    // marker at (10, 0); a second marker at (-20, 0) sits next to a 3 mm step and is left alone.
+    recon::TriangleMesh m;
+    auto surface = [](float x, float y) { return (x * x + y * y) / 400.0f + (x < -20.0f ? 3.0f : 0.0f); };
+    auto bump = [](float x, float y) { return 0.6f * std::exp(-((x - 10) * (x - 10) + y * y) / (2 * 2.5f * 2.5f)); };
+    const int n = 121;  // -30 .. 30 mm
+    for (int j = 0; j < n; ++j)
+        for (int i = 0; i < n; ++i) {
+            const float x = -30.0f + 0.5f * static_cast<float>(i), y = -30.0f + 0.5f * static_cast<float>(j);
+            m.vertices.emplace_back(x, y, surface(x, y) + bump(x, y));
+        }
+    for (int j = 0; j + 1 < n; ++j)
+        for (int i = 0; i + 1 < n; ++i) {
+            const auto v = static_cast<std::uint32_t>(j * n + i), un = static_cast<std::uint32_t>(n);
+            m.triangles.push_back({v, v + 1, v + un + 1});
+            m.triangles.push_back({v, v + un + 1, v + un});
+        }
+    m.compute_normals();
+    const auto before = m.vertices;
+    const std::vector<recon::MarkerDisc> markers{{Vec3f(10, 0, surface(10, 0) + 0.6f), Vec3f(0, 0, 1), 3.0f},
+                                                 {Vec3f(-20, 0, surface(-20, 0)), Vec3f(0, 0, 1), 3.0f}};
+    CHECK(recon::flatten_markers(m, markers) == 1);
+    double worst = 0, moved_far = 0, moved_step = 0;
+    for (std::size_t i = 0; i < m.vertices.size(); ++i) {
+        const Vec3f& p = m.vertices[i];
+        const float r = std::hypot(p.x() - 10, p.y());
+        if (r < 6) worst = std::max(worst, static_cast<double>(std::abs(p.z() - surface(p.x(), p.y()))));
+        if (r > 12) moved_far = std::max(moved_far, static_cast<double>((p - before[i]).norm()));
+        if (std::hypot(p.x() + 20, p.y()) < 10) moved_step = std::max(moved_step, static_cast<double>((p - before[i]).norm()));
+    }
+    CHECK(worst < 0.05);
+    CHECK(moved_far == 0);
+    CHECK(moved_step == 0);
+}
+
 TEST_CASE("simplification keeps the shape, manifoldness and orientation") {
     track::TsdfParams tp;
     tp.voxel_mm = 0.5f;

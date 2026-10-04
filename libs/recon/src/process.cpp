@@ -85,6 +85,7 @@ double pair_violation(const Fragment& a, const Fragment& b, const SE3& T_a_b, fl
 
 struct FrameMarkers {
     std::vector<std::pair<int, Vec3>> markers;  // (live map id, camera-frame position)
+    std::vector<std::pair<Vec3, double>> shape;  // (camera-frame normal, diameter), as `markers`
 };
 
 bool cancelled(const ProcessParams& p) { return p.cancel && p.cancel->load(); }
@@ -176,7 +177,10 @@ Result<ProcessResult> process_session(const session::SessionReader& s, const Pro
                 if (!collect_markers) continue;
                 FrameMarkers fm;
                 for (const auto& mk : rec->markers)
-                    if (mk.map_id >= 0) fm.markers.emplace_back(mk.map_id, mk.position);
+                    if (mk.map_id >= 0) {
+                        fm.markers.emplace_back(mk.map_id, mk.position);
+                        fm.shape.emplace_back(mk.normal, mk.diameter);
+                    }
                 if (!fm.markers.empty()) {
                     std::lock_guard lock(mutex);
                     frame_markers[i] = std::move(fm);
@@ -634,6 +638,32 @@ Result<ProcessResult> process_session(const session::SessionReader& s, const Pro
     progress(params, "Meshing", 0.0);
     out.mesh = extract_mesh(*volume, params.extract);
     rep.cleanup = remove_small_components(out.mesh, params.cleanup);
+    if (params.marker_flatten) {
+        // Each identified marker where its observations agree at the final poses (ids from different
+        // live maps can collide: observations far from the mean are dropped, then it is recomputed).
+        std::map<int, std::vector<std::tuple<Vec3, Vec3, double>>> obs;  // id -> (world position, normal, diameter)
+        for (const auto& [i, fm] : frame_markers) {
+            const auto it = out.frame_poses.find(i);
+            if (it == out.frame_poses.end()) continue;
+            for (std::size_t m = 0; m < fm.markers.size(); ++m)
+                obs[fm.markers[m].first].emplace_back(it->second * fm.markers[m].second, it->second.linear() * fm.shape[m].first, fm.shape[m].second);
+        }
+        std::vector<MarkerDisc> discs;
+        for (const auto& [id, o] : obs) {
+            Vec3 mean = Vec3::Zero();
+            for (const auto& [p, n, d] : o) mean += p;
+            mean /= static_cast<double>(o.size());
+            Vec3 pos = Vec3::Zero(), nrm = Vec3::Zero();
+            std::vector<double> diam;
+            for (const auto& [p, n, d] : o)
+                if ((p - mean).norm() <= params.marker_consistency_mm) pos += p, nrm += n, diam.push_back(d);
+            if (diam.size() < 3 || nrm.norm() < 1e-9) continue;
+            std::ranges::nth_element(diam, diam.begin() + static_cast<std::ptrdiff_t>(diam.size() / 2));
+            discs.push_back({(pos / static_cast<double>(diam.size())).cast<float>(), nrm.normalized().cast<float>(),
+                             static_cast<float>(diam[diam.size() / 2] / 2)});
+        }
+        rep.markers_flattened = static_cast<int>(flatten_markers(out.mesh, discs, *params.marker_flatten));
+    }
     if (params.smooth_iterations > 0) taubin_smooth(out.mesh, params.smooth_iterations);
     if (params.simplify) {
         progress(params, "Simplifying", 0.0);

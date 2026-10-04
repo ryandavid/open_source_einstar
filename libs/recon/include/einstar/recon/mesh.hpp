@@ -65,6 +65,27 @@ struct CleanupReport {
 };
 CleanupReport remove_small_components(TriangleMesh& mesh, const CleanupParams& params = {});
 void remove_unreferenced_vertices(TriangleMesh& mesh);
+
+// Marker stickers: the depth front end fills the hole a sticker leaves in the depth with a plane,
+// but the surface over it still comes out with a bump or dent (0.3-0.8 mm over ~8 mm on the car
+// display recordings: the sticker's dark ring, stereo bleeding, a plane on a curved part). The
+// surface over each marker is replaced by the smooth surface around it: a quadric height field
+// fitted to an annulus, blended in at the edge. Markers whose surroundings are not smooth (an edge,
+// a step) are left alone.
+struct MarkerDisc {
+    Vec3f center;
+    Vec3f normal;  // out of the surface
+    float radius = 3.0f;
+};
+struct MarkerFlattenParams {
+    float cover_radii = 2.2f;   // replaced out to this many sticker radii...
+    float blend_mm = 2.0f;      // ... blended into the surrounding surface over this width
+    float ring_mm = 5.0f;       // the annulus outside that the surface is fitted to
+    float max_ring_rms_mm = 0.2f;
+    float max_height_mm = 3.0f;  // vertices this far off the marker's plane belong to other surfaces
+};
+// Returns the number of markers flattened.
+std::size_t flatten_markers(TriangleMesh& mesh, const std::vector<MarkerDisc>& markers, const MarkerFlattenParams& params = {});
 // Taubin (lambda/mu) smoothing: reduces voxel-scale noise without shrinking the surface.
 void taubin_smooth(TriangleMesh& mesh, int iterations = 5, float lambda = 0.5f, float mu = -0.53f);
 
