@@ -75,7 +75,7 @@ variants on discrete GPUs.
 
 ### Einstar Model: scan to CAD
 
-![Einstar Model](docs/images/einstar-model.png)
+![Einstar Model](docs/images/einstar-model-display.png)
 
 `build/apps/EinstarModel.app` (needs `brew install opencascade`)
 - **From a scan to a STEP solid:** faces, holes and fillets you can pick in CAD, not a mesh.
