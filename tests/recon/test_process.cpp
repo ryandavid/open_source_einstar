@@ -6,6 +6,8 @@
 
 #include <cmath>
 #include <filesystem>
+#include <functional>
+#include <tuple>
 #include <print>
 #include <random>
 
@@ -35,9 +37,10 @@ CameraModel small_camera() {
     return cam;
 }
 
-// Writes a session of exact (noisy) depth rendered at `truth`, recorded with the given live poses.
+// Writes a session of exact (noisy) depth rendered at `truth`, recorded with the given live poses;
+// `corrupt` may edit each frame's depth.
 std::string write_session(const std::string& name, const synth::Scene& scene, const std::vector<SE3>& truth, const std::vector<SE3>& live,
-                          const std::vector<std::uint32_t>& flags) {
+                          const std::vector<std::uint32_t>& flags, const std::function<void(std::size_t, ImageF32&)>& corrupt = {}) {
     const CameraModel cam = small_camera();
     synth::Projector proj;  // depth only: the projector pattern is irrelevant
     proj.model = cam;
@@ -61,6 +64,7 @@ std::string write_session(const std::string& name, const synth::Scene& scene, co
         f.depth = view.depth;
         for (auto& z : f.depth.pixels())
             if (z > 0) z += noise(rng);
+        if (corrupt) corrupt(i, f.depth);
         (*w)->write(std::move(f));
     }
     (*w)->close();
@@ -178,5 +182,56 @@ TEST_CASE("process: a segment placed by a wrong relocalisation is left out") {
     CHECK(r->report.islands_excluded == 1);
     CHECK(r->report.frames_excluded == 12);
     for (int i = 36; i < 48; ++i) CHECK(!r->frame_poses.contains(static_cast<std::size_t>(i)));
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("process: pixels the first fusion contradicts are left out of the final one") {
+    // Every frame has a band of rows 1.5 mm too far, at a different height in each frame (as stereo
+    // produces along a mis-rectified band). Fused, the bands pull the surface back where they land;
+    // checked against the first fusion they are dropped.
+    const int n = 36;
+    const auto scene = synth::table_scene();
+    std::vector<SE3> truth(n);
+    for (int i = 0; i < n; ++i) truth[static_cast<std::size_t>(i)] = truth_pose(i, n);
+    const auto path = write_session("einstar_consistency_test.estr", scene, truth, truth,
+                                    std::vector<std::uint32_t>(static_cast<std::size_t>(n), session::frame_accepted | session::frame_integrated),
+                                    [](std::size_t i, ImageF32& d) {
+                                        const int y0 = static_cast<int>(i * 53 % 224);
+                                        for (int y = y0; y < y0 + 32; ++y)
+                                            for (int x = 0; x < d.width(); ++x)
+                                                if (d(x, y) > 0) d(x, y) += 1.5f;
+                                    });
+    auto s = session::SessionReader::open(path);
+    REQUIRE(s.has_value());
+    auto run = [&](bool consistency) {
+        recon::ProcessParams pp;
+        pp.optimize_poses = false;  // the fusion alone
+        pp.recover_lost_frames = false;
+        pp.simplify = false;
+        if (!consistency) pp.consistency.reset();
+        auto r = recon::process_session(**s, pp);
+        REQUIRE(r.has_value());
+        // Distance of the vertices to the scene along their normal.
+        std::vector<double> err;
+        for (std::size_t v = 0; v < r->mesh.vertices.size(); v += 3) {
+            const Vec3 p = r->mesh.vertices[v].cast<double>();
+            const Vec3 nrm = r->mesh.normals[v].cast<double>();
+            double best = 3.0;
+            for (const double sgn : {1.0, -1.0})
+                if (const auto hit = scene.intersect(p - sgn * 3.0 * nrm, sgn * nrm)) best = std::min(best, std::abs(hit->t - 3.0));
+            err.push_back(best);
+        }
+        std::ranges::sort(err);
+        return std::tuple{err[err.size() / 2], err[err.size() * 95 / 100], r->report.consistency};
+    };
+    const auto [med_plain, p95_plain, st_plain] = run(false);
+    const auto [med, p95, st] = run(true);
+    std::println("consistency: {} of {} pixels dropped ({} in front, {} behind, {} by normal); mesh error median {:.3f} -> {:.3f} mm, "
+                 "p95 {:.3f} -> {:.3f} mm",
+                 st.rejected(), st.pixels, st.in_front, st.behind, st.normal, med_plain, med, p95_plain, p95);
+    CHECK(st_plain.pixels == 0);
+    CHECK(st.behind > st.pixels / 20);
+    CHECK(med < 0.5 * med_plain);
+    CHECK(p95 < p95_plain);
     std::filesystem::remove(path);
 }

@@ -9,8 +9,11 @@
 //    (consecutive ones and loop closures, as edges between the fragments' middle frames), and markers
 //    as landmarks observed by each frame (fixed when a global-marker map was used). Inconsistent
 //    loop closures are pruned. Drift is spread smoothly along the chain instead of per fragment.
-// 3. Every tracked frame is re-fused with its corrected pose, the surface is meshed (surface nets),
-//    small disconnected pieces are removed and the mesh is optionally smoothed.
+// 3. Every tracked frame is re-fused with its corrected pose. The result is the consensus model each
+//    frame is then checked against (consistency.hpp): pixels it contradicts are dropped and the
+//    frames are fused again.
+// 4. The surface is meshed (surface nets), small disconnected pieces are removed and the mesh is
+//    optionally smoothed.
 
 #include <atomic>
 #include <functional>
@@ -19,6 +22,7 @@
 #include <string>
 
 #include "einstar/core/error.hpp"
+#include "einstar/recon/consistency.hpp"
 #include "einstar/recon/mesh.hpp"
 #include "einstar/recon/registration.hpp"
 #include "einstar/session/session.hpp"
@@ -68,11 +72,18 @@ struct ProcessParams {
     // Depth edges (silhouettes, steps) removed from every frame before it is used: the fringe of
     // flying / edge-fattened stereo pixels along object outlines (track::filter_depth_edges).
     std::optional<track::DepthEdgeFilter> edge_filter = track::DepthEdgeFilter{};
-    // Fusion weight = stereo confidence x cos(viewing angle): grazing views count less.
-    bool grazing_weight = true;
+    // Fusion weight: the recorded per-pixel confidence. The depth front end computes it with the
+    // viewing angle already in it (stereo score x cos(viewing angle)); recordings without one get
+    // cos(viewing angle) (track::make_depth_frame). `grazing_weight` multiplies by the cosine once
+    // more (it used to be on, which counted the angle twice).
+    bool grazing_weight = false;
     // EXStar's range-image settings (E10 BuildSetting.ini): no points seen beyond 70 degrees, a 2 px
     // border dropped where the surface is steep (track::filter_grazing).
     std::optional<track::GrazingFilter> grazing_filter = track::GrazingFilter{};
+    // Model-consistency rejection: the frames are fused once, each frame is compared with that model
+    // and the pixels it contradicts (floating in front of a surface its camera looked through, or
+    // hidden behind one) are dropped before the final fusion. nullopt = a single fusion.
+    std::optional<ConsistencyParams> consistency = ConsistencyParams{};
     // Fusion and meshing
     track::TsdfParams tsdf;                 // voxel size etc. of the final model
     bool use_gpu = true;
@@ -106,6 +117,7 @@ struct ProcessReport {
     int islands_excluded = 0;     // ... that contradicted it and were left out of the fusion
     int frames_excluded = 0;
     std::size_t vertices = 0, triangles = 0;
+    ConsistencyStats consistency;  // depth pixels tested / dropped before the final fusion
     CleanupReport cleanup;
     SimplifyReport simplified;
     std::map<std::string, double> stage_ms;

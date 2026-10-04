@@ -1,12 +1,14 @@
 #include "einstar/recon/process.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <mutex>
 #include <numeric>
 #include <set>
 
 #include <tbb/parallel_for.h>
+#include <tbb/task_group.h>
 
 #include "einstar/core/log.hpp"
 #include "einstar/core/timing.hpp"
@@ -558,38 +560,74 @@ Result<ProcessResult> process_session(const session::SessionReader& s, const Pro
         if (auto ctx = gpu::Context::create())
             if (auto v = track_metal::MetalTsdfVolume::create(*ctx, tsdf_params)) volume = std::move(*v);
     if (!volume) volume = std::make_unique<track::TsdfVolume>(tsdf_params);
-    {
-        // Decoding (zstd, points, normals) runs in parallel batches; integration stays in order.
+    // Fuses every frame at its final pose, each first checked against `model` if given.
+    auto fuse = [&](const ConsistencyModel* model, const std::string& stage) -> Result<void> {
+        // Decoding (zstd, points, normals) and the model checks run in parallel batches, the next
+        // batch while the current one is integrated; integration stays in order.
         const std::vector<std::pair<std::size_t, SE3>> todo(out.frame_poses.begin(), out.frame_poses.end());
         constexpr std::size_t kBatch = 32;
-        std::vector<track::DepthFrame> batch(kBatch);
-        std::vector<float> weight(kBatch);
-        std::vector<std::string> errors(kBatch);
-        for (std::size_t b = 0; b < todo.size(); b += kBatch) {
-            if (cancelled(params)) return make_error(Errc::busy, "cancelled");
-            const std::size_t n = std::min(kBatch, todo.size() - b);
-            tbb::parallel_for(std::size_t{0}, n, [&](std::size_t j) {
+        struct Batch {
+            std::vector<track::DepthFrame> frames = std::vector<track::DepthFrame>(kBatch);
+            std::vector<float> weight = std::vector<float>(kBatch);
+            std::vector<std::string> errors = std::vector<std::string>(kBatch);
+            std::vector<ConsistencyStats> stats = std::vector<ConsistencyStats>(kBatch);
+        };
+        std::array<Batch, 2> batches;
+        auto prepare = [&](Batch& bt, std::size_t b) {
+            tbb::parallel_for(std::size_t{0}, std::min(kBatch, todo.size() - b), [&](std::size_t j) {
+                bt.errors[j].clear();
                 auto rec = s.read(todo[b + j].first);
                 if (!rec) {
-                    errors[j] = rec.error().message;
+                    bt.errors[j] = rec.error().message;
                     return;
                 }
                 // Read applies the session's erases at the live pose; a frame live tracking lost has
                 // none, so at the pose recovered for it.
                 if (!rec->accepted()) s.apply_erasures(todo[b + j].first, *rec, todo[b + j].second);
-                batch[j] = frame_of(*rec, k, params);
-                weight[j] = (rec->flags & session::frame_degenerate) ? params.degenerate_weight : 1.0f;
+                bt.frames[j] = frame_of(*rec, k, params);
+                bt.weight[j] = (rec->flags & session::frame_degenerate) ? params.degenerate_weight : 1.0f;
+                if (model) bt.stats[j] = model->filter(bt.frames[j], todo[b + j].second, *params.consistency);
             });
+        };
+        if (!todo.empty()) prepare(batches[0], 0);
+        for (std::size_t b = 0, cur = 0; b < todo.size(); b += kBatch, cur ^= 1) {
+            if (cancelled(params)) return make_error(Errc::busy, "cancelled");
+            tbb::task_group next;
+            if (b + kBatch < todo.size()) next.run([&, b, cur] { prepare(batches[cur ^ 1], b + kBatch); });
+            const auto& bt = batches[cur];
+            const std::size_t n = std::min(kBatch, todo.size() - b);
             for (std::size_t j = 0; j < n; ++j) {
-                if (!errors[j].empty()) return make_error(Errc::io, errors[j]);
-                volume->integrate(batch[j], todo[b + j].second, weight[j]);
+                if (!bt.errors[j].empty()) {
+                    next.wait();
+                    return make_error(Errc::io, bt.errors[j]);
+                }
+                volume->integrate(bt.frames[j], todo[b + j].second, bt.weight[j]);
+                if (model) rep.consistency += bt.stats[j];
             }
-            progress(params, "Fusing", static_cast<double>(b + n) / static_cast<double>(todo.size()));
+            next.wait();
+            progress(params, stage, static_cast<double>(b + n) / static_cast<double>(todo.size()));
         }
+        return {};
+    };
+    if (auto r = fuse(nullptr, "Fusing"); !r) return std::unexpected(r.error());
+    rep.stage_ms["fusion"] = sw.elapsed_ms();
+    if (params.consistency) {
+        // The consensus model as it would be meshed; then every frame again, checked against it.
+        // (A second round against the cleaner model changed nothing measurable.)
+        sw.reset();
+        progress(params, "Checking frames against the model", 0.0);
+        auto model_mesh = extract_mesh(*volume, params.extract);
+        remove_small_components(model_mesh, params.cleanup);
+        const ConsistencyModel model(model_mesh);
+        volume->clear();
+        if (auto r = fuse(&model, "Checking frames against the model"); !r) return std::unexpected(r.error());
+        const auto& c = rep.consistency;
+        log::info("process: consistency: {} of {} depth pixels dropped ({} in front of the model, {} behind it, {} by normal), {} not seen by it",
+                  c.rejected(), c.pixels, c.in_front, c.behind, c.normal, c.unseen);
+        rep.stage_ms["consistency"] = sw.elapsed_ms();
     }
     if (const auto* mv = dynamic_cast<const track_metal::MetalTsdfVolume*>(volume.get()); mv && mv->pool_exhausted())
         log::warn("process: the GPU brick pool is full; parts of the model are missing (use a larger voxel size)");
-    rep.stage_ms["fusion"] = sw.elapsed_ms();
 
     // ---- 4. Mesh -------------------------------------------------------------------------------
     sw.reset();
