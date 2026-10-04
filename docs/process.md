@@ -120,7 +120,9 @@ again, with or without a scanner (`ScanPipeline::load_recording`):
        step removed; connected regions under 100 px dropped; surface seen more obliquely than 70
        degrees dropped (also pixels too steep to have a normal); the 2 px border of a depth region
        dropped where the surface there is steeper than 45 degrees (a face-on border stays);
-     - fusion weight = stereo confidence x cos(viewing angle);
+     - fusion weight = the recorded confidence, which the depth front end computes with the viewing
+       angle in it (stereo score x cos(viewing angle)); recordings without one get cos(viewing angle).
+       (The process step used to multiply by the cosine again; `--grazing-weight` still does.)
      - extraction: surface only where at least 5 frames observed it (`TsdfParams::count_observations`,
        `ExtractParams::min_observations`; the scanner gives ~40 frames per second).
      On a real scan (display + glossy bucket, 2026-10-01) the display's outline went from a ragged
@@ -129,12 +131,55 @@ again, with or without a scanner (`ScanPipeline::load_recording`):
      has a border; it cost surface and changed registration) and a 10-frame minimum (it fragmented
      glossy surface, so the small-piece cleanup, relative to the largest piece, kept a stray flap).
      `einstar-cli process` switches: `--no-edge-filter`, `--edge-radius`, `--rim-radius`, `--min-region`,
-     `--no-grazing-filter`, `--max-view-angle`, `--steep-rim`, `--steep-rim-angle`, `--no-grazing-weight`,
+     `--no-grazing-filter`, `--max-view-angle`, `--steep-rim`, `--steep-rim-angle`, `--grazing-weight`,
      `--min-observations`, `--min-weight`, and `--render out.pgm [--render-frame view.txt]` (a shaded
      view, identical across runs) to compare.
+   - **Model consistency** (`recon::ConsistencyModel`). The fused model, meshed as the output would
+     be, is the consensus every frame is then checked against from its own camera (a z-buffer of the
+     mesh, rendered after a 0.02 mm decimation); the pixels it contradicts are dropped and all frames
+     are fused again. A pixel goes when the model surface its ray meets faces the camera and the
+     pixel lies in front of it (it floats in space the views that built that surface looked through)
+     or behind it (that surface should have hidden it), by more than 0.3 mm + 0.7 mm x (z / 400 mm)^2
+     (pose and calibration residuals plus stereo noise, which grows with z^2; along the surface
+     normal, and at most four tolerances along the ray), unless another model surface facing the
+     camera lies that close within 1.5 mm (a silhouette the model places slightly differently, a
+     surface behind a flake of the model). A pixel on the surface whose normal is more than 60
+     degrees off the model's goes too (flying pixels at steps). A pixel whose ray meets no model, or
+     the back of a model surface, is kept: the camera then looks at the far side of a part the model
+     only has one face of (a thin wall), and nothing says the space is empty. EXStar does the same
+     job with a distance field of its live model (every pixel not near it is deleted); this test
+     knows from which side each surface was seen. On the car display 3.8-4.0% of the depth pixels
+     go (1.5% of EXStar's own depth), most of them along depth borders; the glass's tail beyond
+     0.5 mm went from 0.51% to 0.17% of its area, the dark back plate's from 6.3% to 5.4% (044655)
+     and 4.0% to 3.1% (044347), with the same completeness; it costs ~5 s on 2357 frames. A second
+     round against the cleaner model changed nothing measurable; a 0.6 mm tolerance at 400 mm cleaned
+     the back plate a little more but thinned the glass, 1.5 mm kept more of the tails; a 45 degree
+     normal test cost sparse surface on the glossy bucket. Switches: `--no-consistency`,
+     `--consistency-tol`, `--consistency-noise`, `--consistency-radius`, `--consistency-normal`.
 5. **Mesh.** Surface nets on the zero level: one vertex per surface cell, placed by one Newton step
    onto the trilinear zero level, with quads split along the diagonal that agrees with the SDF
-   normals. Pieces smaller than 2% of the largest are removed. Optional Taubin smoothing.
+   normals. Optional Taubin smoothing.
+   - **Cleanup.** Pieces are triangles joined across edges two triangles share, so a flap on a
+     non-manifold edge is a piece of its own (surface nets make a few hundred where sheets touch).
+     Pieces under 25 mm^2 are removed (EXStar's figure at 0.5 mm), and so are pieces up to 1% of the
+     total area with no larger piece within ~50 mm (floaters, the background). The rule relative to
+     the largest piece (2%) is off: on the car display it removed real surface next to the model (parts
+     seen through openings in the back plate, the bucket's rim; `--min-component 0.02` restores it).
+     No spike removal: no vertex of a surface-nets mesh lies more than an edge length off its
+     neighbours' plane. Switches: `--min-area`, `--isolation`, `--min-component`.
+   - **Marker stickers.** The front end fills a sticker's hole in the depth with a plane, but the
+     fused surface over it still had a bump or dent (0.6-1.7 mm over ~10 mm on the bucket of
+     044347). Each identified marker's surface, out to 2.2 sticker radii, is replaced by a quadric
+     fitted to the 5 mm annulus outside, blended in over 2 mm, where that annulus is smooth (rms <=
+     0.2 mm, data on all sides): 17 of 62 markers on 044347 (`--no-marker-flatten`). EXStar cuts the
+     surface within 6 mm of a marker and leaves the hole.
+   - **Pinholes**: holes whose boundary is a simple loop of at most 2.5 mm are closed with a fan
+     (one or two missing cells; ~260 per scan). A real 1 mm hole, the smallest the model app looks for,
+     is 3.1 mm round. `--fill-holes MM` (EXStar's meshing closes up to 10 mm).
+   - **Watertight** (optional, `ProcessParams::watertight`, `--watertight closed.stl`): a second,
+     closed mesh by screened Poisson reconstruction of the mesh's vertices and normals (PoissonRecon,
+     MIT, finest cell = the voxel size), cleaned and decimated like the mesh: 044655 in 17.6 s, no
+     boundary or non-manifold edges.
    - **Simplification** (on by default): quadric edge collapse bounded at 0.02 mm area-averaged
      deviation, keeping the surface manifold and borders fixed. Large meshes are processed in
      parallel 40 mm blocks with shared vertices locked, then a half-shifted pass cleans up the seams.
@@ -152,6 +197,7 @@ again, with or without a scanner (`ScanPipeline::load_recording`):
 | PG2/Project1 (markers) | marker observations are more self-consistent under the processed poses (spread 0.040 mm median) than under EXStar's own (0.063 mm) |
 
 ### Known limits
-- Holes are not filled: there is no watertight (Poisson) mode yet.
+- Holes larger than pinholes stay open in the mesh; the watertight mesh closes everything, with a
+  smooth guess where the scan saw nothing.
 - Marker holes are filled live (in the stereo frontend), so recordings replayed from EXStar projects
   keep whatever EXStar recorded there.
