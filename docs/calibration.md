@@ -377,11 +377,13 @@ and Δcx = 619.1, which matches the header closely.
   checks are `valid="false"`). None of them put dots in the image corners.
 * **The quick calibration keeps the factory distortion.** The quick (FQFQ) and factory (FAFA) sections
   hold identical k1..k3/p1/p2, but different focal lengths, principal points and extrinsics; the XML's
-  `cameraInExAlgMethod` is false. Our solve with the factory distortion held reproduces EXStar's quick
-  values from its own captures: focal lengths within 1 px, principal points within 1.2 (x) / 4.5 (y) px,
-  the rig rotation within 0.1°, rectified rows 0.064 px (EXStar's 0.058). EXStar's calibration reprojects
-  its own captures at 0.68 px against our 0.29 px, so it probably also uses a measured board model
-  (the `boardData` blob of §5) rather than a perfect grid.
+  `cameraInExAlgMethod` is false. Our solve with the factory distortion held, and the board's dots fitted
+  (§8), reproduces EXStar's quick values from its own captures: focal lengths within 0.3 px, principal
+  points within 0.3 px, the rig rotation within 0.01°, and the rows it rectifies within 0.05 px of
+  EXStar's everywhere in the image at 250–500 mm. The captures reproject at 0.055 px, rows 0.058 px (as
+  EXStar's own). **The board is not its nominal grid**: its dots sit 0.10 mm rms off the 28 mm grid (flat
+  to 0.01 mm). Held at the nominal grid, the solve reprojects at 0.28 px and its principal points land
+  4.5 px off, so EXStar too must fit or know the board (the `boardData` blob of §5).
 
 ## 6. Validation performed
 
@@ -478,8 +480,16 @@ in the repo.
 * **Solve** (`calibrate/solve.hpp`): independent of any stored calibration. Focal lengths come from the
   board homographies (principal point at the image centre), then the board poses and the left → right
   pose, then a Ceres bundle adjustment of both cameras (fx, fy, cx, cy, then with distortion), the rig
-  and every board pose, with one outlier pass. "Keep the factory distortion" does what EXStar's quick
-  calibration does. The flash (quick) and factory calibrations are evaluated on the same captures, with
+  and every board pose, with one outlier pass, then once more with **every dot of the board free**
+  (`src/board_bundle.cpp`; the nominal grid is a 0.5 mm prior on each dot and fixes the scale). The two
+  cameras are then fitted to each other through the dots themselves, and the board's own errors stay in
+  the board instead of going into the distortion: a board bowed by 0.3 mm, held as its nominal grid,
+  bends the rectified rows by up to 2.3 px in the image's corners; fitted, 0.5 px with the distortion
+  free and 0.08 px with it kept (`test_calibrate`). The report gives the board's fit (mm off the grid,
+  mm out of its plane). "Keep the factory distortion" does what EXStar's quick calibration does and is
+  the default: the board views never reach the image's corners, and a distortion fitted without them is
+  extrapolated there (on EXStar's captures, a free distortion's rows differ from EXStar's by up to 2 px in
+  the corners; held, 0.05 px). The flash (quick) and factory calibrations are evaluated on the same captures, with
   only the board poses fitted, and compared parameter by parameter. Rectified row error is the number
   that matters for stereo.
 * **Output**: captures are saved as `imageLeftN.pgm` / `imageRightN.pgm` / `imageTexN.pgm` (EXStar's naming)
@@ -506,4 +516,46 @@ in the repo.
   so the whole procedure runs unattended (`EinstarCalibration --snapshot out.png --complete`). It recovers
   the change (0.245°, +1.71, +0.73) with rows at 0.08 px, while the flash calibration leaves 3.5 px.
 * **Tests** (`test_calibrate`): synthetic views recover the rendering rig (focal length and principal
-  point within 1.5 px, rig within 0.05°); EXStar's captures reproduce its calibration as above.
+  point within 1.5 px, rig within 0.05°); EXStar's captures reproduce its calibration as above; a bowed,
+  jittered board keeps the rows right. `test_calib` covers the self-check below.
+* **Epipolar self-check** (`calib/epipolar.hpp`, `einstar-cli calib-refine`, a line in `einstar-cli inspect`):
+  every marker matched in both IR images while scanning is a correspondence, so its rectified row
+  difference measures the calibration's epipolar error in the conditions it is used in.
+  `calib::check_epipolar(rig, pairs)` takes the raw centres of the pairs (`raw_marker_pair` brings back
+  rectified ones through the rectification that made them), drops mismatches (1.5 px from the median, then
+  5 sigma), and fits a turn of the right camera about its own centre: about the baseline (every row moves
+  by f × angle) and, when the pairs span at least 35% of the columns and the tilt is significant, about its
+  optical axis (rows tilting across the image). Rows are measured in the rig's own epipolar frame at
+  f = mean(fy_L, fy_R), whatever rectified image a pipeline uses. It corrects only when the evidence agrees:
+  ≥ 300 inlier pairs, ≥ 5 of 3 × 3 image regions with ≥ 25 pairs each, a correction between 0.05 and 2 px,
+  every region's median row within 0.12 px after it, and a smaller row error than before; otherwise the
+  verdict says why (too few, one region, regions disagree: not a rotation, too large: recalibrate).
+  `calib::EpipolarSamples` collects pairs during a scan evenly over the image (the newest 200 per cell of
+  6 × 6). `calib-refine <session> --save calibration.txt` writes the corrected rig as a calibration file.
+
+### 8.1 The row offset of the 2026-09-30 calibration
+
+Recordings made with our calibration of 2026-09-30 20:21 (local time; file names are UTC) showed rectified
+rows −0.26 / −0.30 px apart (scans at 21:43 and 21:46). What the recordings and the captures show:
+
+* **The solve is not biased.** Our solve of EXStar's own captures rectifies with EXStar's rows to 0.004 px
+  on average (above); synthetic solves to ±0.04 px.
+* **The rig changed between scans.** The same calibration gave −0.08 and −0.10 px on the two long scans 4–10
+  minutes after it was made (and the regions of the image disagree there by 0.16 px: the free distortion of
+  that solve), then −0.27 / −0.30 px an hour later, after the firmware was changed to the open build.
+  The marker pairs fit a turn of the right camera of −0.0142° (21:46) and −0.0123° (21:43) about the
+  baseline; either correction brings the other scan to −0.05 / +0.03 px (|dy| median 0.09 / 0.08 from
+  0.30 / 0.27). Row differences do not depend on how fast the markers move (no left/right exposure skew).
+  Temperature was not recorded then.
+* **Our frames are not EXStar's.** EXStar's calibration of 2026-09-27 needs both cameras' principal points
+  moved by (+29.8, −9.9) px (the same in both, ±0.6 px over six recordings) to fit our frames of 09-30;
+  then |dy| median 0.08–0.19 px, against 1.3–2.7 px as stored. Our principal points differ from EXStar's
+  by (+14..15, −10..−11) px accordingly. So a calibration made from EXStar's frames does not fit ours and
+  ours does not fit EXStar's: with our calibration in the flash, EXStar would see rows ~1.5 px apart.
+  (`scan-20261002-050023` is an emulator recording, `calibration_time` "emulated"; its 0.003 px says
+  nothing about the scanner.)
+* **Marker distances** scatter 0.064–0.070 mm in our recordings whether or not the row offset is corrected
+  (re-triangulated: 0.069 → 0.071, 0.063 → 0.063), and 0.066 mm in the emulator recording with EXStar's
+  calibration: the 0.043 mm of EXStar's own project is its marker pipeline, not its calibration.
+* The 09-30 captures are not on disk (no session folder or flash backup under
+  `~/Documents/Einstar/Calibration/<serial>/`), so that solve cannot be repeated with the board fitted.

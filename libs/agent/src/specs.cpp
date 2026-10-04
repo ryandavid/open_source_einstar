@@ -207,7 +207,7 @@ std::vector<MethodSpec> build() {
     add("calib.load_reference", calibration, mutating, "Loads a reference calibration to compare with.",
         object({{"path", str("File.")}}, {"path"}));
     add("calib.solve", calibration, mutating, "Solves the stereo calibration from the captures (background; poll calib.state).",
-        object({{"keep_factory_distortion", boolean("Keep the factory distortion (default false).")}}));
+        object({{"keep_factory_distortion", boolean("Keep the factory distortion (default true: the board views leave the image corners empty).")}}));
     add("calib.save", calibration, mutating, "Saves the solved calibration (returns the path).");
     add("calib.plan_write", calibration, read_only, "What writing to the scanner would do: the gates (all must pass), the backup path.");
     add("calib.write", calibration, mutating,

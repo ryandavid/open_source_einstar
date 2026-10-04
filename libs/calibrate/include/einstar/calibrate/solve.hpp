@@ -3,7 +3,9 @@
 // Stereo calibration of the IR pair from board captures, independent of any stored calibration:
 // focal lengths from the board homographies (principal point at the image centre, no distortion),
 // board poses, the left -> right pose, then a joint bundle adjustment of both cameras' intrinsics,
-// distortion, their relative pose and every board pose (optim::refine_stereo_calibration).
+// distortion, their relative pose and every board pose (optim::refine_stereo_calibration), and last
+// the same with every dot of the board free (the real board is not its nominal grid: held as exact,
+// its errors bend the distortion, and with it the rectified rows where no dot was).
 //
 // Also evaluates a given calibration on the same captures (e.g. the one in the scanner's flash, which
 // EXStar made) so the two can be compared on equal terms.
@@ -32,6 +34,9 @@ struct SolveOptions {
     std::optional<std::array<std::array<double, 5>, 2>> fixed_distortion;
     double huber_px = 1.0;
     double outlier_px = 1.5;  // dots reprojecting worse than this (and 4x the RMS) are dropped once
+    // A last adjustment with every dot of the board free (its nominal grid a weak prior and the scale):
+    // the board's own errors then stay in the board instead of bending the distortion.
+    bool refine_board = true;
 };
 
 struct ViewReport {
@@ -53,6 +58,8 @@ struct CalibrationReport {
     double max_row_px = 0;
     int dots = 0;
     int dropped = 0;              // outliers removed
+    double board_rms_mm = 0;      // the fitted dots' offset from the nominal grid (refine_board)
+    double board_flatness_mm = 0; // ... out of the board's plane (rms)
 };
 
 // Views need >= 20 dots common to both cameras; at least 4 such views.
@@ -79,6 +86,9 @@ struct CalibrationDiff {
     Vec3 rotation_deg{0, 0, 0};   // relative rotation of the right camera (axis-angle, left frame)
     Vec3 translation_mm{0, 0, 0};
     double baseline_mm = 0;       // b - a
+    // Rectified rows of points seen through a, rectified through b, over the image at 250-500 mm (px):
+    // what b would leave of the epipolar error if a were right.
+    double row_mean_px = 0, row_max_px = 0;
 };
 [[nodiscard]] CalibrationDiff compare_calibrations(const RigCalibration& a, const RigCalibration& b);
 

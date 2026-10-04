@@ -1029,7 +1029,7 @@
       "additionalProperties": false,
       "properties": {
         "keep_factory_distortion": {
-          "description": "Keep the factory distortion (default false).",
+          "description": "Keep the factory distortion (default true: the board views leave the image corners empty).",
           "type": "boolean"
         }
       },

@@ -10,9 +10,12 @@
 #include <Eigen/Dense>
 
 #include "einstar/calib/device_calibration.hpp"
+#include "einstar/calib/epipolar.hpp"
 #include "einstar/calib/rectify.hpp"
 #include "einstar/calibrate/plan.hpp"
 #include "einstar/optim/stereo_calibration.hpp"
+
+#include "board_bundle.hpp"
 
 namespace einstar::calibrate {
 namespace {
@@ -22,7 +25,8 @@ constexpr std::size_t kMinCommonDots = 20;
 
 struct Views {
     std::vector<optim::BoardView> views;
-    std::vector<std::size_t> capture;  // index into the captures of each view
+    std::vector<std::vector<int>> ids;  // each dot's index on the board (row * cols + column)
+    std::vector<std::size_t> capture;   // index into the captures of each view
 };
 
 // Dots seen by both cameras, in board coordinates.
@@ -31,15 +35,18 @@ Views common_views(const std::vector<StereoCapture>& captures, const BoardSpec& 
     for (std::size_t c = 0; c < captures.size(); ++c) {
         const auto& cap = captures[c];
         optim::BoardView v;
+        std::vector<int> ids;
         for (std::size_t i = 0; i < cap.left.grid.size(); ++i)
             for (std::size_t j = 0; j < cap.right.grid.size(); ++j)
                 if (cap.left.grid[i] == cap.right.grid[j]) {
                     v.board.push_back(board.point(cap.left.grid[i]));
                     v.left.push_back(cap.left.pixels[i]);
                     v.right.push_back(cap.right.pixels[j]);
+                    ids.push_back(static_cast<int>(std::lround(cap.left.grid[i].y())) * board.cols + static_cast<int>(std::lround(cap.left.grid[i].x())));
                 }
         if (v.board.size() < kMinCommonDots) continue;
         out.views.push_back(std::move(v));
+        out.ids.push_back(std::move(ids));
         out.capture.push_back(c);
     }
     return out;
@@ -194,6 +201,7 @@ Result<CalibrationReport> solve_stereo(const std::vector<StereoCapture>& capture
         auto& bv = v.views[k];
         const SE3 Tl = r.T_left_board[k], Tr = r.rig.T_right_left * Tl;
         optim::BoardView kept;
+        std::vector<int> kept_ids;
         kept.T_left_board = Tl;
         for (std::size_t i = 0; i < bv.board.size(); ++i) {
             const double el = (r.rig.left.project(Tl * bv.board[i]) - bv.left[i]).norm();
@@ -203,16 +211,41 @@ Result<CalibrationReport> solve_stereo(const std::vector<StereoCapture>& capture
                 continue;
             }
             kept.board.push_back(bv.board[i]), kept.left.push_back(bv.left[i]), kept.right.push_back(bv.right[i]);
+            kept_ids.push_back(v.ids[k][i]);
         }
         bv = std::move(kept);
+        v.ids[k] = std::move(kept_ids);
     }
     if (dropped > 0) r = optim::refine_stereo_calibration(r.rig, v.views, so);
+
+    // Last, the board's dots free: the cameras fitted to each other through the dots themselves.
+    double board_rms_mm = 0, board_flatness_mm = 0;
+    if (o.refine_board) {
+        std::vector<Vec3> nominal;
+        for (int gy = 0; gy < board.rows; ++gy)
+            for (int gx = 0; gx < board.cols; ++gx) nominal.push_back(board.point(Vec2(gx, gy)));
+        for (std::size_t k = 0; k < v.views.size(); ++k) v.views[k].T_left_board = r.T_left_board[k];
+        detail::BoardBundleOptions bo;
+        bo.free_distortion = so.free_distortion;
+        bo.huber_px = o.huber_px;
+        const auto b = detail::refine_with_board(r.rig, v.views, v.ids, nominal, bo);
+        r.rig = b.rig;
+        r.T_left_board = b.T_left_board;
+        for (std::size_t k = 0; k < v.views.size(); ++k)
+            for (std::size_t i = 0; i < v.views[k].board.size(); ++i) v.views[k].board[i] = b.board[static_cast<std::size_t>(v.ids[k][i])];
+        double ss = 0, sz = 0;
+        for (std::size_t i = 0; i < nominal.size(); ++i) ss += (b.board[i] - nominal[i]).squaredNorm(), sz += b.board[i].z() * b.board[i].z();
+        board_rms_mm = std::sqrt(ss / static_cast<double>(nominal.size()));
+        board_flatness_mm = std::sqrt(sz / static_cast<double>(nominal.size()));
+    }
 
     rig = r.rig;
     rig.texture = rig.left;
     rig.T_texture_left = SE3::Identity();
     auto report = make_report(rig, v, r.T_left_board, captures, board);
     report.dropped = dropped;
+    report.board_rms_mm = board_rms_mm;
+    report.board_flatness_mm = board_flatness_mm;
     return report;
 }
 
@@ -252,6 +285,8 @@ CalibrationDiff compare_calibrations(const RigCalibration& a, const RigCalibrati
     d.rotation_deg = aa.axis() * aa.angle() * kDeg;
     d.translation_mm = b.T_right_left.translation() - a.T_right_left.translation();
     d.baseline_mm = b.baseline_mm() - a.baseline_mm();
+    const auto rows = calib::row_agreement(a, b);
+    d.row_mean_px = rows.mean, d.row_max_px = rows.max_abs;
     return d;
 }
 

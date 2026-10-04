@@ -20,7 +20,7 @@ target_link_libraries(test_core PRIVATE einstar::core)
 einstar_add_test(test_depth depth/test_stereo.cpp depth/test_metal_stereo.cpp)
 target_link_libraries(test_depth PRIVATE einstar::depth_metal einstar::synth einstar::markers)
 
-einstar_add_test(test_calib calib/test_rectify.cpp calib/test_device_calibration.cpp)
+einstar_add_test(test_calib calib/test_rectify.cpp calib/test_device_calibration.cpp calib/test_epipolar.cpp)
 target_link_libraries(test_calib PRIVATE einstar::calib)
 
 einstar_add_test(test_render render/test_scene_renderer.cpp render/test_view_camera.cpp render/test_scanner_model.cpp)

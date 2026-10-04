@@ -5,8 +5,10 @@
 #include <fstream>
 #include <iterator>
 #include <print>
+#include <random>
 
 #include "einstar/calib/device_calibration.hpp"
+#include "einstar/calib/epipolar.hpp"
 #include "einstar/calibrate/captures.hpp"
 #include "einstar/calibrate/plan.hpp"
 #include "einstar/calibrate/solve.hpp"
@@ -127,16 +129,29 @@ TEST_CASE("EXStar's calibration captures solve to its calibration") {
     const auto d = compare_calibrations(flash, r->rig);
     std::println("EXStar captures: rms {:.3f} px, rows {:.3f} px; vs flash: left f {:+.2f} {:+.2f} c {:+.2f} {:+.2f}, rig {:.3f} deg, baseline {:+.3f} mm", r->rms_px,
                  r->row_rms_px, d.left.dfx, d.left.dfy, d.left.dcx, d.left.dcy, rotation_deg(r->rig.T_right_left, flash.T_right_left), d.baseline_mm);
-    CHECK(r->rms_px < 0.4);
-    CHECK(r->row_rms_px < 0.08);
+    // With the board's dots fitted (it is 0.1 mm off its nominal grid) the captures reproject at 0.04 px, and
+    // the solve is EXStar's calibration: principal points within 0.3 px, the rig within 0.01 degrees, the
+    // rows it rectifies within 0.05 px of EXStar's everywhere in the image.
+    CHECK(r->rms_px < 0.1);
+    CHECK(r->row_rms_px < 0.06);
+    CHECK(r->board_rms_mm > 0.05);
+    CHECK(r->board_rms_mm < 0.2);
     for (const auto& c : {d.left, d.right}) {
-        CHECK(std::abs(c.dfx) < 1.5);
-        CHECK(std::abs(c.dfy) < 1.5);
-        CHECK(std::abs(c.dcx) < 3.0);
-        CHECK(std::abs(c.dcy) < 6.0);
+        CHECK(std::abs(c.dfx) < 1.0);
+        CHECK(std::abs(c.dfy) < 1.0);
+        CHECK(std::abs(c.dcx) < 1.0);
+        CHECK(std::abs(c.dcy) < 1.0);
     }
-    CHECK(rotation_deg(r->rig.T_right_left, flash.T_right_left) < 0.15);
+    CHECK(rotation_deg(r->rig.T_right_left, flash.T_right_left) < 0.03);
     CHECK(std::abs(d.baseline_mm) < 0.3);
+    std::println("  rows vs flash: {:+.3f} px on average, up to {:.3f}", d.row_mean_px, d.row_max_px);
+    CHECK(std::abs(d.row_mean_px) < 0.03);
+    CHECK(d.row_max_px < 0.1);
+    // Held at the nominal grid, the board's errors go into the cameras (principal points 4.5 px off).
+    so.refine_board = false;
+    const auto nominal = solve_stereo(loaded->captures, loaded->width, loaded->height, {}, so);
+    REQUIRE(nominal);
+    CHECK(nominal->rms_px > 0.2);
 
     // The flash calibration aligns these captures' rows as well as ours does.
     const auto e = evaluate_calibration(flash, loaded->captures);
@@ -263,4 +278,66 @@ TEST_CASE("nearest target: the uncaptured view the scanner is closest to") {
     CHECK(n.error > 1);
     std::fill(captured.begin(), captured.end(), true);
     CHECK(nearest_target(plan, captured, m).index == -1);
+}
+
+TEST_CASE("a board off its nominal grid does not bend the rectified rows") {
+    // A board bowed by 0.3 mm with its dots up to 0.1 mm off their spots, seen in the plan's 25 views
+    // (dot centres projected exactly, 0.05 px noise). Held at its nominal grid, the solve takes the bow
+    // into the distortion and the rows go wrong where no dot was; with the dots fitted they do not.
+    const RigCalibration truth = flash_rig();
+    const BoardSpec board;
+    std::mt19937 rng(5);
+    std::normal_distribution<double> noise(0, 0.05);
+    std::uniform_real_distribution<double> jitter(-0.1, 0.1);
+    std::vector<Vec3> dots;
+    for (int gy = 0; gy < board.rows; ++gy)
+        for (int gx = 0; gx < board.cols; ++gx) {
+            Vec3 p = board.point(Vec2(gx, gy));
+            const double u = (gx - 0.5 * (board.cols - 1)) / (0.5 * (board.cols - 1)), v = (gy - 0.5 * (board.rows - 1)) / (0.5 * (board.rows - 1));
+            p += Vec3(jitter(rng), jitter(rng), -0.3 * (1 - u * u) * (1 - v * v));
+            dots.push_back(p);
+        }
+    auto seen = [&](const CameraModel& cam, const SE3& T) {
+        BoardDetection d;
+        for (int i = 0; i < board.dots(); ++i) {
+            const Vec2 px = cam.project(T * dots[static_cast<std::size_t>(i)]) + Vec2(noise(rng), noise(rng));
+            if (px.x() < 0 || px.y() < 0 || px.x() > cam.width - 1 || px.y() > cam.height - 1) continue;
+            d.grid.push_back(Vec2(i % board.cols, i / board.cols));
+            d.pixels.push_back(px);
+        }
+        return d;
+    };
+    std::vector<StereoCapture> captures;
+    for (const auto& t : default_plan()) {
+        const SE3 T = target_pose(t, 90, truth, board);
+        captures.push_back({t.label, seen(truth.left, T), seen(truth.right, truth.T_right_left * T)});
+    }
+    SolveOptions so;
+    so.refine_board = false;
+    const auto nominal = solve_stereo(captures, 1280, 1024, board, so);
+    so.refine_board = true;
+    const auto fitted = solve_stereo(captures, 1280, 1024, board, so);
+    REQUIRE(nominal);
+    REQUIRE(fitted);
+    const auto rn = calib::row_agreement(truth, nominal->rig), rf = calib::row_agreement(truth, fitted->rig);
+    std::println("bowed board: nominal grid rms {:.3f} px, rows {:+.3f} up to {:.2f} px; dots fitted rms {:.3f} px ({:.3f} mm off the grid), rows {:+.3f} up to {:.2f} px",
+                 nominal->rms_px, rn.mean, rn.max_abs, fitted->rms_px, fitted->board_rms_mm, rf.mean, rf.max_abs);
+    CHECK(rn.max_abs > 1.0);
+    CHECK(fitted->rms_px < 0.08);
+    CHECK(std::abs(rf.mean) < 0.05);
+    CHECK(rf.max_abs < 0.7);  // in the image's corners, beyond every dot, the distortion is extrapolated
+    CHECK(std::abs(fitted->rig.baseline_mm() - truth.baseline_mm()) < 0.1);
+    // With the distortion known (EXStar's quick calibration keeps the factory's) the corners are right too.
+    so.fixed_distortion = std::array{truth.left.dist, truth.right.dist};
+    const auto fixed = solve_stereo(captures, 1280, 1024, board, so);
+    REQUIRE(fixed);
+    const auto rx = calib::row_agreement(truth, fixed->rig);
+    std::println("  factory distortion: rows {:+.3f} up to {:.2f} px", rx.mean, rx.max_abs);
+    CHECK(std::abs(rx.mean) < 0.03);
+    CHECK(rx.max_abs < 0.15);
+    // The board as fitted: its bow (about its mean, which goes into the board poses).
+    double mean = 0, ss = 0;
+    for (const auto& p : dots) mean += p.z() / static_cast<double>(dots.size());
+    for (const auto& p : dots) ss += (p.z() - mean) * (p.z() - mean);
+    CHECK(std::abs(fitted->board_flatness_mm - std::sqrt(ss / static_cast<double>(dots.size()))) < 0.02);
 }

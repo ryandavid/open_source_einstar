@@ -527,6 +527,8 @@ Result<fs::path> CalibrationController::save_result() {
     std::ofstream rep(session_dir_ / "report.txt");
     rep << std::format("{}\n{}\nsolve: {} views, {} dots, reprojection {:.3f} px, rectified rows {:.3f} px (max {:.2f})\n", description_, f.created,
                        f.views, st.ours->dots, st.ours->rms_px, st.ours->row_rms_px, st.ours->max_row_px);
+    if (st.ours->board_rms_mm > 0)
+        rep << std::format("board: dots fitted {:.3f} mm off the nominal grid, {:.3f} mm out of its plane\n", st.ours->board_rms_mm, st.ours->board_flatness_mm);
     if (st.flash) rep << std::format("flash calibration ({}) on these captures: reprojection {:.3f} px, rows {:.3f} px (max {:.2f})\n", flash_time_, st.flash->rms_px,
                                      st.flash->row_rms_px, st.flash->max_row_px);
     if (st.vs_flash) {
@@ -535,6 +537,7 @@ Result<fs::path> CalibrationController::save_result() {
                            "translation ({:+.2f} {:+.2f} {:+.2f}) mm\n",
                            d.left.dfx, d.left.dfy, d.left.dcx, d.left.dcy, d.right.dfx, d.right.dfy, d.right.dcx, d.right.dcy, d.rotation_deg.x(),
                            d.rotation_deg.y(), d.rotation_deg.z(), d.translation_mm.x(), d.translation_mm.y(), d.translation_mm.z());
+        rep << std::format("flash rays through ours: rectified rows {:+.3f} px on average, up to {:.2f} px (250-500 mm)\n", d.row_mean_px, d.row_max_px);
     }
     for (const auto& v : st.ours->views)
         rep << std::format("{:14} {:>3} dots  {:>5.0f} mm  tilt {:+5.1f} {:+5.1f}  rms {:.3f}  rows {:.3f}{}\n", v.name, v.dots, v.distance_mm, v.tilt_x_deg,

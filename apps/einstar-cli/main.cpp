@@ -16,6 +16,9 @@
 //                                     raw captures of the current pose under standard lighting conditions
 //   rig-fit <calibration dir> <dir>...
 //                                     how far raw pairs are from the calibration, and the rig correction that fits them
+//   calib-refine <session.estr> [--calibration C] [--offset-only] [--save FILE [--force]]
+//                                     check the calibration against the markers matched while scanning
+//                                     (rectified row offset), and write the corrected calibration
 //   board-check <calibration dir> <dir>...
 //                                     homography residual of the calibration board in each camera (model fit)
 //   fixture-pack --out DIR [--mustang <Project1.ir_E10_prj>] [--stl mesh.stl] [--board <dir>]
@@ -61,6 +64,7 @@
 #include <Eigen/Eigenvalues>
 
 #include "einstar/calib/device_calibration.hpp"
+#include "einstar/calib/epipolar.hpp"
 #include "einstar/calib/rectify.hpp"
 #include "einstar/calibrate/board.hpp"
 #include "einstar/calibrate/captures.hpp"
@@ -100,7 +104,8 @@ int usage() {
                  "       rig-fit <calibration dir> <dir>... |\n"
                  "       board-check <calibration dir> <dir>... |\n"
                  "       board-poses <calibration> <dir>... [--pad N] |\n"
-                 "       calib-solve <captures dir> [--reference <calibration>] [--save <file>] [--no-distortion | --distortion-from <calibration>] |\n"
+                 "       calib-solve <captures dir> [--reference <calibration>] [--save <file>] [--no-distortion | --distortion-from <calibration>] [--nominal-board] |\n"
+                 "       calib-refine <session.estr> [--calibration <calibration>] [--offset-only] [--save <file> [--force]] |\n"
                  "       fixture-pack --out DIR [--mustang <Project1.ir_E10_prj>] [--stl mesh.stl] [--board <dir>] |\n"
                  "       track-fixture <project.ir_E10_prj> [--start N] [--count N] [--skip K] [--stl ref.stl] [--cpu] [--mode geometry|hybrid|markers] [--global-markers] [--marker-confirm N] [--record out.estr] [--quiet] |\n"
                  "       process <session.estr> [-o mesh.stl|ply|obj] [--voxel MM] [--no-optimize] [--smooth N] [--stl reference.stl] [--reference-poses file] [--render out.pgm [--render-frame view.txt]] [--no-edge-filter | --edge-radius N --rim-radius N --min-region PX] [--no-grazing-weight] [--no-grazing-filter | --max-view-angle DEG --steep-rim PX --steep-rim-angle DEG] [--min-weight W] [--min-observations N] [--min-component F] |\n"
@@ -1682,6 +1687,7 @@ int calib_solve(std::span<char*> args) {
     }
     calibrate::SolveOptions so;
     so.free_distortion = !has_flag(args, "--no-distortion");
+    so.refine_board = !has_flag(args, "--nominal-board");
     if (const char* from = arg_str(args, "--distortion-from")) {
         auto cal = load_calibration(from);
         if (!cal) {
@@ -1716,6 +1722,8 @@ int calib_solve(std::span<char*> args) {
     }
     std::println("{:18} {:>4} {:>6} {:>13} | {:>8.3f} {:>8.3f}{}", "all", ours->dots, "", "", ours->rms_px, ours->row_rms_px,
                  ref_report ? std::format(" | {:>8.3f} {:>8.3f}", ref_report->rms_px, ref_report->row_rms_px) : "");
+    if (so.refine_board)
+        std::println("board: dots fitted {:.3f} mm rms off the nominal grid, {:.3f} mm out of its plane", ours->board_rms_mm, ours->board_flatness_mm);
     auto camera_line = [](const char* name, const CameraModel& m) {
         std::println("  {:6} f {:9.3f} {:9.3f}  c {:8.3f} {:8.3f}  k {:+.5f} {:+.5f} {:+.6f} {:+.6f} {:+.5f}", name, m.fx, m.fy, m.cx, m.cy, m.dist[0], m.dist[1],
                      m.dist[2], m.dist[3], m.dist[4]);
@@ -1742,6 +1750,7 @@ int calib_solve(std::span<char*> args) {
                          c.dcy, c.distortion_px, c.mapping_px);
         std::println("  rig    rot ({:+.4f}, {:+.4f}, {:+.4f}) deg  t ({:+.3f}, {:+.3f}, {:+.3f}) mm  baseline {:+.3f} mm", d.rotation_deg.x(), d.rotation_deg.y(),
                      d.rotation_deg.z(), d.translation_mm.x(), d.translation_mm.y(), d.translation_mm.z(), d.baseline_mm);
+        std::println("  rows   {:+.3f} px on average, up to {:.3f} px (reference's rays through ours, 250-500 mm)", d.row_mean_px, d.row_max_px);
     }
     if (const char* out = arg_str(args, "--save")) {
         calibrate::CalibrationFile f;
@@ -2263,6 +2272,78 @@ int track_session(const char* path, std::span<char*> args) {
     return 0;
 }
 
+// Every marker of a session seen by both IR cameras, back in raw pixels through the rectification it was
+// recorded with (empty without the scanner's record).
+std::vector<calib::MarkerPair> session_marker_pairs(const session::SessionReader& s) {
+    std::vector<calib::MarkerPair> pairs;
+    const auto& d = s.device();
+    if (!d) return pairs;
+    for (std::size_t i = 0; i < s.frame_count(); ++i)
+        for (const auto& m : s.meta(i).markers)
+            if (m.left_rect.x() >= 0 && m.right_rect.x() >= 0)
+                pairs.push_back(calib::raw_marker_pair(d->rig, d->R_rect_left, d->R_rect_right, d->rectified, d->rectified_right, m.left_rect, m.right_rect));
+    return pairs;
+}
+
+void print_epipolar_rows(const char* name, const calib::EpipolarCheck::Rows& r) {
+    std::println("  {:7} rows {:+.3f} px, |dy| median {:.3f} p95 {:.3f}, sigma {:.3f}; dy = {:+.3f} {:+.3f} u {:+.3f} v {:+.3f} d", name, r.median, r.abs_median, r.p95,
+                 r.robust_sigma, r.offset, r.slope_x, r.slope_y, r.slope_disparity);
+}
+
+// The epipolar self-check of a recording's calibration from its marker pairs, and the corrected calibration.
+int calib_refine(std::span<char*> args) {
+    if (args.empty()) return usage();
+    auto r = session::SessionReader::open(args[0]);
+    if (!r) {
+        std::println(stderr, "{}", r.error().message);
+        return 1;
+    }
+    const auto& s = **r;
+    if (!s.device()) {
+        std::println(stderr, "{}: no scanner record (DEVC), so no calibration to check", args[0]);
+        return 1;
+    }
+    const auto pairs = session_marker_pairs(s);
+    // Another calibration can be checked against the same markers (they are back in raw pixels).
+    RigCalibration rig = s.device()->rig;
+    if (const char* other = arg_str(args, "--calibration")) {
+        auto cal = load_calibration(other);
+        if (!cal) {
+            std::println(stderr, "{}", cal.error().message);
+            return 1;
+        }
+        rig = cal->rig();
+    }
+    calib::EpipolarCheckOptions o;
+    o.fit_optical_axis = !has_flag(args, "--offset-only");
+    const auto c = calib::check_epipolar(rig, pairs, o);
+    std::println("{}", c.verdict);
+    std::println("  {} pairs, {} inliers in {} image regions, columns spanned {:.0f}%; worst region after {:.3f} px", c.pairs, c.inliers, c.cells, 100 * c.x_span,
+                 c.worst_cell_px);
+    std::println("  turn about the baseline {:+.4f} +- {:.4f} deg, optical axis {:+.4f} +- {:.4f} deg{}", c.about_baseline_deg, c.sigma_baseline_deg,
+                 c.about_optical_axis_deg, c.sigma_optical_axis_deg, c.optical_axis_fitted ? "" : " (not fitted)");
+    print_epipolar_rows("before", c.before);
+    print_epipolar_rows("after", c.after);
+    if (const char* out = arg_str(args, "--save")) {
+        if (!c.apply && !has_flag(args, "--force")) {
+            std::println(stderr, "not saved: the check does not correct this calibration (--force saves the turned rig anyway)");
+            return 1;
+        }
+        calibrate::CalibrationFile f;
+        f.rig = c.apply ? c.corrected : calib::turn_right_camera(rig, c.about_baseline_deg * M_PI / 180, c.about_optical_axis_deg * M_PI / 180);
+        f.serial = s.device()->serial;
+        f.source = std::format("einstar-cli calib-refine {}: right camera turned {:+.4f} deg about the baseline, {:+.4f} about its axis", args[0],
+                               c.about_baseline_deg, c.about_optical_axis_deg);
+        f.row_rms_px = c.after.robust_sigma;
+        if (auto w = calibrate::write_calibration_file(out, f); !w) {
+            std::println(stderr, "{}", w.error().message);
+            return 1;
+        }
+        std::println("saved {}", out);
+    }
+    return 0;
+}
+
 int inspect_cmd(const char* path, std::span<char*> args) {
     auto r = session::SessionReader::open(path);
     if (!r) {
@@ -2278,6 +2359,14 @@ int inspect_cmd(const char* path, std::span<char*> args) {
                      d->firmware, d->calibration_blob.size(), d->rig.left.fx);
     else
         std::println("scanner: not recorded");
+    if (s.device()) {  // the calibration checked against the markers matched while scanning
+        const auto c = calib::check_epipolar(s.device()->rig, session_marker_pairs(s));
+        std::println("epipolar: {}", c.verdict);
+        if (has_flag(args, "--detail")) {
+            print_epipolar_rows("before", c.before);
+            if (c.apply) print_epipolar_rows("after", c.after);
+        }
+    }
     if (const char* out = arg_str(args, "--dump-blob"); out && s.device()) {  // the scanner's calibration blob as recorded
         std::ofstream f(out, std::ios::binary);
         const auto& b = s.device()->calibration_blob;
@@ -2618,6 +2707,7 @@ int main(int argc, char** argv) {
     if (cmd == "board-check") return board_check(rest);
     if (cmd == "board-poses") return board_poses(rest);
     if (cmd == "calib-solve") return calib_solve(rest);
+    if (cmd == "calib-refine") return calib_refine(rest);
     if (cmd == "track-fixture" && argc >= 3) return track_fixture(argv[2], rest);
     if (cmd == "track-session" && argc >= 3) return track_session(argv[2], rest);
     if (cmd == "inspect" && argc >= 3) return inspect_cmd(argv[2], std::span<char*>(argv + 3, static_cast<std::size_t>(argc - 3)));
