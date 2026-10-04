@@ -197,3 +197,25 @@ TEST_CASE("two halves of a hole wall made coaxial share one axis") {
     CHECK((d - d.dot(ca.axis) * ca.axis).norm() < 1e-10);
     CHECK((ca.point - axis_point - (ca.point - axis_point).dot(axis) * axis).norm() < 0.03);
 }
+
+TEST_CASE("a face held at a distance stays on the side it starts on, though it starts across from where it ends") {
+    // A sloping scanned face (24 degrees off the y axis, as a tab's floor), and an unseen face 3 mm inside it that
+    // starts square to the datum: it turns 24 degrees to become parallel, and must end inside, where it started.
+    const Vec3 n = Vec3(0, -std::cos(24 * kDeg), -std::sin(24 * kDeg));
+    std::vector<Vec3> pts;
+    for (int i = -10; i <= 10; ++i)
+        for (int j = -10; j <= 10; ++j) pts.push_back(Vec3(i, 0, 0) + j * n.cross(Vec3::UnitX()) + Vec3(0, 110, -46));
+    const Plane outer{n, n.dot(Vec3(0, 110, -46))};
+    SolveInput in;
+    in.features.push_back({outer, pts, {}, false});
+    in.features.push_back({Plane{-Vec3::UnitY(), -113.4}, {}, {}, false});  // y = 113.4, facing -y: inside the floor
+    in.constraints.push_back(Parallel{1, 0});
+    in.constraints.push_back(Distance{0, 1, 3.0});
+    const SolveResult r = solve(in);
+    REQUIRE(r.converged);
+    const auto& inner = std::get<Plane>(r.surfaces[1]);
+    CHECK(std::abs(std::abs(inner.normal.dot(n)) - 1) < 1e-9);
+    // 3 mm on the inside of the outer face (against its outward normal).
+    const Vec3 on_inner = inner.offset * inner.normal;
+    CHECK(std::abs(outer.normal.dot(on_inner) - outer.offset + 3.0) < 1e-6);
+}

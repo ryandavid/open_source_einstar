@@ -506,14 +506,24 @@ struct CoreResult {
     std::vector<std::size_t> row_constraint;
     MatX kkt;  // at the solution, kept rows only
     int kept_rows = 0;
+    std::vector<Frozen> start;  // the constraints frozen at the start: their sides and senses hold throughout
 };
+
+// Frozen at the current state, keeping the sides and senses chosen at the start (a face that starts across from
+// where it ends, e.g. square to the datum but held parallel to a sloping face, must not change side on the way).
+std::vector<Frozen> freeze_keeping_sides(const Problem& P, const State& s, const std::vector<Frozen>& start) {
+    std::vector<Frozen> fz = freeze_all(P, s);
+    for (const auto ci : P.active) fz[ci].sign = start[ci].sign;
+    return fz;
+}
 
 CoreResult solve_core(const Problem& P, State s) {
     CoreResult out;
     const int n = P.L.n;
+    out.start = freeze_all(P, s);
     for (int it = 0; it < P.o.max_iterations; ++it) {
         out.iterations = it + 1;
-        const std::vector<Frozen> fz = freeze_all(P, s);
+        const std::vector<Frozen> fz = freeze_keeping_sides(P, s, out.start);
         const Linearisation lin = linearise(P, s, fz);
         out.row_kept = independent_rows(lin.C);
         out.row_constraint = lin.row_constraint;
@@ -762,7 +772,7 @@ SolveResult solve(const SolveInput& in, const SolveOptions& o) {
     result.datums = core.state.datums;
 
     // Constraint status from the final rows: violation, and whether any row added something new.
-    const std::vector<Frozen> fz = freeze_all(P, core.state);
+    const std::vector<Frozen> fz = freeze_keeping_sides(P, core.state, core.start);
     const VecX c = constraint_values(P, core.state, fz);
     {
         std::size_t row = 0;
