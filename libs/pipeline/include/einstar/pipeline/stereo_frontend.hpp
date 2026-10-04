@@ -26,6 +26,8 @@ struct StereoFrontendParams {
     // of the depths scanned (most lie between 240 and 450 mm), so the fewest columns are lost either way.
     double reference_depth_mm = 320.0;
     depth::RefineParams refine;
+    depth::DetailParams detail;
+    depth::FilterParams filter;
     depth::SpeckleParams speckle{100, 1.0f};
     bool detect_markers = true;
     bool gpu_previews = true;   // rectified pair as GPU textures (Metal backend)

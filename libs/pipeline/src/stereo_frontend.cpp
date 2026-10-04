@@ -29,6 +29,8 @@ StereoFrontend::StereoFrontend(const RigCalibration& rig, StereoFrontendParams p
     stereo_.sgm.min_disparity = static_cast<int>(std::floor(d_min)) - 2;
     stereo_.sgm.num_disparities = static_cast<int>(std::ceil(d_max - d_min)) + 4;
     stereo_.refine = params_.refine;
+    stereo_.detail = params_.detail;
+    stereo_.filter = params_.filter;
     stereo_.speckle = params_.speckle;
 
     const track::Intrinsics full{rect_.rectified.width, rect_.rectified.height, rect_.rectified.fx, rect_.rectified.fy,
@@ -330,7 +332,7 @@ DepthOutput StereoFrontend::process(const ImageU8& raw_left, const ImageU8& raw_
     const ImageU8 rr = calib::remap(raw_right.view(), map_right_);
     out.rectified_left = depth::downsample2(rl.view());
     out.rectified_right = depth::downsample2(rr.view());
-    const auto stereo = depth::compute_disparity(out.rectified_left.view(), out.rectified_right.view(), stereo_);
+    const auto stereo = depth::compute_disparity(out.rectified_left.view(), out.rectified_right.view(), rl.view(), rr.view(), stereo_);
     // Disparity at half resolution -> depth with the half-resolution geometry.
     const depth::RectifiedGeometry half = rect_.geometry.scaled(1);
     depth::PointImageParams pp;

@@ -75,15 +75,16 @@ TEST_CASE("Metal stereo matches the CPU reference") {
     const auto mr = calib::build_remap(pr.rig.right, rect.R_right, rect.rectified_right);
 
     // CPU reference path (as in the stereo frontend).
-    const auto hl = depth::downsample2(calib::remap(pr.left.view(), ml).view());
-    const auto hr = depth::downsample2(calib::remap(pr.right.view(), mr).view());
+    const auto fl = calib::remap(pr.left.view(), ml), fr = calib::remap(pr.right.view(), mr);
+    const auto hl = depth::downsample2(fl.view());
+    const auto hr = depth::downsample2(fr.view());
     depth::StereoParams sp;
     sp.pyramid_levels = 1;
     const auto& g = rect.geometry;
     sp.sgm.min_disparity = static_cast<int>(std::floor(g.disparity_from_depth(700) / 4)) - 2;
     sp.sgm.num_disparities = static_cast<int>(g.disparity_from_depth(150) / 4) - sp.sgm.min_disparity + 4;
     Stopwatch sw;
-    const auto cpu = depth::compute_disparity(hl.view(), hr.view(), sp);
+    const auto cpu = depth::compute_disparity(hl.view(), hr.view(), fl.view(), fr.view(), sp);
     const double cpu_ms = sw.elapsed_ms();
 
     auto gpu = depth_metal::MetalStereo::create(*ctx, sp, hl.width(), hl.height());

@@ -3,6 +3,7 @@
 #include <cmath>
 #include <algorithm>
 #include <cstdlib>
+#include <limits>
 #include <vector>
 #include <print>
 #include "einstar/pipeline/stereo_frontend.hpp"
@@ -15,12 +16,22 @@ int main(int argc, char** argv) {
     pipeline::StereoFrontendParams fp_cpu_previews;
     fp_cpu_previews.cpu_previews = true;
     if (const char* ref = std::getenv("REF_DEPTH")) fp_cpu_previews.reference_depth_mm = std::atof(ref);
+    if (std::getenv("STEREO_CPU")) fp_cpu_previews.backend = pipeline::StereoBackend::cpu;
+    if (const char* v = std::getenv("DETAIL")) fp_cpu_previews.detail.enabled = std::atoi(v) > 0, fp_cpu_previews.detail.radius = std::atoi(v);
+    if (const char* v = std::getenv("DETAIL_SEARCH")) fp_cpu_previews.detail.search = static_cast<float>(std::atof(v));
+    if (const char* v = std::getenv("DETAIL_ZNCC")) fp_cpu_previews.detail.min_zncc = static_cast<float>(std::atof(v));
+    if (const char* v = std::getenv("EDGE_WIN")) fp_cpu_previews.refine.reject_edge_winners = std::atoi(v) != 0;
+    if (const char* v = std::getenv("OCCL")) fp_cpu_previews.filter.occlusion = std::atoi(v) != 0;
+    if (const char* v = std::getenv("SPIKE")) fp_cpu_previews.filter.spikes = std::atof(v) > 0, fp_cpu_previews.filter.spike_threshold = static_cast<float>(std::atof(v));
     pipeline::StereoFrontend fe(rig, fp_cpu_previews);
     long counts[4][3] = {};  // distance band x {total, >0.5 mm, >2 mm}
     long kind[3][3] = {};    // {interior, hole border, depth jump} x {total, >0.5, >2}
     long signed_hist[2] = {}, sil_hist[2] = {}, no_hit = 0;
     long disp_hist[4] = {}, disp_z[4] = {};
     long tex[2][6] = {};  // {good, bad} x texture std bins of 5 grey levels
+    std::vector<double> interior_errs;            // |error| of interior pixels (mm)
+    double c_sum = 0, c_xx = 0, c_yy = 0;         // lag-1 correlation of the signed error along rows
+    long c_n = 0;
     for (int a = 1; a < argc; ++a) {
         const auto id = static_cast<std::uint32_t>(std::atoi(argv[a]));
         ImageU8 l, r;
@@ -77,6 +88,7 @@ int main(int argc, char** argv) {
                     if (drop(x, y)) P(x, y) = Vec3f::Zero();
         }
         const int W = P.width(), H = P.height();
+        Image<float> signed_err(W, H, std::numeric_limits<float>::quiet_NaN());
         // Distance (px) to the nearest depth discontinuity (jump > 3 mm or invalid neighbour).
         auto near_edge = [&](int x, int y) {
             for (int rr = 1; rr <= 3; ++rr)
@@ -144,6 +156,10 @@ int main(int argc, char** argv) {
                         if (z > 0 && std::abs(z - p.z()) > std::max(3.0f, 0.01f * p.z())) k = 2;
                         else if (z <= 0 && k == 0) k = 1;
                     }
+                if (hit && k == 0 && err < 5.0) {
+                    interior_errs.push_back(err);
+                    signed_err(x, y) = static_cast<float>((w - cam).norm() - hit->t);
+                }
                 kind[k][0]++;
                 kind[k][1] += err > 0.5;
                 kind[k][2] += err > 2.0;
@@ -151,7 +167,24 @@ int main(int argc, char** argv) {
                 counts[band][1] += err > 0.5;
                 counts[band][2] += err > 2.0;
             }
+        // Error correlation between horizontal neighbours (after removing each frame's mean): stereo with a
+        // large window gives blobby, strongly correlated errors.
+        double mean = 0;
+        long nm = 0;
+        for (const float e : signed_err.pixels())
+            if (!std::isnan(e)) mean += e, ++nm;
+        mean /= static_cast<double>(std::max(1L, nm));
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x + 1 < W; ++x) {
+                const float e0 = signed_err(x, y), e1 = signed_err(x + 1, y);
+                if (std::isnan(e0) || std::isnan(e1)) continue;
+                c_sum += (e0 - mean) * (e1 - mean), c_xx += (e0 - mean) * (e0 - mean), c_yy += (e1 - mean) * (e1 - mean), ++c_n;
+            }
     }
+    std::ranges::sort(interior_errs);
+    auto q = [&](double f) { return interior_errs.empty() ? 0.0 : interior_errs[static_cast<std::size_t>(f * static_cast<double>(interior_errs.size() - 1))]; };
+    std::println("interior: {} pixels, |error| median {:.3f} mm, p90 {:.3f} mm; neighbour error correlation {:.2f}", interior_errs.size(), q(0.5),
+                 q(0.9), c_n ? c_sum / std::sqrt(c_xx * c_yy) : 0.0);
     const auto pct = [](long n, long total) { return 100.0 * static_cast<double>(n) / static_cast<double>(std::max(1L, total)); };
     long tot = 0, g5 = 0, g2 = 0;
     for (int k = 0; k < 3; ++k) tot += kind[k][0], g5 += kind[k][1], g2 += kind[k][2];

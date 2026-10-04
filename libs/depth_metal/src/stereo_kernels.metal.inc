@@ -42,6 +42,19 @@ kernel void rectify_half(device const uchar* src [[buffer(0)]], device const flo
     out[gid.y * a.out_w + gid.x] = uchar((acc + 2) / 4);
 }
 
+// Full-resolution rectified image (== CPU remap); downsample2 then gives exactly rectify_half's output.
+kernel void rectify_full(device const uchar* src [[buffer(0)]], device const float2* map [[buffer(1)]],
+                         device uchar* out [[buffer(2)]], constant RectifyArgs& a [[buffer(3)]],
+                         uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= a.full_w || gid.y >= a.full_h) return;
+    const float2 m = map[gid.y * a.full_w + gid.x];
+    float v = 0.0f;
+    const int x0 = int(floor(m.x)), y0 = int(floor(m.y));
+    if (!(x0 < 0 || y0 < 0 || x0 + 1 >= int(a.src_w) || y0 + 1 >= int(a.src_h)))
+        v = clamp(bilinear_u8(src, a.src_w, a.src_h, m.x, m.y) + 0.5f, 0.0f, 255.0f);
+    out[gid.y * a.full_w + gid.x] = uchar(uint(v));
+}
+
 kernel void downsample2(device const uchar* src [[buffer(0)]], device uchar* out [[buffer(1)]],
                         constant Size2& s [[buffer(2)]], uint2 gid [[thread_position_in_grid]]) {
     const uint w = s.w / 2, h = s.h / 2;
@@ -414,7 +427,7 @@ kernel void median3(device const float* in [[buffer(0)]], device float* out [[bu
 constant uint kRefineCandidates [[function_constant(0)]];
 constant int kMaxRefineCandidates = 17;
 
-struct RefineArgs { uint w; uint h; uint cw; uint ch; int radius; int search_radius; float min_zncc; uint subpixel; };
+struct RefineArgs { uint w; uint h; uint cw; uint ch; int radius; int search_radius; float min_zncc; uint subpixel; uint reject_edge; };
 
 kernel void refine_slanted(device const uchar* left [[buffer(0)]], device const uchar* right [[buffer(1)]],
                            device const float* coarse [[buffer(2)]], device float* out_disp [[buffer(3)]],
@@ -486,11 +499,137 @@ kernel void refine_slanted(device const uchar* left [[buffer(0)]], device const 
         prev = sc;
     }
     if (best_k < 0 || best < a.min_zncc) return;
+    if (a.reject_edge && (best_k == 0 || best_k == ncand - 1)) return;
     float d = lo + step * float(best_k);
     if (a.subpixel && best_k > 0 && best_k + 1 < ncand && best_prev > -2.0f && best_next > -2.0f)
         d += step * subpixel_offset(1.0f - best_prev, 1.0f - best, 1.0f - best_next);
     out_disp[i] = d;
     out_conf[i] = best;
+}
+
+// ---- detail refinement on the full-resolution images (mirrors depth::refine_detail) ----
+struct DetailArgs { uint w; uint h; uint fw; uint fh; int radius; int K; float step; float min_zncc; uint subpixel; uint enabled; };
+constant int kMaxDetailCandidates = 17;
+
+inline float detail_grad(float l, float c, float r) {
+    if (!valid(l) || !valid(r) || abs(r - c) >= 1.0f || abs(c - l) >= 1.0f) return 0.0f;
+    return clamp(0.5f * (r - l), -0.9f, 0.9f);
+}
+
+kernel void refine_detail(device const uchar* left [[buffer(0)]], device const uchar* right [[buffer(1)]],
+                          device const float* first [[buffer(2)]], device float* out [[buffer(3)]],
+                          device atomic_int* claims [[buffer(4)]], constant DetailArgs& a [[buffer(5)]],
+                          uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= a.w || gid.y >= a.h) return;
+    const int x = int(gid.x), y = int(gid.y), W = int(a.w), H = int(a.h);
+    const uint i = gid.y * a.w + gid.x;
+    atomic_store_explicit(&claims[i], kNoMatch, memory_order_relaxed);  // for occlusion_claim (next dispatch)
+    const float d = first[i];
+    out[i] = d;
+    if (!a.enabled || !valid(d) || x < 1 || y < 1 || x + 1 >= W || y + 1 >= H) return;
+    const int n = 2 * a.radius;
+    const int x0 = 2 * x - a.radius + 1, y0 = 2 * y - a.radius + 1;
+    if (x0 < 0 || y0 < 0 || x0 + n > int(a.fw) || y0 + n > int(a.fh)) return;
+    const float gx = detail_grad(first[i - 1], d, first[i + 1]), gy = detail_grad(first[i - a.w], d, first[i + a.w]);
+    const float cx = 2.0f * float(x) + 0.5f, cy = 2.0f * float(y) + 0.5f;
+    const float D0 = 2.0f * d;
+    const int nc = 2 * a.K + 1;
+    float sa = 0, saa = 0, sb[kMaxDetailCandidates], sbb[kMaxDetailCandidates], sab[kMaxDetailCandidates];
+    uint dead = 0;
+    for (int k = 0; k < nc; ++k) { sb[k] = 0; sbb[k] = 0; sab[k] = 0; }
+    const int FW = int(a.fw);
+    for (int j = 0; j < n; ++j) {
+        const int Y = y0 + j;
+        device const uchar* ra = left + Y * FW;
+        device const uchar* rb = right + Y * FW;
+        const float dy = gy * (float(Y) - cy);
+        for (int u = 0; u < n; ++u) {
+            const int X = x0 + u;
+            const float ia = ra[X];
+            sa += ia; saa += ia * ia;
+            const float base = float(X) - (D0 + gx * (float(X) - cx) + dy);
+            for (int k = 0; k < nc; ++k) {
+                const float xb = base - a.step * float(k - a.K);
+                const int xi = int(floor(xb));
+                if (xi < 0 || xi + 1 >= FW) { dead |= 1u << k; continue; }
+                const float f = xb - float(xi);
+                const float ib = float(rb[xi]) * (1.0f - f) + float(rb[xi + 1]) * f;
+                sb[k] += ib; sbb[k] += ib * ib; sab[k] += ia * ib;
+            }
+        }
+    }
+    const float m = float(n * n);
+    const float va = saa - sa * sa / m;
+    float best = -2.0f, best_prev = -2.0f, best_next = -2.0f, prev = -2.0f;
+    int best_k = -1;
+    for (int k = 0; k < nc; ++k) {
+        float sc = -2.0f;
+        if (!(dead & (1u << k))) {
+            const float vb = sbb[k] - sb[k] * sb[k] / m;
+            sc = (va < 1e-6f || vb < 1e-6f) ? -1.0f : (sab[k] - sa * sb[k] / m) / sqrt(va * vb);
+        }
+        if (k == best_k + 1) best_next = sc;
+        if (sc > best) { best = sc; best_k = k; best_prev = prev; best_next = -2.0f; }
+        prev = sc;
+    }
+    if (best_k <= 0 || best_k + 1 >= nc || best < a.min_zncc || best_prev <= -2.0f || best_next <= -2.0f) return;
+    float D = D0 + a.step * float(best_k - a.K);
+    if (a.subpixel) D += a.step * subpixel_offset(1.0f - best_prev, 1.0f - best, 1.0f - best_next);
+    out[i] = 0.5f * D;
+}
+
+// ---- occlusion + spike filters (mirror depth::filter_disparity) ----
+struct FilterArgs { uint w; uint h; uint occlusion; float occlusion_tolerance; uint spikes; float spike_threshold; };
+constant float kClaimScale = 256.0f;  // claims hold disparities in 1/256 px (integer atomics)
+
+kernel void occlusion_claim(device const float* disp [[buffer(0)]], device atomic_int* claims [[buffer(1)]],
+                            constant FilterArgs& a [[buffer(2)]], uint2 gid [[thread_position_in_grid]]) {
+    if (!a.occlusion || gid.x >= a.w || gid.y >= a.h) return;
+    const float d = disp[gid.y * a.w + gid.x];
+    if (!valid(d)) return;
+    const int xr = int(rint(float(gid.x) - d));
+    if (xr < 0 || xr >= int(a.w)) return;
+    atomic_fetch_max_explicit(&claims[gid.y * a.w + uint(xr)], int(rint(d * kClaimScale)), memory_order_relaxed);
+}
+
+kernel void occlusion_apply(device float* disp [[buffer(0)]], device const int* claims [[buffer(1)]],
+                            constant FilterArgs& a [[buffer(2)]], uint2 gid [[thread_position_in_grid]]) {
+    if (!a.occlusion || gid.x >= a.w || gid.y >= a.h) return;
+    const uint i = gid.y * a.w + gid.x;
+    const float d = disp[i];
+    if (!valid(d)) return;
+    const int xr = int(rint(float(gid.x) - d));
+    if (xr < 0 || xr >= int(a.w)) return;
+    const int c = claims[gid.y * a.w + uint(xr)];
+    if (c != kNoMatch && d < float(c) / kClaimScale - a.occlusion_tolerance) disp[i] = kInvalid;
+}
+
+kernel void spike_filter(device const float* in [[buffer(0)]], device float* out [[buffer(1)]],
+                         constant FilterArgs& a [[buffer(2)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= a.w || gid.y >= a.h) return;
+    const int x = int(gid.x), y = int(gid.y);
+    const uint i = gid.y * a.w + gid.x;
+    const float d = in[i];
+    out[i] = d;
+    if (!a.spikes || !valid(d)) return;
+    float buf[9];
+    int n = 0;
+    for (int v = -1; v <= 1; ++v)
+        for (int u = -1; u <= 1; ++u) {
+            const int xx = x + u, yy = y + v;
+            if (xx < 0 || yy < 0 || xx >= int(a.w) || yy >= int(a.h)) continue;
+            const float e = in[yy * int(a.w) + xx];
+            if (!valid(e)) continue;
+            buf[n++] = e;
+        }
+    if (n < 3) return;
+    for (int i2 = 1; i2 < n; ++i2) {
+        const float t = buf[i2];
+        int j = i2 - 1;
+        while (j >= 0 && buf[j] > t) { buf[j + 1] = buf[j]; --j; }
+        buf[j + 1] = t;
+    }
+    if (abs(d - buf[n / 2]) > a.spike_threshold) out[i] = kInvalid;
 }
 )METAL"
 R"METAL(
@@ -576,7 +715,8 @@ kernel void ccl_filter(device float* disp [[buffer(0)]], device float* conf [[bu
 }
 
 // ---- disparity -> organised points, normals, weights (mirrors depth::disparity_to_points) ----
-struct PointsArgs { uint w; uint h; float f; float cx; float cy; float baseline; float min_depth; float max_depth; float max_jump; float cx_offset; };
+struct PointsArgs { uint w; uint h; float f; float cx; float cy; float baseline; float min_depth; float max_depth; float max_jump; float cx_offset;
+                   float edge_weight; float weight_reference_depth; };
 
 kernel void disparity_points(device const float* disp [[buffer(0)]], device const float* conf [[buffer(1)]],
                              device float4* pts [[buffer(2)]], constant PointsArgs& a [[buffer(3)]],
@@ -601,6 +741,7 @@ kernel void point_normals(device const float4* pts [[buffer(0)]], device const f
     const float4 p = pts[i];
     float w = p.w > 0 ? conf[i] : 0.0f;
     float4 n = float4(0);
+    float view = a.edge_weight;
     if (p.w > 0 && gid.x > 0 && gid.y > 0 && gid.x + 1 < a.w && gid.y + 1 < a.h) {
         const float4 l = pts[i - 1], r = pts[i + 1], t = pts[i - a.w], b = pts[i + a.w];
         if (l.w > 0 && r.w > 0 && t.w > 0 && b.w > 0 && abs(l.z - r.z) <= a.max_jump && abs(t.z - b.z) <= a.max_jump) {
@@ -610,9 +751,13 @@ kernel void point_normals(device const float4* pts [[buffer(0)]], device const f
                 nn /= len;
                 if (dot(nn, p.xyz) > 0) nn = -nn;
                 n = float4(nn, 0);
-                w *= max(0.0f, -dot(nn, normalize(p.xyz)));
+                view = max(0.0f, min(-dot(nn, normalize(p.xyz)), -dot(nn, normalize(p.xyz - float3(a.baseline, 0, 0)))));
             }
         }
+    }
+    if (p.w > 0) {
+        const float rz = a.weight_reference_depth / p.z;
+        w *= view * (a.weight_reference_depth > 0 ? clamp(rz * rz, 0.1f, 1.0f) : 1.0f);
     }
     nrm[i] = n;
     wts[i] = w;

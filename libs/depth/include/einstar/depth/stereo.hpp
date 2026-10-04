@@ -43,6 +43,33 @@ struct RefineParams {
     int search_radius = 2;     // disparity search +/- around the upsampled value
     int zncc_radius = 3;       // 7x7 window
     float min_zncc = 0.5f;     // reject weaker matches
+    // A best score at either end of the search may be the flank of a peak outside it: no match.
+    bool reject_edge_winners = true;
+};
+
+// Detail refinement on the full-resolution images: each half-resolution disparity is re-matched with a
+// small window (2*radius full-resolution pixels square, slanted by the local disparity gradient) close
+// to its value. The 7x7 half-resolution window (14x14 full-resolution pixels) is robust but blurs depth
+// over its whole footprint, which rounds edges and makes the noise blobby (strongly correlated between
+// neighbours); the small window keeps the detail. Matches it cannot confirm keep the first estimate.
+struct DetailParams {
+    // Synthetic speckle, 3 frames (debug_depth_errors): median error 0.137 -> 0.113 mm, neighbour error
+    // correlation 0.75 -> 0.59, gross errors unchanged; a wider search lets small windows jump to wrong peaks.
+    bool enabled = true;
+    int radius = 5;            // 10x10 full-resolution window
+    float search = 1.0f;       // full-resolution px either side of the first estimate
+    float step = 0.5f;         // full-resolution px
+    float min_zncc = 0.5f;
+};
+
+// After refinement: a pixel whose right view another left pixel, nearer the camera, also claims is
+// occluded in the right image (its match is the foreground's); an isolated value far from its 3x3
+// neighbours' median is a spike.
+struct FilterParams {
+    bool occlusion = true;
+    float occlusion_tolerance = 1.0f;  // disparity px (stereo resolution) closer than the claimant
+    bool spikes = true;
+    float spike_threshold = 1.0f;      // disparity px from the 3x3 median
 };
 
 struct SpeckleParams {
@@ -54,6 +81,8 @@ struct StereoParams {
     int pyramid_levels = 2;  // SGM runs at 1/2^levels resolution; 0 means full resolution
     SgmParams sgm;
     RefineParams refine;
+    DetailParams detail;     // needs the full-resolution images (compute_disparity's second form)
+    FilterParams filter;
     SpeckleParams speckle;
     bool subpixel = true;
 };
@@ -66,6 +95,11 @@ struct StereoResult {
 // Both images must be rectified, same size, row-aligned; disparity = x_left - x_right (signed).
 [[nodiscard]] StereoResult compute_disparity(ImageView<const std::uint8_t> left,
                                              ImageView<const std::uint8_t> right,
+                                             const StereoParams& params);
+// The same, with the full-resolution images `left` and `right` were 2x2 box-downsampled from, for the
+// detail refinement (params.detail).
+[[nodiscard]] StereoResult compute_disparity(ImageView<const std::uint8_t> left, ImageView<const std::uint8_t> right,
+                                             ImageView<const std::uint8_t> full_left, ImageView<const std::uint8_t> full_right,
                                              const StereoParams& params);
 
 // ---- building blocks, exposed for testing and for the Metal port ----
@@ -82,5 +116,12 @@ struct StereoResult {
 
 // Removes connected regions (4-neighbourhood, |d_a - d_b| <= max_diff) smaller than max_region_size.
 void remove_speckles(ImageF32& disparity, const SpeckleParams& params);
+
+// Detail refinement (see DetailParams) of a disparity at half the full images' resolution, in place.
+void refine_detail(ImageView<const std::uint8_t> full_left, ImageView<const std::uint8_t> full_right, ImageF32& disparity,
+                   const DetailParams& params, bool subpixel);
+
+// Occlusion and spike filters (see FilterParams), in place.
+void filter_disparity(ImageF32& disparity, const FilterParams& params);
 
 }  // namespace einstar::depth

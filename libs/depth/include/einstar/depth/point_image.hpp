@@ -32,11 +32,27 @@ struct PointImage {
     ImageF32 weights;       // 0..1
 };
 
+// Each point's weight (its confidence, for tracking and fusion): the match score times how squarely
+// both cameras see the surface (the worse of the two: grazing in either view degrades the match). A
+// point without a normal (beside a hole or a depth jump, where most stereo outliers are) gets
+// `edge_weight` instead of the view term. Optionally also the depth noise relative to
+// `weight_reference_depth` (stereo depth error grows with z^2: the weight is its inverse, at most 1, at
+// least 0.1). That is off: weights are compared with absolute thresholds downstream (the live view shows
+// voxels above 0.5, meshing keeps those above 1), and at 300 mm it cut the live model of a synthetic scan
+// after 8 frames by 40%; to be tuned on a real scan with raw IR.
 struct PointImageParams {
     float min_depth = 150.0f;     // mm
     float max_depth = 700.0f;     // mm
     float max_depth_jump = 4.0f;  // mm between neighbours used for normals
+    float edge_weight = 0.25f;
+    float weight_reference_depth = 0.0f;  // mm; 0 = no depth term
 };
+
+[[nodiscard]] inline float depth_noise_weight(float z, float reference) {
+    if (reference <= 0.0f) return 1.0f;
+    const float r = reference / z;
+    return r * r > 1.0f ? 1.0f : (r * r < 0.1f ? 0.1f : r * r);
+}
 
 [[nodiscard]] PointImage disparity_to_points(const ImageF32& disparity, const ImageF32& confidence,
                                              const RectifiedGeometry& geom, const PointImageParams& params = {});

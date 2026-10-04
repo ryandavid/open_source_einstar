@@ -24,9 +24,11 @@ struct CostArgs { std::uint32_t w, h, nd; std::int32_t min_disp; std::uint16_t i
 struct PathArgs { std::uint32_t w, h, nd; std::int32_t dx, dy, p1, p2; std::uint32_t adaptive, slant, first; };
 struct WtaArgs { std::uint32_t w, h, nd; std::int32_t min_disp; float uniqueness; std::uint32_t subpixel; };
 struct LrArgs { std::uint32_t w, h; float max_diff; };
-struct RefineArgs { std::uint32_t w, h, cw, ch; std::int32_t radius, search_radius; float min_zncc; std::uint32_t subpixel; };
+struct RefineArgs { std::uint32_t w, h, cw, ch; std::int32_t radius, search_radius; float min_zncc; std::uint32_t subpixel, reject_edge; };
+struct DetailArgs { std::uint32_t w, h, fw, fh; std::int32_t radius, K; float step, min_zncc; std::uint32_t subpixel, enabled; };
+struct FilterArgs { std::uint32_t w, h, occlusion; float occlusion_tolerance; std::uint32_t spikes; float spike_threshold; };
 struct CclArgs { std::uint32_t w, h; float max_diff; std::uint32_t min_size; };
-struct PointsArgs { std::uint32_t w, h; float f, cx, cy, baseline, min_depth, max_depth, max_jump, cx_offset; };
+struct PointsArgs { std::uint32_t w, h; float f, cx, cy, baseline, min_depth, max_depth, max_jump, cx_offset, edge_weight, weight_reference_depth; };
 struct BlobArgs {
     std::uint32_t w, h, threshold, min_diameter, max_diameter;
     float max_aspect, min_fill;
@@ -51,6 +53,8 @@ struct MetalStereo::Impl {
     Ref<MTL::ComputePipelineState> path_simd;  // barrier-free SGM paths (non-Apple GPUs; see the kernel)
     NS::UInteger path_simd_width = 0;
     Ref<MTL::ComputePipelineState> ccl_init, ccl_merge, ccl_count, ccl_filter, pts_kernel, nrm_kernel;
+    Ref<MTL::ComputePipelineState> rectify_full, detail, occl_claim, occl_apply, spike;
+    Ref<MTL::Buffer> full_l, full_r, claims;  // full-resolution rectified pair (detail refinement); occlusion claims
     Ref<MTL::ComputePipelineState> blob_init, blob_merge, blob_stats, blob_select;
     // Marker blob search (per side): labels, per-root count/box/peak, compacted candidates.
     struct BlobBuffers { Ref<MTL::Buffer> L, count, x0, y0, x1, y1, peak, moments, out, n_out; };
@@ -130,6 +134,9 @@ Result<std::unique_ptr<MetalStereo>> MetalStereo::create(std::shared_ptr<gpu::Co
                            std::pair{"ccl_init", &im->ccl_init}, std::pair{"ccl_merge", &im->ccl_merge},
                            std::pair{"ccl_count", &im->ccl_count}, std::pair{"ccl_filter", &im->ccl_filter},
                            std::pair{"disparity_points", &im->pts_kernel}, std::pair{"point_normals", &im->nrm_kernel},
+                           std::pair{"rectify_full", &im->rectify_full}, std::pair{"refine_detail", &im->detail},
+                           std::pair{"occlusion_claim", &im->occl_claim}, std::pair{"occlusion_apply", &im->occl_apply},
+                           std::pair{"spike_filter", &im->spike},
                            std::pair{"blob_init", &im->blob_init}, std::pair{"blob_merge", &im->blob_merge},
                            std::pair{"blob_stats", &im->blob_stats}, std::pair{"blob_select", &im->blob_select}})
         if (auto r = make(n, *slot); !r) return std::unexpected(r.error());
@@ -137,6 +144,8 @@ Result<std::unique_ptr<MetalStereo>> MetalStereo::create(std::shared_ptr<gpu::Co
         const auto candidates = static_cast<std::uint32_t>(4 * params.refine.search_radius + 1);  // 0.5 px steps
         if (params.refine.search_radius < 1 || candidates > 17)
             return make_error(Errc::invalid_argument, "Metal stereo: refine search radius must be 1..4");
+        if (params.detail.enabled && (params.detail.step <= 0 || std::lround(params.detail.search / params.detail.step) > 8 || params.detail.radius < 1))
+            return make_error(Errc::invalid_argument, "Metal stereo: detail search must be at most 8 steps either side");
         const std::pair<int, std::uint32_t> constants[] = {{0, candidates}};
         auto p = im->ctx->compute_pipeline(*lib, "refine_slanted", constants);
         if (!p) return std::unexpected(p.error());
@@ -182,6 +191,7 @@ Result<std::unique_ptr<MetalStereo>> MetalStereo::create(std::shared_ptr<gpu::Co
     const auto fpx = static_cast<std::size_t>(width * height);
     im->labels = im->buf(fpx * 4);
     im->sizes = im->buf(fpx * 4);
+    im->claims = im->buf(fpx * 4);
     return std::unique_ptr<MetalStereo>(new MetalStereo(std::move(im)));
 }
 
@@ -196,6 +206,8 @@ Result<void> MetalStereo::set_rectification(const calib::RemapTable& left, const
     const auto n = static_cast<std::size_t>(left.width * left.height);
     im.map_l = im.buf(n * 8);
     im.map_r = im.buf(n * 8);
+    im.full_l = im.buf(n);
+    im.full_r = im.buf(n);
     auto pack = [&](const calib::RemapTable& t, MTL::Buffer* b) {
         std::vector<float> d(2 * n);
         for (std::size_t i = 0; i < n; ++i) {
@@ -227,7 +239,7 @@ void MetalStereo::set_point_params(const depth::RectifiedGeometry& g, float min_
     auto& im = *impl_;
     im.points_args = {static_cast<std::uint32_t>(im.w), static_cast<std::uint32_t>(im.h), static_cast<float>(g.f),
                       static_cast<float>(g.cx), static_cast<float>(g.cy), static_cast<float>(g.baseline), min_depth, max_depth, max_jump,
-                      static_cast<float>(g.cx_offset)};
+                      static_cast<float>(g.cx_offset), depth::PointImageParams{}.edge_weight, depth::PointImageParams{}.weight_reference_depth};
     im.have_points = true;
 }
 
@@ -433,12 +445,31 @@ Result<void> MetalStereo::encode_and_run(bool from_raw, bool make_points, ImageU
                              static_cast<std::uint32_t>(im.full_w), static_cast<std::uint32_t>(im.full_h),
                              static_cast<std::uint32_t>(im.w), static_cast<std::uint32_t>(im.h)};
         MTL::Buffer* raw[2] = {im.bound_raw_l ? im.bound_raw_l : im.raw_l.get(), im.bound_raw_r ? im.bound_raw_r : im.raw_r.get()};
-        for (int side = 0; side < 2; ++side) {
-            enc->setBuffer(raw[side], 0, 0);
-            enc->setBuffer(side ? im.map_r.get() : im.map_l.get(), 0, 1);
-            enc->setBuffer(side ? im.img_r[0].get() : im.img_l[0].get(), 0, 2);
-            enc->setBytes(&ra, sizeof(ra), 3);
-            dispatch2d(im.rectify.get(), im.w, im.h);
+        if (im.p.detail.enabled) {
+            // Full resolution for the detail refinement, then the same 2x2 box downsample as the CPU.
+            const Size2 fs{static_cast<std::uint32_t>(im.full_w), static_cast<std::uint32_t>(im.full_h)};
+            for (int side = 0; side < 2; ++side) {
+                enc->setBuffer(raw[side], 0, 0);
+                enc->setBuffer(side ? im.map_r.get() : im.map_l.get(), 0, 1);
+                enc->setBuffer(side ? im.full_r.get() : im.full_l.get(), 0, 2);
+                enc->setBytes(&ra, sizeof(ra), 3);
+                dispatch2d(im.rectify_full.get(), im.full_w, im.full_h);
+            }
+            enc->memoryBarrier(MTL::BarrierScopeBuffers);
+            for (int side = 0; side < 2; ++side) {
+                enc->setBuffer(side ? im.full_r.get() : im.full_l.get(), 0, 0);
+                enc->setBuffer(side ? im.img_r[0].get() : im.img_l[0].get(), 0, 1);
+                enc->setBytes(&fs, sizeof(fs), 2);
+                dispatch2d(im.down.get(), im.w, im.h);
+            }
+        } else {
+            for (int side = 0; side < 2; ++side) {
+                enc->setBuffer(raw[side], 0, 0);
+                enc->setBuffer(side ? im.map_r.get() : im.map_l.get(), 0, 1);
+                enc->setBuffer(side ? im.img_r[0].get() : im.img_l[0].get(), 0, 2);
+                enc->setBytes(&ra, sizeof(ra), 3);
+                dispatch2d(im.rectify.get(), im.w, im.h);
+            }
         }
     }
     gpu::profile::split(im.ctx->queue(), cmd, enc, "stereo/rectify");
@@ -538,7 +569,7 @@ Result<void> MetalStereo::encode_and_run(bool from_raw, bool make_points, ImageU
         enc->memoryBarrier(MTL::BarrierScopeBuffers);
         const RefineArgs rf{static_cast<std::uint32_t>(im.lw[lf]), static_cast<std::uint32_t>(im.lh[lf]),
                             static_cast<std::uint32_t>(im.lw[lc]), static_cast<std::uint32_t>(im.lh[lc]), im.p.refine.zncc_radius,
-                            im.p.refine.search_radius, im.p.refine.min_zncc, im.p.subpixel ? 1u : 0u};
+                            im.p.refine.search_radius, im.p.refine.min_zncc, im.p.subpixel ? 1u : 0u, im.p.refine.reject_edge_winners ? 1u : 0u};
         enc->setBuffer(im.img_l[lf].get(), 0, 0);
         enc->setBuffer(im.img_r[lf].get(), 0, 1);
         enc->setBuffer(im.med[lc].get(), 0, 2);
@@ -548,8 +579,42 @@ Result<void> MetalStereo::encode_and_run(bool from_raw, bool make_points, ImageU
         dispatch2d(im.refine.get(), im.lw[lf], im.lh[lf]);
     }
     gpu::profile::split(im.ctx->queue(), cmd, enc, "stereo/median+refine");
-    // --- speckle removal: connected components on the GPU (same rule as depth::remove_speckles) ---
     const int fw = im.lw[0], fh = im.lh[0];
+    // --- detail refinement (full resolution, from raw images only), occlusion and spike filters ---
+    {
+        const auto& dp = im.p.detail;
+        const DetailArgs da{static_cast<std::uint32_t>(fw), static_cast<std::uint32_t>(fh), static_cast<std::uint32_t>(im.full_w),
+                            static_cast<std::uint32_t>(im.full_h), dp.radius, static_cast<std::int32_t>(std::lround(dp.search / dp.step)), dp.step,
+                            dp.min_zncc, im.p.subpixel ? 1u : 0u, dp.enabled && from_raw ? 1u : 0u};
+        const auto& fp = im.p.filter;
+        const FilterArgs fa{static_cast<std::uint32_t>(fw), static_cast<std::uint32_t>(fh), fp.occlusion ? 1u : 0u, fp.occlusion_tolerance,
+                            fp.spikes ? 1u : 0u, fp.spike_threshold};
+        enc->memoryBarrier(MTL::BarrierScopeBuffers);
+        enc->setBuffer(im.full_l ? im.full_l.get() : im.img_l[0].get(), 0, 0);
+        enc->setBuffer(im.full_r ? im.full_r.get() : im.img_r[0].get(), 0, 1);
+        enc->setBuffer(im.disp[0].get(), 0, 2);
+        enc->setBuffer(im.med[0].get(), 0, 3);
+        enc->setBuffer(im.claims.get(), 0, 4);
+        enc->setBytes(&da, sizeof(da), 5);
+        dispatch2d(im.detail.get(), fw, fh);
+        enc->memoryBarrier(MTL::BarrierScopeBuffers);
+        enc->setBuffer(im.med[0].get(), 0, 0);
+        enc->setBuffer(im.claims.get(), 0, 1);
+        enc->setBytes(&fa, sizeof(fa), 2);
+        dispatch2d(im.occl_claim.get(), fw, fh);
+        enc->memoryBarrier(MTL::BarrierScopeBuffers);
+        enc->setBuffer(im.med[0].get(), 0, 0);
+        enc->setBuffer(im.claims.get(), 0, 1);
+        enc->setBytes(&fa, sizeof(fa), 2);
+        dispatch2d(im.occl_apply.get(), fw, fh);
+        enc->memoryBarrier(MTL::BarrierScopeBuffers);
+        enc->setBuffer(im.med[0].get(), 0, 0);
+        enc->setBuffer(im.disp[0].get(), 0, 1);
+        enc->setBytes(&fa, sizeof(fa), 2);
+        dispatch2d(im.spike.get(), fw, fh);
+    }
+    gpu::profile::split(im.ctx->queue(), cmd, enc, "stereo/detail+filters");
+    // --- speckle removal: connected components on the GPU (same rule as depth::remove_speckles) ---
     if (im.p.speckle.max_region_size > 0) {
         const CclArgs cc{static_cast<std::uint32_t>(fw), static_cast<std::uint32_t>(fh), im.p.speckle.max_diff,
                          static_cast<std::uint32_t>(im.p.speckle.max_region_size)};

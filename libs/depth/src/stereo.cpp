@@ -196,6 +196,7 @@ void refine_level(ImageView<const std::uint8_t> left, ImageView<const std::uint8
                 }
             }
             if (best_k < 0 || best < p.min_zncc) continue;
+            if (p.reject_edge_winners && (best_k == 0 || best_k == nd - 1)) continue;
             float d = lo + kStep * static_cast<float>(best_k);
             if (subpixel && best_k > 0 && best_k + 1 < nd && scores[best_k - 1] > -2.0f && scores[best_k + 1] > -2.0f)
                 d += kStep * subpixel_offset(1.0f - scores[best_k - 1], 1.0f - best, 1.0f - scores[best_k + 1]);
@@ -205,7 +206,124 @@ void refine_level(ImageView<const std::uint8_t> left, ImageView<const std::uint8
     });
 }
 
+// ZNCC of an n x n full-resolution window with top-left (x0, y0) in `a` against `b` at disparity
+// D + gx * (X - cx) + gy * (Y - cy) (bilinear along the row in `b`); -2 when the window leaves `b`.
+float zncc_window(ImageView<const std::uint8_t> a, ImageView<const std::uint8_t> b, int x0, int y0, int n, float cx, float cy, float D,
+                  float gx, float gy) {
+    double sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
+    for (int j = 0; j < n; ++j) {
+        const int Y = y0 + j;
+        const std::uint8_t* ra = a.row(Y);
+        const std::uint8_t* rb = b.row(Y);
+        const float dy = gy * (static_cast<float>(Y) - cy);
+        for (int i = 0; i < n; ++i) {
+            const int X = x0 + i;
+            const float xb = static_cast<float>(X) - (D + gx * (static_cast<float>(X) - cx) + dy);
+            const int xi = static_cast<int>(std::floor(xb));
+            if (xi < 0 || xi + 1 >= b.width) return -2.0f;
+            const float f = xb - static_cast<float>(xi);
+            const double ib = rb[xi] * (1.0f - f) + rb[xi + 1] * f;
+            const double ia = ra[X];
+            sa += ia;
+            sb += ib;
+            saa += ia * ia;
+            sbb += ib * ib;
+            sab += ia * ib;
+        }
+    }
+    const double m = static_cast<double>(n) * n;
+    const double va = saa - sa * sa / m;
+    const double vb = sbb - sb * sb / m;
+    if (va < 1e-6 || vb < 1e-6) return -1.0f;
+    return static_cast<float>((sab - sa * sb / m) / std::sqrt(va * vb));
+}
+
 }  // namespace
+
+void refine_detail(ImageView<const std::uint8_t> full_left, ImageView<const std::uint8_t> full_right, ImageF32& disparity,
+                   const DetailParams& p, bool subpixel) {
+    if (!p.enabled || p.radius < 1 || p.step <= 0) return;
+    const ImageF32 first = disparity;
+    const int w = first.width(), h = first.height(), W = full_left.width, H = full_left.height;
+    const int K = std::min(16, static_cast<int>(std::lround(p.search / p.step)));
+    const int nc = 2 * K + 1, n = 2 * p.radius;
+    // Disparity gradient per pixel (the same at both resolutions: disparity and x both scale by 2).
+    auto grad = [&](float l, float c, float r) {
+        if (!valid_disparity(l) || !valid_disparity(r) || std::abs(r - c) >= 1.0f || std::abs(c - l) >= 1.0f) return 0.0f;
+        return std::clamp(0.5f * (r - l), -0.9f, 0.9f);
+    };
+    parallel_rows(h, [&](int y) {
+        float scores[33];
+        const int y0 = 2 * y - p.radius + 1;
+        if (y < 1 || y + 1 >= h || y0 < 0 || y0 + n > H) return;
+        for (int x = 1; x + 1 < w; ++x) {
+            const float d = first(x, y);
+            if (!valid_disparity(d)) continue;
+            const int x0 = 2 * x - p.radius + 1;
+            if (x0 < 0 || x0 + n > W) continue;
+            const float gx = grad(first(x - 1, y), d, first(x + 1, y)), gy = grad(first(x, y - 1), d, first(x, y + 1));
+            // The half-resolution pixel's centre in full-resolution pixels, and its disparity there.
+            const float cx = 2.0f * static_cast<float>(x) + 0.5f, cy = 2.0f * static_cast<float>(y) + 0.5f;
+            const float D0 = 2.0f * d;
+            float best = -2.0f;
+            int best_k = -1;
+            for (int k = 0; k < nc; ++k) {
+                scores[k] = zncc_window(full_left, full_right, x0, y0, n, cx, cy, D0 + p.step * static_cast<float>(k - K), gx, gy);
+                if (scores[k] > best) {
+                    best = scores[k];
+                    best_k = k;
+                }
+            }
+            // Keep the first estimate unless the small window finds a clear peak inside the search.
+            if (best_k <= 0 || best_k + 1 >= nc || best < p.min_zncc || scores[best_k - 1] <= -2.0f || scores[best_k + 1] <= -2.0f) continue;
+            float D = D0 + p.step * static_cast<float>(best_k - K);
+            if (subpixel) D += p.step * subpixel_offset(1.0f - scores[best_k - 1], 1.0f - best, 1.0f - scores[best_k + 1]);
+            disparity(x, y) = 0.5f * D;
+        }
+    });
+}
+
+void filter_disparity(ImageF32& disparity, const FilterParams& p) {
+    const int w = disparity.width(), h = disparity.height();
+    if (p.occlusion) {
+        // The nearest claimant of each right pixel (largest disparity) is the one it sees.
+        parallel_rows(h, [&](int y) {
+            std::vector<float> nearest(static_cast<std::size_t>(w), kInvalidDisparity);
+            for (int x = 0; x < w; ++x) {
+                const float d = disparity(x, y);
+                if (!valid_disparity(d)) continue;
+                const long xr = std::lround(static_cast<float>(x) - d);
+                if (xr >= 0 && xr < w) nearest[static_cast<std::size_t>(xr)] = std::max(nearest[static_cast<std::size_t>(xr)], d);
+            }
+            for (int x = 0; x < w; ++x) {
+                const float d = disparity(x, y);
+                if (!valid_disparity(d)) continue;
+                const long xr = std::lround(static_cast<float>(x) - d);
+                if (xr >= 0 && xr < w && d < nearest[static_cast<std::size_t>(xr)] - p.occlusion_tolerance) disparity(x, y) = kInvalidDisparity;
+            }
+        });
+    }
+    if (p.spikes) {
+        const ImageF32 in = disparity;
+        parallel_rows(h, [&](int y) {
+            float buf[9];
+            for (int x = 0; x < w; ++x) {
+                const float d = in(x, y);
+                if (!valid_disparity(d)) continue;
+                int n = 0;
+                for (int v = -1; v <= 1; ++v)
+                    for (int u = -1; u <= 1; ++u) {
+                        const int xx = x + u, yy = y + v;
+                        if (xx < 0 || yy < 0 || xx >= w || yy >= h || !valid_disparity(in(xx, yy))) continue;
+                        buf[n++] = in(xx, yy);
+                    }
+                if (n < 3) continue;  // (isolated pixels are the speckle filter's)
+                std::nth_element(buf, buf + n / 2, buf + n);
+                if (std::abs(d - buf[n / 2]) > p.spike_threshold) disparity(x, y) = kInvalidDisparity;
+            }
+        });
+    }
+}
 
 Image<std::uint64_t> census_transform(ImageView<const std::uint8_t> img, int rx, int ry) {
     Image<std::uint64_t> out(img.width, img.height, 0);
@@ -377,6 +495,12 @@ void remove_speckles(ImageF32& disparity, const SpeckleParams& p) {
 
 StereoResult compute_disparity(ImageView<const std::uint8_t> left, ImageView<const std::uint8_t> right,
                                const StereoParams& params) {
+    return compute_disparity(left, right, {}, {}, params);
+}
+
+StereoResult compute_disparity(ImageView<const std::uint8_t> left, ImageView<const std::uint8_t> right,
+                               ImageView<const std::uint8_t> full_left, ImageView<const std::uint8_t> full_right,
+                               const StereoParams& params) {
     std::vector<ImageU8> pyr_l, pyr_r;  // pyr[i] is level i+1 (half size each)
     ImageView<const std::uint8_t> cur_l = left, cur_r = right;
     for (int i = 0; i < params.pyramid_levels; ++i) {
@@ -401,6 +525,9 @@ StereoResult compute_disparity(ImageView<const std::uint8_t> left, ImageView<con
         disp = std::move(finer);
         result.confidence = std::move(conf);
     }
+    if (params.detail.enabled && full_left.width == 2 * left.width && full_left.height == 2 * left.height)
+        refine_detail(full_left, full_right, disp, params.detail, params.subpixel);
+    filter_disparity(disp, params.filter);
     remove_speckles(disp, params.speckle);
     for (std::size_t i = 0; i < disp.size(); ++i)
         if (!valid_disparity(disp.data()[i])) result.confidence.data()[i] = 0.0f;

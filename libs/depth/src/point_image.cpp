@@ -24,25 +24,31 @@ PointImage disparity_to_points(const ImageF32& disparity, const ImageF32& confid
         }
     });
 
-    // Normals from central differences, skipping depth discontinuities.
-    tbb::parallel_for(1, h - 1, [&](int y) {
-        for (int x = 1; x < w - 1; ++x) {
+    // Normals from central differences, skipping depth discontinuities; weights (PointImageParams).
+    const Vec3f right_centre(static_cast<float>(g.baseline), 0.0f, 0.0f);
+    tbb::parallel_for(0, h, [&](int y) {
+        for (int x = 0; x < w; ++x) {
             const Vec3f& p = out.points(x, y);
             if (p.z() == 0.0f) continue;
-            const Vec3f& l = out.points(x - 1, y);
-            const Vec3f& r = out.points(x + 1, y);
-            const Vec3f& u = out.points(x, y - 1);
-            const Vec3f& dn = out.points(x, y + 1);
-            if (l.z() == 0 || r.z() == 0 || u.z() == 0 || dn.z() == 0) continue;
-            if (std::abs(l.z() - r.z()) > params.max_depth_jump || std::abs(u.z() - dn.z()) > params.max_depth_jump) continue;
-            Vec3f n = (r - l).cross(dn - u);
-            const float len = n.norm();
-            if (len < 1e-9f) continue;
-            n /= len;
-            if (n.dot(p) > 0) n = -n;
-            out.normals(x, y) = n;
-            // Down-weight grazing surfaces: they are the least reliable.
-            out.weights(x, y) *= std::max(0.0f, -n.dot(p.normalized()));
+            float view = params.edge_weight;
+            if (x > 0 && y > 0 && x + 1 < w && y + 1 < h) {
+                const Vec3f& l = out.points(x - 1, y);
+                const Vec3f& r = out.points(x + 1, y);
+                const Vec3f& u = out.points(x, y - 1);
+                const Vec3f& dn = out.points(x, y + 1);
+                if (l.z() != 0 && r.z() != 0 && u.z() != 0 && dn.z() != 0 && std::abs(l.z() - r.z()) <= params.max_depth_jump &&
+                    std::abs(u.z() - dn.z()) <= params.max_depth_jump) {
+                    Vec3f n = (r - l).cross(dn - u);
+                    const float len = n.norm();
+                    if (len >= 1e-9f) {
+                        n /= len;
+                        if (n.dot(p) > 0) n = -n;
+                        out.normals(x, y) = n;
+                        view = std::max(0.0f, std::min(-n.dot(p.normalized()), -n.dot((p - right_centre).normalized())));
+                    }
+                }
+            }
+            out.weights(x, y) *= view * depth_noise_weight(p.z(), params.weight_reference_depth);
         }
     });
     return out;
