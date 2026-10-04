@@ -99,6 +99,9 @@ struct ProcessParams {
     // one or two missing cells and no real hole the model app could find (1 mm is 3.1 mm round);
     // EXStar's meshing closes up to 10 mm.
     double fill_holes_max_perimeter_mm = 2.5;
+    // A closed (watertight) mesh as well, by screened Poisson reconstruction of the mesh
+    // (ProcessResult::watertight; the mesh itself stays as it is). Off by default: ~15 s at 0.5 mm.
+    std::optional<WatertightParams> watertight;
     int smooth_iterations = 0;
     bool simplify = true;          // error-bounded decimation: flat areas lose triangles, detail stays
     SimplifyParams simplify_params;
@@ -134,6 +137,7 @@ struct ProcessReport {
 
 struct ProcessResult {
     TriangleMesh mesh;
+    TriangleMesh watertight;  // if ProcessParams::watertight
     std::map<std::size_t, SE3> frame_poses;  // session frame index -> optimised T_world_camera
     ProcessReport report;
 };

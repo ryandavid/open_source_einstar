@@ -100,7 +100,7 @@ int usage() {
                  "       calib-solve <captures dir> [--reference <calibration>] [--save <file>] [--no-distortion | --distortion-from <calibration>] |\n"
                  "       fixture-pack --out DIR [--mustang <Project1.ir_E10_prj>] [--stl mesh.stl] [--board <dir>] |\n"
                  "       track-fixture <project.ir_E10_prj> [--start N] [--count N] [--skip K] [--stl ref.stl] [--cpu] [--mode geometry|hybrid|markers] [--global-markers] [--marker-confirm N] [--record out.estr] [--quiet] |\n"
-                 "       process <session.estr> [-o mesh.stl|ply|obj] [--voxel MM] [--no-optimize] [--smooth N] [--stl reference.stl] [--reference-poses file] [--render out.pgm [--render-frame view.txt]] [--no-edge-filter | --edge-radius N --rim-radius N --min-region PX] [--grazing-weight] [--no-grazing-filter | --max-view-angle DEG --steep-rim PX --steep-rim-angle DEG] [--no-consistency | --consistency-tol MM --consistency-noise MM --consistency-radius MM --consistency-normal DEG] [--min-weight W] [--min-observations N] [--min-area MM2] [--isolation MM] [--min-component F] [--no-marker-flatten] [--fill-holes PERIMETER_MM] |\n"
+                 "       process <session.estr> [-o mesh.stl|ply|obj] [--voxel MM] [--no-optimize] [--smooth N] [--stl reference.stl] [--reference-poses file] [--render out.pgm [--render-frame view.txt]] [--no-edge-filter | --edge-radius N --rim-radius N --min-region PX] [--grazing-weight] [--no-grazing-filter | --max-view-angle DEG --steep-rim PX --steep-rim-angle DEG] [--no-consistency | --consistency-tol MM --consistency-noise MM --consistency-radius MM --consistency-normal DEG] [--min-weight W] [--min-observations N] [--min-area MM2] [--isolation MM] [--min-component F] [--no-marker-flatten] [--fill-holes PERIMETER_MM] [--watertight closed.stl [--poisson-weight W] [--poisson-cell MM]] |\n"
                  "       track-session <session.estr> [--fake-time] [--count N] [--cpu] |\n"
                  "       inspect <session.estr> [--dump-blob out.bin] [--detail] [--dump-depth out.pgm [--frame N]]");
     return 2;
@@ -2515,6 +2515,12 @@ int process_cmd(const char* path, std::span<char*> args) {
     pp.cleanup.isolation_mm = arg_double(args, "--isolation", pp.cleanup.isolation_mm);
     if (has_flag(args, "--no-marker-flatten")) pp.marker_flatten.reset();
     pp.fill_holes_max_perimeter_mm = arg_double(args, "--fill-holes", pp.fill_holes_max_perimeter_mm);
+    const char* watertight_out = arg_str(args, "--watertight");
+    if (watertight_out) {
+        pp.watertight = recon::WatertightParams{};
+        pp.watertight->point_weight = arg_double(args, "--poisson-weight", pp.watertight->point_weight);
+        pp.watertight->cell_mm = arg_double(args, "--poisson-cell", pp.watertight->cell_mm);
+    }
     std::string last_stage;
     pp.progress = [&](const std::string& stage, double) {
         if (stage != last_stage) {
@@ -2609,6 +2615,13 @@ int process_cmd(const char* path, std::span<char*> args) {
             return 1;
         }
         std::println("wrote {}", outp);
+    }
+    if (watertight_out) {
+        if (auto w = recon::save_mesh(r->watertight, watertight_out); !w) {
+            std::println(stderr, "{}", w.error().message);
+            return 1;
+        }
+        std::println("wrote {} (watertight: {} triangles)", watertight_out, r->watertight.triangles.size());
     }
     return 0;
 }

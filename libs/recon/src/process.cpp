@@ -665,6 +665,17 @@ Result<ProcessResult> process_session(const session::SessionReader& s, const Pro
         rep.markers_flattened = static_cast<int>(flatten_markers(out.mesh, discs, *params.marker_flatten));
     }
     rep.holes_filled = static_cast<int>(fill_small_holes(out.mesh, params.fill_holes_max_perimeter_mm));
+    if (params.watertight) {
+        progress(params, "Closing the surface", 0.0);
+        Stopwatch wt;
+        auto wp = *params.watertight;
+        if (wp.cell_mm <= 0) wp.cell_mm = params.tsdf.voxel_mm;
+        auto closed = watertight_mesh(out.mesh, wp);  // from the full-resolution mesh, before smoothing and decimation
+        if (!closed) return std::unexpected(closed.error());
+        out.watertight = std::move(*closed);
+        if (params.simplify) recon::simplify(out.watertight, params.simplify_params);
+        rep.stage_ms["watertight"] = wt.elapsed_ms();
+    }
     if (params.smooth_iterations > 0) taubin_smooth(out.mesh, params.smooth_iterations);
     if (params.simplify) {
         progress(params, "Simplifying", 0.0);
@@ -672,7 +683,7 @@ Result<ProcessResult> process_session(const session::SessionReader& s, const Pro
     }
     rep.vertices = out.mesh.vertices.size();
     rep.triangles = out.mesh.triangles.size();
-    rep.stage_ms["mesh"] = sw.elapsed_ms();
+    rep.stage_ms["mesh"] = sw.elapsed_ms() - (rep.stage_ms.contains("watertight") ? rep.stage_ms.at("watertight") : 0.0);
     rep.stage_ms["total"] = total.elapsed_ms();
     progress(params, "Done", 1.0);
     return out;

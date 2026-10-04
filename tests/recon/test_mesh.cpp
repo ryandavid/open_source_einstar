@@ -233,6 +233,49 @@ TEST_CASE("small holes are closed, consistently oriented; larger ones stay open"
     CHECK(m.normals.back().z() > 0.99f);  // the pinhole's new vertex
 }
 
+TEST_CASE("watertight: a sphere with a cap missing comes out closed") {
+    // A UV sphere (radius 20 mm, ~1 mm triangles) without the cap above 60 degrees latitude.
+    recon::TriangleMesh m;
+    const double r = 20;
+    const int rings = 64, segs = 128;
+    for (int i = 0; i <= rings; ++i)
+        for (int j = 0; j < segs; ++j) {
+            const double th = M_PI * i / rings, ph = 2 * M_PI * j / segs;
+            const Vec3 p(r * std::sin(th) * std::cos(ph), r * std::sin(th) * std::sin(ph), r * std::cos(th));
+            m.vertices.push_back(p.cast<float>());
+            m.normals.push_back(p.normalized().cast<float>());
+        }
+    auto id = [&](int i, int j) { return static_cast<std::uint32_t>(i * segs + (j % segs)); };
+    for (int i = 0; i < rings; ++i) {
+        if (M_PI * i / rings < M_PI / 6) continue;  // the cap
+        for (int j = 0; j < segs; ++j) {
+            m.triangles.push_back({id(i, j), id(i + 1, j), id(i + 1, j + 1)});
+            m.triangles.push_back({id(i, j), id(i + 1, j + 1), id(i, j + 1)});
+        }
+    }
+    recon::WatertightParams p;
+    p.cell_mm = 0.5;
+    auto closed = recon::watertight_mesh(m, p);
+    REQUIRE(closed.has_value());
+    REQUIRE(!closed->empty());
+    std::map<std::pair<std::uint32_t, std::uint32_t>, int> edges;
+    for (const auto& t : closed->triangles)
+        for (int e = 0; e < 3; ++e) {
+            const auto a = t[static_cast<std::size_t>(e)], b = t[static_cast<std::size_t>((e + 1) % 3)];
+            ++edges[{std::min(a, b), std::max(a, b)}];
+        }
+    const auto open = std::ranges::count_if(edges, [](const auto& kv) { return kv.second != 2; });
+    double worst = 0;
+    for (const auto& v : closed->vertices)
+        if (v.z() < 0.8 * r) worst = std::max(worst, std::abs(v.cast<double>().norm() - r));  // where there was data
+    std::println("watertight sphere: {} triangles, {} edges not shared by two, radial error {:.3f} mm where scanned",
+                 closed->triangles.size(), open, worst);
+    CHECK(open == 0);
+    CHECK(worst < 0.2);
+    // Outward normals: the surface encloses the centre.
+    CHECK(closed->normals.front().dot(closed->vertices.front().normalized()) > 0.9f);
+}
+
 TEST_CASE("simplification keeps the shape, manifoldness and orientation") {
     track::TsdfParams tp;
     tp.voxel_mm = 0.5f;

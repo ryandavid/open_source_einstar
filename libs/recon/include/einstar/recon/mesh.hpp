@@ -90,6 +90,17 @@ std::size_t flatten_markers(TriangleMesh& mesh, const std::vector<MarkerDisc>& m
 // Closes holes whose boundary is a simple loop no longer than `max_perimeter_mm`: a fan around a new
 // vertex at the loop's centroid (a triangle for three edges). Returns the number of holes closed.
 std::size_t fill_small_holes(TriangleMesh& mesh, double max_perimeter_mm);
+// A closed surface from a scan's mesh: screened Poisson reconstruction (PoissonRecon) of its vertices
+// and normals, so holes are bridged by a smooth surface and the result encloses a volume. Pieces it
+// makes from stray samples are removed as in remove_small_components.
+struct WatertightParams {
+    double cell_mm = 0;            // finest octree cell; 0 = 0.5 mm (in the process step: its voxel size)
+    double point_weight = 2.0;     // screening weight (PoissonRecon's default; EXStar uses 3)
+    double samples_per_node = 1.5;
+    CleanupParams cleanup;
+};
+[[nodiscard]] Result<TriangleMesh> watertight_mesh(const TriangleMesh& surface, const WatertightParams& params = {});
+
 // Taubin (lambda/mu) smoothing: reduces voxel-scale noise without shrinking the surface.
 void taubin_smooth(TriangleMesh& mesh, int iterations = 5, float lambda = 0.5f, float mu = -0.53f);
 

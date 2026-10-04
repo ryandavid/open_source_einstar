@@ -51,6 +51,15 @@ FetchContent_MakeAvailable(nanoflann)
 add_library(nanoflann_headers INTERFACE)
 target_include_directories(nanoflann_headers SYSTEM INTERFACE ${nanoflann_SOURCE_DIR}/include)
 
+# PoissonRecon (MIT, M. Kazhdan): screened Poisson surface reconstruction, header/template code used
+# by libs/recon for the optional watertight mesh. No release tags since V8: pinned to a commit.
+FetchContent_Declare(poissonrecon
+  URL https://github.com/mkazhdan/PoissonRecon/archive/262b0f539d404057d1f36e1adc07fc9388678899.tar.gz
+  DOWNLOAD_EXTRACT_TIMESTAMP ON)
+FetchContent_MakeAvailable(poissonrecon)
+add_library(poissonrecon_headers INTERFACE)
+target_include_directories(poissonrecon_headers SYSTEM INTERFACE ${poissonrecon_SOURCE_DIR}/Src)
+
 # metal-cpp: header-only C++ bindings for Metal.
 FetchContent_Declare(metal_cpp
   URL https://developer.apple.com/metal/cpp/files/metal-cpp_macOS15_iOS18.zip
