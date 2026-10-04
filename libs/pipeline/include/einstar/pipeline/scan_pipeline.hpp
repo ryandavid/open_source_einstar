@@ -5,6 +5,7 @@
 // and reported (never silent).
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -215,8 +216,14 @@ public:
     void set_record_raw_ir(bool on) { record_raw_ir_ = on; }
     [[nodiscard]] bool record_raw_ir() const { return record_raw_ir_; }
 
-    // Called from the device thread; never blocks.
+    // Called from the device thread; never blocks (unless block_when_full). Frame numbers and timestamps
+    // are made to increase across stream restarts (the scanner starts both over when streaming restarts,
+    // e.g. after a settings change), so every frame in a recording keeps a unique number.
     void push(usb::FrameGroup&& group);
+    // Waits until every frame pushed so far has been processed (not from the worker thread).
+    void drain();
+    // Which stream sensor is the left IR camera, when known (a replay); otherwise the first frame decides.
+    void set_left_sensor(int sensor);
 
     [[nodiscard]] const track::Tracker& tracker() const { return tracker_; }
     [[nodiscard]] std::vector<SE3> trajectory() const;
@@ -292,6 +299,14 @@ private:
     std::condition_variable space_cv_;
     std::deque<usb::FrameGroup> queue_;
     std::atomic<std::uint64_t> frames_in_{0}, dropped_{0};
+    // Monotonic numbering across stream restarts (push() only).
+    struct Numbering {
+        bool any = false;
+        std::uint64_t last_id = 0, last_time_us = 0;
+        std::int64_t id_offset = 0, time_offset_us = 0;
+        std::chrono::steady_clock::time_point last_arrival;
+    } numbering_;
+    std::mutex numbering_mutex_;
     std::atomic<bool> reset_requested_{false};
     std::atomic<bool> discard_on_reset_{true};
     bool order_detected_ = false;

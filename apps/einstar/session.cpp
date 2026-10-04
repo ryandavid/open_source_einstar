@@ -143,6 +143,7 @@ Result<std::unique_ptr<Session>> Session::open(bool emulator, UpdateSink updates
     record.R_rect_left = frontend->rectification().R_left;
     record.R_rect_right = frontend->rectification().R_right;
     record.rectified = frontend->rectification().rectified;
+    record.rectified_right = frontend->rectification().rectified_right;
     s->pipeline_ = std::make_unique<pipeline::ScanPipeline>(std::move(frontend), pp, std::move(updates));
     s->pipeline_->set_device_record(std::move(record));
     // Every scan is recorded so the process step can use every frame.
@@ -160,8 +161,15 @@ Result<std::unique_ptr<Session>> Session::open_offline(const session::DeviceReco
     auto s = std::unique_ptr<Session>(new Session());
     pipeline::ScanPipelineParams pp;
     pp.block_when_full = true;
-    s->pipeline_ = std::make_unique<pipeline::ScanPipeline>(std::make_unique<pipeline::StereoFrontend>(recorded.rig), pp, std::move(updates));
-    s->pipeline_->set_device_record(recorded);
+    auto frontend = std::make_unique<pipeline::StereoFrontend>(recorded.rig);
+    // New frames are rectified as this build does it (the recording may predate a change).
+    session::DeviceRecord record = recorded;
+    record.R_rect_left = frontend->rectification().R_left;
+    record.R_rect_right = frontend->rectification().R_right;
+    record.rectified = frontend->rectification().rectified;
+    record.rectified_right = frontend->rectification().rectified_right;
+    s->pipeline_ = std::make_unique<pipeline::ScanPipeline>(std::move(frontend), pp, std::move(updates));
+    s->pipeline_->set_device_record(record);
     s->pipeline_->start();
     s->offline_info_.vendor_name = recorded.vendor;
     s->offline_info_.product_name = recorded.product.empty() ? "Einstar" : recorded.product;

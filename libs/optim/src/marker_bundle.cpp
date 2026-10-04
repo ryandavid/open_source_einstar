@@ -18,10 +18,10 @@ struct StereoReprojection {
         const Eigen::Matrix<T, 3, 1> Xw(X[0], X[1], X[2]);
         const Eigen::Matrix<T, 3, 1> p = quat * Xw + Eigen::Matrix<T, 3, 1>(t[0], t[1], t[2]);
         if (p.z() <= T(1e-3)) return false;
-        const T f(g_.f), cx(g_.cx), cy(g_.cy), B(g_.baseline);
+        const T f(g_.f), cx(g_.cx), cxr(g_.right_cx()), cy(g_.cy), B(g_.baseline);
         res[0] = f * p.x() / p.z() + cx - T(l_.x());
         res[1] = f * p.y() / p.z() + cy - T(l_.y());
-        res[2] = f * (p.x() - B) / p.z() + cx - T(r_.x());
+        res[2] = f * (p.x() - B) / p.z() + cxr - T(r_.x());
         res[3] = f * p.y() / p.z() + cy - T(r_.y());
         return true;
     }
@@ -39,7 +39,7 @@ Eigen::Vector4d residual(const MarkerBundle& b, const MarkerObservation& o) {
     const Vec3 p = T_cw * b.markers.at(o.marker);
     const auto& g = b.geometry;
     return {g.f * p.x() / p.z() + g.cx - o.left.x(), g.f * p.y() / p.z() + g.cy - o.left.y(),
-            g.f * (p.x() - g.baseline) / p.z() + g.cx - o.right.x(), g.f * p.y() / p.z() + g.cy - o.right.y()};
+            g.f * (p.x() - g.baseline) / p.z() + g.right_cx() - o.right.x(), g.f * p.y() / p.z() + g.cy - o.right.y()};
 }
 
 }  // namespace

@@ -14,6 +14,7 @@ int main(int argc, char** argv) {
     const auto setup = e2e::make_scene();
     pipeline::StereoFrontendParams fp_cpu_previews;
     fp_cpu_previews.cpu_previews = true;
+    if (const char* ref = std::getenv("REF_DEPTH")) fp_cpu_previews.reference_depth_mm = std::atof(ref);
     pipeline::StereoFrontend fe(rig, fp_cpu_previews);
     long counts[4][3] = {};  // distance band x {total, >0.5 mm, >2 mm}
     long kind[3][3] = {};    // {interior, hole border, depth jump} x {total, >0.5, >2}

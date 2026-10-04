@@ -19,10 +19,10 @@ MarkerStereo::MarkerStereo(const RigCalibration& rig, const calib::StereoRectifi
     : rig_(rig), rect_(rect), params_(std::move(params)) {}
 
 Vec2 MarkerStereo::rectify_left(const Vec2& raw) const { return to_rectified(rig_.left, rect_.R_left, rect_.rectified, raw); }
-Vec2 MarkerStereo::rectify_right(const Vec2& raw) const { return to_rectified(rig_.right, rect_.R_right, rect_.rectified, raw); }
+Vec2 MarkerStereo::rectify_right(const Vec2& raw) const { return to_rectified(rig_.right, rect_.R_right, rect_.rectified_right, raw); }
 
 std::vector<Marker3D> MarkerStereo::reconstruct(const std::vector<Ellipse>& left, const std::vector<Ellipse>& right,
-                                                const DisparityPrior& prior) const {
+                                                const DepthPrior& prior) const {
     const auto& g = rect_.geometry;
     std::vector<Vec2> rl(left.size()), rr(right.size());
     for (std::size_t i = 0; i < left.size(); ++i) rl[i] = rectify_left(left[i].center);
@@ -34,7 +34,7 @@ std::vector<Marker3D> MarkerStereo::reconstruct(const std::vector<Ellipse>& left
         Marker3D m;
     };
     std::vector<Candidate> cands;
-    std::vector<double> priors(left.size(), -1.0);
+    std::vector<double> priors(left.size(), -1.0);  // depth, mm
     if (prior)
         for (std::size_t i = 0; i < left.size(); ++i) priors[i] = prior(rl[i], left[i].a);
     for (std::size_t i = 0; i < left.size(); ++i)
@@ -42,19 +42,19 @@ std::vector<Marker3D> MarkerStereo::reconstruct(const std::vector<Ellipse>& left
             const double dy = std::abs(rl[i].y() - rr[j].y());
             if (dy > params_.max_row_error_px) continue;
             const double d = rl[i].x() - rr[j].x();
-            if (d <= 0) continue;
+            if (d + g.cx_offset <= 0) continue;  // at or beyond infinity
             double prior_err = 0;
             {
-                const double dp = priors[i];
-                if (prior && params_.require_prior && dp < 0) {
+                const double zp = priors[i];
+                if (prior && params_.require_prior && zp < 0) {
                     // No surface around it: only acceptable where dense stereo cannot exist anyway (the
                     // right view of this point falls outside the rectified image).
-                    const auto& rc = rect_.rectified;
+                    const auto& rc = rect_.rectified_right;
                     const bool unverifiable = rr[j].x() < 0 || rr[j].x() >= rc.width || rr[j].y() < 0 || rr[j].y() >= rc.height;
                     if (!unverifiable) continue;
                 }
-                if (dp > 0) {
-                    prior_err = std::abs(d - dp);
+                if (zp > 0) {
+                    prior_err = std::abs(d - g.disparity_from_depth(zp));
                     if (prior_err > params_.prior_tolerance_px) continue;
                 }
             }

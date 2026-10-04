@@ -13,6 +13,7 @@
 #include <set>
 #include <thread>
 
+#include "einstar/pipeline/replay.hpp"
 #include "einstar/pipeline/scan_pipeline.hpp"
 #include "einstar/recon/process.hpp"
 #include "einstar/session/session.hpp"
@@ -102,6 +103,69 @@ TEST_CASE("live recording keeps every frame that reaches the host") {
             CHECK(std::equal(img.pixels().begin(), img.pixels().end(), orig.begin(), orig.end()));
         }
     }
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("a recording's raw IR replays through the pipeline with every frame processed") {
+    // Live, the 3-deep queue drops five of eight frames; their raw IR is kept, so a replay processes all
+    // eight (in order, none dropped) into a new recording of the same scanner.
+    const RigCalibration rig = e2e::einstar_like_rig();
+    const auto setup = e2e::make_scene();
+    const auto dir = std::filesystem::temp_directory_path() / "einstar_test_replay";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    std::string live;
+    {
+        pipeline::ScanPipelineParams pp;
+        pp.queue_capacity = 3;
+        pp.record_raw_ir = true;
+        pipeline::ScanPipeline pipe(std::make_unique<pipeline::StereoFrontend>(rig), pp, [](pipeline::LiveUpdate&&) {});
+        pipe.set_recording_directory(dir.string());
+        session::DeviceRecord dev;
+        dev.serial = "TESTSERIAL";
+        dev.rig = rig;
+        pipe.set_device_record(dev);
+        // A stream restart halfway: the scanner counts from 10 again.
+        for (std::uint32_t k = 0; k < 8; ++k) {
+            const std::uint32_t id = 10 + k % 4;
+            usb::FrameGroup g;
+            g.frame_id = id;
+            g.timestamp = static_cast<std::uint64_t>(id) * 68000;
+            for (int sensor = 0; sensor < 2; ++sensor) {
+                usb::StreamFrame f;
+                f.sensor = sensor;
+                f.frame_id = id;
+                e2e::render_sensor(setup, rig, e2e::truth_pose(10 + k), sensor, k * 3 + static_cast<std::uint32_t>(sensor), f.pixels);
+                g.sensors[static_cast<std::size_t>(sensor)] = std::move(f);
+            }
+            pipe.push(std::move(g));
+        }
+        pipe.start();
+        live = pipe.flush_recording();
+        pipe.stop();
+    }
+    auto in = session::SessionReader::open(live);
+    REQUIRE(in.has_value());
+    REQUIRE((*in)->raw_count() == 8);
+    std::set<std::uint64_t> raw_numbers;
+    for (std::size_t i = 0; i < 8; ++i) raw_numbers.insert((*in)->raw_index(i));
+    CHECK(raw_numbers.size() == 8);  // unique across the restart
+    CHECK((*in)->frame_count() + (*in)->dropped().size() == 8);
+
+    const auto out = (dir / "replayed.estr").string();
+    auto r = pipeline::replay_recording(**in, out);
+    REQUIRE(r.has_value());
+    CHECK(r->pushed == 8);
+    CHECK(r->processed == 8);
+    REQUIRE(r->files.size() == 1);
+    CHECK(r->files.back() == out);
+    auto rep = session::SessionReader::open(out);
+    REQUIRE(rep.has_value());
+    CHECK((*rep)->frame_count() == 8);
+    CHECK((*rep)->dropped().empty());
+    REQUIRE((*rep)->device().has_value());
+    CHECK((*rep)->device()->serial == "TESTSERIAL");
+    for (std::size_t i = 0; i < 8; ++i) CHECK((*rep)->meta(i).index == (*in)->raw_index(i));
     std::filesystem::remove_all(dir);
 }
 

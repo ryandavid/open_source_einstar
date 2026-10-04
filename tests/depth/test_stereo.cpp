@@ -132,7 +132,7 @@ TEST_CASE("sgm alone on a fronto-parallel plane gives the expected integer dispa
     int good = 0, valid = 0;
     for (int y = 20; y < disp.height() - 20; ++y)
         for (int x = 200; x < disp.width() - 20; ++x) {
-            if (disp(x, y) < 0) continue;
+            if (!depth::valid_disparity(disp(x, y))) continue;
             ++valid;
             if (std::abs(disp(x, y) - expected) < 0.5) ++good;
         }

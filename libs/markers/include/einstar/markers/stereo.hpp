@@ -27,7 +27,7 @@ struct StereoParams {
     std::vector<double> diameters{6.0};
     double diameter_tolerance = 0.35;  // relative
     double max_size_mismatch = 0.35;   // relative difference of the left/right apparent sizes after depth scaling
-    double prior_tolerance_px = 6.0;   // |d - d_prior| when a disparity prior is available
+    double prior_tolerance_px = 6.0;   // |d - d_prior| (full-resolution px) when a depth prior is available
     // Only accept markers whose surroundings have depth (a prior was given but has no value for this
     // marker): stickers sit on scanned surfaces, and unverifiable pairings are the main source of
     // phantom markers floating in front of the scene.
@@ -42,15 +42,15 @@ public:
     [[nodiscard]] Vec2 rectify_left(const Vec2& raw) const;
     [[nodiscard]] Vec2 rectify_right(const Vec2& raw) const;
 
-    // Expected full-resolution rectified disparity at a rectified-left marker of the given apparent
-    // radius (px), e.g. from the dense speckle depth around it. 0 = cannot be checked (e.g. outside the
-    // depth image); negative = checked, but there is no surface around the marker.
-    using DisparityPrior = std::function<double(const Vec2& left_rect, double radius_px)>;
+    // Expected depth (mm) at a rectified-left marker of the given apparent radius (full-resolution px),
+    // e.g. from the dense speckle depth around it. 0 = cannot be checked (e.g. outside the depth
+    // image); negative = checked, but there is no surface around the marker.
+    using DepthPrior = std::function<double(const Vec2& left_rect, double radius_px)>;
 
     // Ambiguous correspondences (repeated patterns on the same scanline) are only resolved with a
     // prior; without one they are dropped rather than risk a wrong 3D marker.
     [[nodiscard]] std::vector<Marker3D> reconstruct(const std::vector<Ellipse>& left, const std::vector<Ellipse>& right,
-                                                    const DisparityPrior& prior = {}) const;
+                                                    const DepthPrior& prior = {}) const;
 
     [[nodiscard]] const calib::StereoRectification& rectification() const { return rect_; }
 

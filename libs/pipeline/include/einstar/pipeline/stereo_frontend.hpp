@@ -22,6 +22,9 @@ struct StereoFrontendParams {
     StereoBackend backend = StereoBackend::automatic;
     double min_depth_mm = 150.0;
     double max_depth_mm = 700.0;
+    // Where both rectified images show the same columns (calib::RectificationOptions): near the middle
+    // of the depths scanned (most lie between 240 and 450 mm), so the fewest columns are lost either way.
+    double reference_depth_mm = 320.0;
     depth::RefineParams refine;
     depth::SpeckleParams speckle{100, 1.0f};
     bool detect_markers = true;

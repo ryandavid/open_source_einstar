@@ -8,7 +8,7 @@
 
 namespace einstar::calib {
 
-StereoRectification compute_rectification(const RigCalibration& rig, double scale) {
+StereoRectification compute_rectification(const RigCalibration& rig, const RectificationOptions& options) {
     StereoRectification out;
     // Relative pose: right camera coords = R * left coords + t.
     const Mat3 R = rig.T_right_left.linear();
@@ -37,23 +37,63 @@ StereoRectification compute_rectification(const RigCalibration& rig, double scal
     out.R_left = r_align * l_half;
     out.R_right = r_align * r_half;
 
-    // Shared intrinsics: conservative focal length, principal point from the average of where
-    // each original image centre lands after rectification.
+    // Intrinsics: one focal length (the smallest, so no image is upsampled) and one cy for both. The
+    // window is placed on what both cameras see: each sensor's outline is mapped into the rectified
+    // frame, the right one moved by the disparity of the reference depth, and the window centred on
+    // their overlap. With the right camera's principal point shifted by that disparity, the scene at the
+    // reference depth then occupies the same columns in both images.
+    const double scale = options.scale;
     const double f = std::min({rig.left.fx, rig.left.fy, rig.right.fx, rig.right.fy}) * scale;
-    auto rectified_center = [&](const CameraModel& cam, const Mat3& r) {
-        const Vec2 n = undistort_to_normalized(cam, Vec2(cam.width * 0.5, cam.height * 0.5));
-        const Vec3 ray = r * Vec3(n.x(), n.y(), 1.0);
-        return Vec2(ray.x() / ray.z(), ray.y() / ray.z());
+    // A sensor's extent in rectified coordinates (no principal point): mean of each edge's samples,
+    // which ignores the corners that rectification rotates out of line.
+    struct Extent { double x0, x1, y0, y1; };
+    auto extent = [&](const CameraModel& cam, const Mat3& r) {
+        constexpr int kSamples = 64;
+        auto map = [&](double px, double py) {
+            const Vec2 n = undistort_to_normalized(cam, Vec2(px, py));
+            const Vec3 ray = r * Vec3(n.x(), n.y(), 1.0);
+            return Vec2(f * ray.x() / ray.z(), f * ray.y() / ray.z());
+        };
+        Extent e{0, 0, 0, 0};
+        const double sw = cam.width - 1.0, sh = cam.height - 1.0;
+        for (int i = 0; i < kSamples; ++i) {
+            const double s = (i + 0.5) / kSamples;
+            e.x0 += map(0, s * sh).x() / kSamples;
+            e.x1 += map(sw, s * sh).x() / kSamples;
+            e.y0 += map(s * sw, 0).y() / kSamples;
+            e.y1 += map(s * sw, sh).y() / kSamples;
+        }
+        return e;
     };
-    const Vec2 c = 0.5 * (rectified_center(rig.left, out.R_left) + rectified_center(rig.right, out.R_right));
+    const Extent el = extent(rig.left, out.R_left), er = extent(rig.right, out.R_right);
+    const double baseline = rig.baseline_mm();
+    const double shift = options.reference_depth_mm > 0 ? f * baseline / options.reference_depth_mm : 0.0;
+    // Overlap at the reference depth, in left rectified coordinates: a right coordinate u is seen by
+    // the left camera at u + f * B / z.
+    const double ox0 = std::max(el.x0, er.x0 + shift), ox1 = std::min(el.x1, er.x1 + shift);
+    const double oy0 = std::max(el.y0, er.y0), oy1 = std::min(el.y1, er.y1);
     const int w = static_cast<int>(std::lround(rig.left.width * scale));
     const int h = static_cast<int>(std::lround(rig.left.height * scale));
     out.rectified.width = w;
     out.rectified.height = h;
     out.rectified.fx = out.rectified.fy = f;
-    out.rectified.cx = w * 0.5 - f * c.x();
-    out.rectified.cy = h * 0.5 - f * c.y();
-    out.geometry = {f, out.rectified.cx, out.rectified.cy, rig.baseline_mm()};
+    if (options.reference_depth_mm > 0 && ox1 > ox0 && oy1 > oy0) {
+        out.rectified.cx = 0.5 * (w - 1) - 0.5 * (ox0 + ox1);
+        out.rectified.cy = 0.5 * (h - 1) - 0.5 * (oy0 + oy1);
+    } else {
+        // One shared principal point: the average of where each image centre lands (the old layout).
+        auto rectified_center = [&](const CameraModel& cam, const Mat3& r) {
+            const Vec2 n = undistort_to_normalized(cam, Vec2(cam.width * 0.5, cam.height * 0.5));
+            const Vec3 ray = r * Vec3(n.x(), n.y(), 1.0);
+            return Vec2(ray.x() / ray.z(), ray.y() / ray.z());
+        };
+        const Vec2 c = 0.5 * (rectified_center(rig.left, out.R_left) + rectified_center(rig.right, out.R_right));
+        out.rectified.cx = w * 0.5 - f * c.x();
+        out.rectified.cy = h * 0.5 - f * c.y();
+    }
+    out.rectified_right = out.rectified;
+    out.rectified_right.cx = out.rectified.cx + shift;
+    out.geometry = {f, out.rectified.cx, out.rectified.cy, baseline, shift};
     return out;
 }
 

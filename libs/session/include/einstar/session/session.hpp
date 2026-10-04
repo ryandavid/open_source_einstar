@@ -44,6 +44,7 @@
 #include "einstar/core/image.hpp"
 #include "einstar/core/lasso.hpp"
 #include "einstar/core/se3.hpp"
+#include "einstar/depth/point_image.hpp"
 #include "einstar/markers/marker_map.hpp"
 #include "einstar/track/frame.hpp"
 
@@ -56,7 +57,8 @@ struct DeviceRecord {
     RigCalibration rig;                          // decoded from the blob
     Mat3 R_rect_left = Mat3::Identity();         // rectifying rotations used live (original -> rectified)
     Mat3 R_rect_right = Mat3::Identity();
-    CameraModel rectified;                       // full-resolution rectified camera (no distortion)
+    CameraModel rectified;                       // full-resolution rectified left camera (no distortion)
+    CameraModel rectified_right;                 // the right one (its cx differs; older files: = rectified)
 };
 
 // Settings the frame was captured with (as last sent to the scanner).
@@ -103,7 +105,9 @@ struct SessionHeader {
     track::Intrinsics depth_intrinsics;  // of the stored depth images (rectified left camera)
     // Full-resolution rectified stereo geometry (for marker bundle adjustment).
     double rect_f = 0, rect_cx = 0, rect_cy = 0, baseline_mm = 0;
+    double rect_cx_offset = 0;  // right camera's cx - left cx (0 in older files, which had one cx)
     std::string description;
+    [[nodiscard]] depth::RectifiedGeometry rectified_geometry() const { return {rect_f, rect_cx, rect_cy, baseline_mm, rect_cx_offset}; }
 };
 
 enum FrameFlags : std::uint32_t {

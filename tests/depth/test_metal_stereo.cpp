@@ -72,7 +72,7 @@ TEST_CASE("Metal stereo matches the CPU reference") {
     const Pair pr = make_pair();
     const auto rect = calib::compute_rectification(pr.rig);
     const auto ml = calib::build_remap(pr.rig.left, rect.R_left, rect.rectified);
-    const auto mr = calib::build_remap(pr.rig.right, rect.R_right, rect.rectified);
+    const auto mr = calib::build_remap(pr.rig.right, rect.R_right, rect.rectified_right);
 
     // CPU reference path (as in the stereo frontend).
     const auto hl = depth::downsample2(calib::remap(pr.left.view(), ml).view());
@@ -80,7 +80,7 @@ TEST_CASE("Metal stereo matches the CPU reference") {
     depth::StereoParams sp;
     sp.pyramid_levels = 1;
     const auto& g = rect.geometry;
-    sp.sgm.min_disparity = static_cast<int>(g.disparity_from_depth(700) / 4) - 2;
+    sp.sgm.min_disparity = static_cast<int>(std::floor(g.disparity_from_depth(700) / 4)) - 2;
     sp.sgm.num_disparities = static_cast<int>(g.disparity_from_depth(150) / 4) - sp.sgm.min_disparity + 4;
     Stopwatch sw;
     const auto cpu = depth::compute_disparity(hl.view(), hr.view(), sp);
@@ -104,12 +104,12 @@ TEST_CASE("Metal stereo matches the CPU reference") {
     int both = 0, only_cpu = 0, only_gpu = 0, close = 0;
     for (std::size_t i = 0; i < cpu.disparity.size(); ++i) {
         const float a = cpu.disparity.data()[i], b = res->disparity.data()[i];
-        if (a >= 0 && b >= 0) {
+        if (depth::valid_disparity(a) && depth::valid_disparity(b)) {
             ++both;
             if (std::abs(a - b) <= 0.25f) ++close;
-        } else if (a >= 0) {
+        } else if (depth::valid_disparity(a)) {
             ++only_cpu;
-        } else if (b >= 0) {
+        } else if (depth::valid_disparity(b)) {
             ++only_gpu;
         }
     }
@@ -126,19 +126,16 @@ TEST_CASE("Metal stereo produces GPU-resident frames matching the CPU point conv
     const Pair pr = make_pair();
     const auto rect = calib::compute_rectification(pr.rig);
     const auto ml = calib::build_remap(pr.rig.left, rect.R_left, rect.rectified);
-    const auto mr = calib::build_remap(pr.rig.right, rect.R_right, rect.rectified);
+    const auto mr = calib::build_remap(pr.rig.right, rect.R_right, rect.rectified_right);
     depth::StereoParams sp;
     sp.pyramid_levels = 1;
     const auto& g = rect.geometry;
-    sp.sgm.min_disparity = static_cast<int>(g.disparity_from_depth(700) / 4) - 2;
+    sp.sgm.min_disparity = static_cast<int>(std::floor(g.disparity_from_depth(700) / 4)) - 2;
     sp.sgm.num_disparities = static_cast<int>(g.disparity_from_depth(150) / 4) - sp.sgm.min_disparity + 4;
     auto gpu = depth_metal::MetalStereo::create(*ctx, sp, ml.width / 2, ml.height / 2);
     REQUIRE(gpu.has_value());
     REQUIRE((*gpu)->set_rectification(ml, mr, pr.left.width(), pr.left.height()).has_value());
-    depth::RectifiedGeometry half = g;
-    half.f = g.f / 2;
-    half.cx = (g.cx + 0.5) / 2 - 0.5;
-    half.cy = (g.cy + 0.5) / 2 - 0.5;
+    const depth::RectifiedGeometry half = g.scaled(1);
     (*gpu)->set_point_params(half, 150.0f, 700.0f, 4.0f);
 
     // Reference: GPU disparity (already speckle-filtered on the GPU) converted on the CPU.
@@ -209,19 +206,16 @@ TEST_CASE("compute_frame (raw images used in place, previews, blobs) matches the
     }
     const auto rect = calib::compute_rectification(pr.rig);
     const auto ml = calib::build_remap(pr.rig.left, rect.R_left, rect.rectified);
-    const auto mr = calib::build_remap(pr.rig.right, rect.R_right, rect.rectified);
+    const auto mr = calib::build_remap(pr.rig.right, rect.R_right, rect.rectified_right);
     depth::StereoParams sp;
     sp.pyramid_levels = 1;
     const auto& g = rect.geometry;
-    sp.sgm.min_disparity = static_cast<int>(g.disparity_from_depth(700) / 4) - 2;
+    sp.sgm.min_disparity = static_cast<int>(std::floor(g.disparity_from_depth(700) / 4)) - 2;
     sp.sgm.num_disparities = static_cast<int>(g.disparity_from_depth(150) / 4) - sp.sgm.min_disparity + 4;
     auto gpu = depth_metal::MetalStereo::create(*ctx, sp, ml.width / 2, ml.height / 2);
     REQUIRE(gpu.has_value());
     REQUIRE((*gpu)->set_rectification(ml, mr, pr.left.width(), pr.left.height()).has_value());
-    depth::RectifiedGeometry half = g;
-    half.f = g.f / 2;
-    half.cx = (g.cx + 0.5) / 2 - 0.5;
-    half.cy = (g.cy + 0.5) / 2 - 0.5;
+    const depth::RectifiedGeometry half = g.scaled(1);
     (*gpu)->set_point_params(half, 150.0f, 700.0f, 4.0f);
     (*gpu)->set_blob_params({});
     REQUIRE(reinterpret_cast<std::uintptr_t>(pr.left.data()) % kImagePageBytes == 0);  // eligible for in-place use

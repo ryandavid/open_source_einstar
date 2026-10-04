@@ -9,8 +9,8 @@
 #include <chrono>
 #include <filesystem>
 #include <format>
-#include <map>
 #include <future>
+#include <map>
 #include <set>
 
 namespace einstar::pipeline {
@@ -364,6 +364,7 @@ session::SessionWriter* ScanPipeline::ensure_recorder() {
     h.rect_cx = g.cx;
     h.rect_cy = g.cy;
     h.baseline_mm = g.baseline;
+    h.rect_cx_offset = g.cx_offset;
     h.description = "live scan";
     auto w = session::SessionWriter::create(path, h);
     if (!w) {
@@ -509,6 +510,31 @@ void ScanPipeline::fill_marker_overlays(const track::TrackResult& r, const Depth
 }
 
 void ScanPipeline::push(usb::FrameGroup&& group) {
+    {
+        // The scanner counts frames and keeps time from the start of each stream: a restart would repeat
+        // numbers (and move time backwards) within one recording. Continue past the last frame instead,
+        // by the time that passed on the host (at least one frame period).
+        std::lock_guard lock(numbering_mutex_);
+        auto& n = numbering_;
+        const auto now = std::chrono::steady_clock::now();
+        auto id = static_cast<std::uint64_t>(static_cast<std::int64_t>(group.frame_id) + n.id_offset);
+        auto t = static_cast<std::uint64_t>(static_cast<std::int64_t>(group.timestamp) + n.time_offset_us);
+        if (n.any && (id <= n.last_id || t <= n.last_time_us)) {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - n.last_arrival).count();
+            const std::uint64_t next_t = n.last_time_us + static_cast<std::uint64_t>(std::max<std::int64_t>(elapsed, 22'676));
+            n.id_offset = static_cast<std::int64_t>(n.last_id + 1) - static_cast<std::int64_t>(group.frame_id);
+            n.time_offset_us = static_cast<std::int64_t>(next_t) - static_cast<std::int64_t>(group.timestamp);
+            log::info("frame numbering: the stream restarted at frame {} (after {}); continuing from {}", group.frame_id, n.last_id, n.last_id + 1);
+            id = n.last_id + 1;
+            t = next_t;
+        }
+        n.any = true;
+        n.last_id = id;
+        n.last_time_us = t;
+        n.last_arrival = now;
+        group.frame_id = static_cast<std::uint32_t>(id);
+        group.timestamp = t;
+    }
     ++frames_in_;
     if (record_raw_ir_) {
         // Raw IR is recorded on arrival, so frames the live pipeline drops are still kept.
@@ -538,6 +564,21 @@ void ScanPipeline::push(usb::FrameGroup&& group) {
     }
     cv_.notify_one();
     if (overflow) record_dropped(*overflow, "live queue full");
+}
+
+void ScanPipeline::drain() {
+    if (!worker_.joinable()) return;
+    std::promise<void> done;
+    auto f = done.get_future();
+    post([&done] { done.set_value(); });
+    f.wait();
+}
+
+void ScanPipeline::set_left_sensor(int sensor) {
+    post([this, sensor] {
+        frontend_->set_left_sensor(sensor);
+        order_detected_ = true;
+    });
 }
 
 std::vector<SE3> ScanPipeline::trajectory() const {

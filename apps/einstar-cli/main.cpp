@@ -28,6 +28,9 @@
 //   track-fixture <project.ir_E10_prj> [--start N] [--count N] [--skip K] [--record out.estr] [--quiet]
 //                                     run the tracker on EXStar-recorded depth frames and compare poses;
 //                                     --record writes a session (plus EXStar's poses as <out>.exstar_poses)
+//   replay <session.estr> -o out.estr [--start N] [--count N] [--cpu] [--reference-depth MM] [--recorded-map]
+//                                     a recording's raw IR through this build's live pipeline into a new recording
+//                                     (A/B tests of the depth front end on real scans; see replay.cpp)
 //   process <session.estr> [-o mesh.stl|ply|obj] [--voxel MM] [--no-optimize] [--smooth N]
 //           [--stl reference.stl] [--reference-poses file]
 //                                     the process step: optimise poses, re-fuse, mesh, export
@@ -102,6 +105,7 @@ int usage() {
                  "       track-fixture <project.ir_E10_prj> [--start N] [--count N] [--skip K] [--stl ref.stl] [--cpu] [--mode geometry|hybrid|markers] [--global-markers] [--marker-confirm N] [--record out.estr] [--quiet] |\n"
                  "       process <session.estr> [-o mesh.stl|ply|obj] [--voxel MM] [--no-optimize] [--smooth N] [--stl reference.stl] [--reference-poses file] [--render out.pgm [--render-frame view.txt]] [--no-edge-filter | --edge-radius N --rim-radius N --min-region PX] [--no-grazing-weight] [--no-grazing-filter | --max-view-angle DEG --steep-rim PX --steep-rim-angle DEG] [--min-weight W] [--min-observations N] [--min-component F] |\n"
                  "       track-session <session.estr> [--fake-time] [--count N] [--cpu] |\n"
+                 "       replay <session.estr> -o out.estr [--start N] [--count N] [--cpu] [--reference-depth MM] [--recorded-map] |\n"
                  "       inspect <session.estr> [--dump-blob out.bin] [--detail] [--dump-depth out.pgm [--frame N]]");
     return 2;
 }
@@ -2591,6 +2595,10 @@ int process_cmd(const char* path, std::span<char*> args) {
 
 }  // namespace
 
+namespace einstar::cli {
+int replay_cmd(const char* path, std::span<char*> args);  // replay.cpp
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) return usage();
     const std::string_view cmd = argv[1];
@@ -2614,5 +2622,6 @@ int main(int argc, char** argv) {
     if (cmd == "track-session" && argc >= 3) return track_session(argv[2], rest);
     if (cmd == "inspect" && argc >= 3) return inspect_cmd(argv[2], std::span<char*>(argv + 3, static_cast<std::size_t>(argc - 3)));
     if (cmd == "process" && argc >= 3) return process_cmd(argv[2], std::span<char*>(argv + 3, static_cast<std::size_t>(argc - 3)));
+    if (cmd == "replay" && argc >= 3) return einstar::cli::replay_cmd(argv[2], std::span<char*>(argv + 3, static_cast<std::size_t>(argc - 3)));
     return usage();
 }

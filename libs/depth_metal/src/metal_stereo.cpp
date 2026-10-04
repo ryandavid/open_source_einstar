@@ -26,7 +26,7 @@ struct WtaArgs { std::uint32_t w, h, nd; std::int32_t min_disp; float uniqueness
 struct LrArgs { std::uint32_t w, h; float max_diff; };
 struct RefineArgs { std::uint32_t w, h, cw, ch; std::int32_t radius, search_radius; float min_zncc; std::uint32_t subpixel; };
 struct CclArgs { std::uint32_t w, h; float max_diff; std::uint32_t min_size; };
-struct PointsArgs { std::uint32_t w, h; float f, cx, cy, baseline, min_depth, max_depth, max_jump; };
+struct PointsArgs { std::uint32_t w, h; float f, cx, cy, baseline, min_depth, max_depth, max_jump, cx_offset; };
 struct BlobArgs {
     std::uint32_t w, h, threshold, min_diameter, max_diameter;
     float max_aspect, min_fill;
@@ -226,7 +226,8 @@ Result<depth::StereoResult> MetalStereo::compute(ImageView<const std::uint8_t> l
 void MetalStereo::set_point_params(const depth::RectifiedGeometry& g, float min_depth, float max_depth, float max_jump) {
     auto& im = *impl_;
     im.points_args = {static_cast<std::uint32_t>(im.w), static_cast<std::uint32_t>(im.h), static_cast<float>(g.f),
-                      static_cast<float>(g.cx), static_cast<float>(g.cy), static_cast<float>(g.baseline), min_depth, max_depth, max_jump};
+                      static_cast<float>(g.cx), static_cast<float>(g.cy), static_cast<float>(g.baseline), min_depth, max_depth, max_jump,
+                      static_cast<float>(g.cx_offset)};
     im.have_points = true;
 }
 
@@ -338,7 +339,7 @@ depth::StereoResult MetalStereo::read_result() const {
     const auto n = static_cast<std::size_t>(im.w * im.h);
     im.ctx->download(im.disp[0].get(), 0, res.disparity.data(), n * 4);
     if (im.p.pyramid_levels == 0) {
-        for (std::size_t i = 0; i < n; ++i) res.confidence.data()[i] = res.disparity.data()[i] < 0 ? 0.0f : 1.0f;
+        for (std::size_t i = 0; i < n; ++i) res.confidence.data()[i] = depth::valid_disparity(res.disparity.data()[i]) ? 1.0f : 0.0f;
     } else {
         im.ctx->download(im.conf[0].get(), 0, res.confidence.data(), n * 4);
     }

@@ -13,7 +13,8 @@ namespace einstar::calib {
 struct StereoRectification {
     Mat3 R_left = Mat3::Identity();   // original left camera frame -> rectified left frame
     Mat3 R_right = Mat3::Identity();  // original right camera frame -> rectified right frame
-    CameraModel rectified;            // shared ideal pinhole model (no distortion)
+    CameraModel rectified;            // left ideal pinhole model (no distortion)
+    CameraModel rectified_right;      // the same but for cx (geometry.cx_offset to the right)
     depth::RectifiedGeometry geometry;
 
     // Points in the rectified left frame -> original left camera frame.
@@ -24,7 +25,16 @@ struct StereoRectification {
     }
 };
 
-[[nodiscard]] StereoRectification compute_rectification(const RigCalibration& rig, double scale = 1.0);
+struct RectificationOptions {
+    double scale = 1.0;  // rectified image size relative to the sensors'
+    // Depth at which a point has zero disparity: the right camera's principal point is shifted so that
+    // the scene at this depth lands on the same columns in both images. Matching then loses only the
+    // columns |disparity| wide at the image edges, nearest this depth (0 = one shared principal point,
+    // as before; the overlap then shifts by f * baseline / z, half the image at 300 mm).
+    double reference_depth_mm = 320.0;
+};
+
+[[nodiscard]] StereoRectification compute_rectification(const RigCalibration& rig, const RectificationOptions& options = {});
 
 // Look-up table: for each rectified pixel, the source pixel in the original (distorted) image.
 struct RemapTable {

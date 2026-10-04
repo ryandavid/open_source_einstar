@@ -101,11 +101,21 @@ TEST_CASE("real calibration rectifies to a usable stereo geometry") {
     CHECK_THAT(in_rect.x(), WithinAbs(159.913, 1e-3));
     CHECK(std::abs(in_rect.y()) < 1e-6);
     CHECK(std::abs(in_rect.z()) < 1e-6);
-    // Disparity at the working range: 175 mm .. 625 mm.
-    const double d_near = rect.geometry.disparity_from_depth(175), d_far = rect.geometry.disparity_from_depth(625);
-    INFO("disparity range " << d_far << " .. " << d_near << " px, f=" << rect.geometry.f << " cx=" << rect.rectified.cx);
-    CHECK(d_far > 200);
-    CHECK(d_near < 1100);
+    // Disparity over the working range (175 mm .. 625 mm) is signed, zero at the reference depth; the
+    // physical disparity f * B / z (disparity + cx_offset) is what the scanner's geometry dictates.
+    const auto& g = rect.geometry;
+    const double d_near = g.disparity_from_depth(175), d_far = g.disparity_from_depth(625);
+    INFO("disparity range " << d_far << " .. " << d_near << " px, f=" << g.f << " cx=" << g.cx << " cx_offset=" << g.cx_offset);
+    CHECK(d_far + g.cx_offset > 200);
+    CHECK(d_near + g.cx_offset < 1100);
+    CHECK(std::abs(g.disparity_from_depth(calib::RectificationOptions{}.reference_depth_mm)) < 1e-9);
+    CHECK(d_far < 0);
+    CHECK(d_near > 0);
+    // The window sits on the overlap: EXStar's own rectification (docs/calibration.md) puts the left
+    // principal point at 319.6 and the right one 619 px further right; ours is within ~10% of that layout.
+    CHECK(g.cx > 250);
+    CHECK(g.cx < 420);
+    CHECK(rect.rectified_right.cx == g.right_cx());
 }
 
 TEST_CASE("CCF files extracted from a flash blob are the stored files, and write back to a loadable directory") {

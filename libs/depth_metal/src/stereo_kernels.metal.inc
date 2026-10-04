@@ -4,7 +4,11 @@ using namespace metal;
 
 // Mirrors libs/depth/src/stereo.cpp (the CPU reference). Integer stages are bit-exact.
 
-constant float kInvalid = -1.0f;
+// Disparities are signed (the rectified right camera's principal point is shifted), so "no match" is a
+// value no disparity reaches; integer right disparities use kNoMatch.
+constant float kInvalid = -1.0e9f;
+constant int kNoMatch = -2147483647 - 1;
+inline bool valid(float d) { return d > -1.0e8f; }
 
 struct Size2 { uint w; uint h; };
 
@@ -78,7 +82,7 @@ kernel void cost_volume(device const ulong* cl [[buffer(0)]], device const ulong
     if (k >= a.nd || x >= a.w || y >= a.h) return;
     const int xr = int(x) - (a.min_disp + int(k));
     uint c = a.invalid_cost;
-    if (xr >= 0) c = popcount(cl[y * a.w + x] ^ cr[y * a.w + uint(xr)]);
+    if (xr >= 0 && xr < int(a.w)) c = popcount(cl[y * a.w + x] ^ cr[y * a.w + uint(xr)]);
     cost[(ulong(y) * a.w + x) * a.nd + k] = uchar(c);
 }
 
@@ -277,16 +281,18 @@ kernel void wta_left(device const ushort* sum [[buffer(0)]], device float* disp 
     if (gid.x >= a.w || gid.y >= a.h) return;
     const int x = int(gid.x);
     device const ushort* s = sum + (ulong(gid.y) * a.w + gid.x) * a.nd;
+    // Candidates whose right pixel x - (min_disp + k) lies inside the image.
+    const int min_k = max(0, x - a.min_disp - (int(a.w) - 1));
     const int max_k = min(int(a.nd), x - a.min_disp + 1);
     float out = kInvalid;
-    if (max_k > 0) {
-        int best_k = 0;
-        for (int k = 1; k < max_k; ++k) if (s[k] < s[best_k]) best_k = k;
+    if (max_k > min_k) {
+        int best_k = min_k;
+        for (int k = min_k + 1; k < max_k; ++k) if (s[k] < s[best_k]) best_k = k;
         ushort second = 0xFFFF;
-        for (int k = 0; k < max_k; ++k) if (abs(k - best_k) > 1) second = min(second, s[k]);
+        for (int k = min_k; k < max_k; ++k) if (abs(k - best_k) > 1) second = min(second, s[k]);
         if (!(second != 0xFFFF && float(s[best_k]) >= a.uniqueness * float(second))) {
             float d = float(a.min_disp + best_k);
-            if (a.subpixel && best_k > 0 && best_k + 1 < max_k) d += subpixel_offset(s[best_k - 1], s[best_k], s[best_k + 1]);
+            if (a.subpixel && best_k > min_k && best_k + 1 < max_k) d += subpixel_offset(s[best_k - 1], s[best_k], s[best_k + 1]);
             out = d;
         }
     }
@@ -310,30 +316,31 @@ kernel void wta_rows(device const ushort* sum [[buffer(0)]], device float* disp 
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint x = simd_id; x < a.w; x += nsimd) {
         device const ushort* s = sum + (ulong(y) * a.w + x) * a.nd;
+        const int min_k = max(0, int(x) - a.min_disp - (int(a.w) - 1));
         const int max_k = min(int(a.nd), int(x) - a.min_disp + 1);
-        if (max_k <= 0) {  // uniform across the SIMD group
+        if (max_k <= min_k) {  // uniform across the SIMD group
             if (lane == 0) disp[y * a.w + x] = kInvalid;
             continue;
         }
         uint best = 0xFFFFFFFFu;
-        for (int k = int(lane); k < max_k; k += int(width)) {
+        for (int k = min_k + int(lane); k < max_k; k += int(width)) {
             const uint v = s[k];
             const uint key = (v << 16) | uint(k);
             best = min(best, key);
-            // The right pixel that sees this candidate: xr = x - min_disp - k (>= 0 because k < max_k).
+            // The right pixel that sees this candidate: xr = x - min_disp - k (inside the row for min_k <= k < max_k).
             if (v != 0xFFFFu) atomic_fetch_min_explicit(&right_best[uint(int(x) - a.min_disp - k)], key, memory_order_relaxed);
         }
         best = simd_min(best);
         const int best_k = int(best & 0xFFFFu);
         ushort second = 0xFFFF;
-        for (int k = int(lane); k < max_k; k += int(width))
+        for (int k = min_k + int(lane); k < max_k; k += int(width))
             if (abs(k - best_k) > 1) second = min(second, s[k]);
         second = simd_min(second);
         if (lane == 0) {
             float out = kInvalid;
             if (!(second != 0xFFFF && float(best >> 16) >= a.uniqueness * float(second))) {
                 float d = float(a.min_disp + best_k);
-                if (a.subpixel && best_k > 0 && best_k + 1 < max_k) d += subpixel_offset(s[best_k - 1], s[best_k], s[best_k + 1]);
+                if (a.subpixel && best_k > min_k && best_k + 1 < max_k) d += subpixel_offset(s[best_k - 1], s[best_k], s[best_k + 1]);
                 out = d;
             }
             disp[y * a.w + x] = out;
@@ -342,7 +349,7 @@ kernel void wta_rows(device const ushort* sum [[buffer(0)]], device float* disp 
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint x = tid; x < a.w; x += tg_size) {
         const uint key = atomic_load_explicit(&right_best[x], memory_order_relaxed);
-        rdisp[y * a.w + x] = key == 0xFFFFFFFFu ? -1 : a.min_disp + int(key & 0xFFFFu);
+        rdisp[y * a.w + x] = key == 0xFFFFFFFFu ? kNoMatch : a.min_disp + int(key & 0xFFFFu);
     }
 }
 
@@ -352,13 +359,13 @@ kernel void wta_right(device const ushort* sum [[buffer(0)]], device int* rdisp 
     const int xr = int(gid.x);
     int best_k = -1;
     ushort best = 0xFFFF;
-    for (int k = 0; k < int(a.nd); ++k) {
+    for (int k = max(0, -(xr + a.min_disp)); k < int(a.nd); ++k) {
         const int xl = xr + a.min_disp + k;
         if (xl >= int(a.w)) break;
         const ushort v = sum[(ulong(gid.y) * a.w + uint(xl)) * a.nd + uint(k)];
         if (v < best) { best = v; best_k = k; }
     }
-    rdisp[gid.y * a.w + gid.x] = best_k < 0 ? -1 : a.min_disp + best_k;
+    rdisp[gid.y * a.w + gid.x] = best_k < 0 ? kNoMatch : a.min_disp + best_k;
 }
 
 struct LrArgs { uint w; uint h; float max_diff; };
@@ -368,9 +375,9 @@ kernel void lr_check(device float* disp [[buffer(0)]], device const int* rdisp [
     if (gid.x >= a.w || gid.y >= a.h) return;
     const uint i = gid.y * a.w + gid.x;
     const float d = disp[i];
-    if (d < 0) return;
+    if (!valid(d)) return;
     const int xr = int(rint(float(gid.x) - d));
-    if (xr < 0 || xr >= int(a.w) || rdisp[gid.y * a.w + uint(xr)] < 0 || abs(float(rdisp[gid.y * a.w + uint(xr)]) - d) > a.max_diff)
+    if (xr < 0 || xr >= int(a.w) || rdisp[gid.y * a.w + uint(xr)] == kNoMatch || abs(float(rdisp[gid.y * a.w + uint(xr)]) - d) > a.max_diff)
         disp[i] = kInvalid;
 }
 
@@ -380,7 +387,7 @@ kernel void median3(device const float* in [[buffer(0)]], device float* out [[bu
     if (gid.x >= s.w || gid.y >= s.h) return;
     const int x = int(gid.x), y = int(gid.y);
     const uint i = gid.y * s.w + gid.x;
-    if (in[i] < 0) { out[i] = kInvalid; return; }
+    if (!valid(in[i])) { out[i] = kInvalid; return; }
     float buf[9];
     int n = 0;
     for (int v = -1; v <= 1; ++v)
@@ -388,7 +395,7 @@ kernel void median3(device const float* in [[buffer(0)]], device float* out [[bu
             const int xx = x + u, yy = y + v;
             if (xx < 0 || yy < 0 || xx >= int(s.w) || yy >= int(s.h)) continue;
             const float d = in[yy * int(s.w) + xx];
-            if (d < 0) continue;
+            if (!valid(d)) continue;
             buf[n++] = d;
         }
     // insertion sort; the CPU uses nth_element on the same set, so the n/2-th element matches
@@ -422,15 +429,15 @@ kernel void refine_slanted(device const uchar* left [[buffer(0)]], device const 
     const int cw = int(a.cw), ch = int(a.ch);
     const int cx = min(x / 2, cw - 1), cy = min(y / 2, ch - 1);
     const float d0 = coarse[cy * cw + cx];
-    if (d0 < 0.0f) return;
+    if (!valid(d0)) return;
     auto C = [&](int xx, int yy) { return coarse[yy * cw + xx]; };
     float gx = 0, gy = 0;
     const float c = d0;
-    if (cx > 0 && cx + 1 < cw && C(cx - 1, cy) >= 0 && C(cx + 1, cy) >= 0) {
+    if (cx > 0 && cx + 1 < cw && valid(C(cx - 1, cy)) && valid(C(cx + 1, cy))) {
         const float g = 0.5f * (C(cx + 1, cy) - C(cx - 1, cy));
         if (abs(C(cx + 1, cy) - c) < 2 && abs(c - C(cx - 1, cy)) < 2) gx = g;
     }
-    if (cy > 0 && cy + 1 < ch && C(cx, cy - 1) >= 0 && C(cx, cy + 1) >= 0) {
+    if (cy > 0 && cy + 1 < ch && valid(C(cx, cy - 1)) && valid(C(cx, cy + 1))) {
         const float g = 0.5f * (C(cx, cy + 1) - C(cx, cy - 1));
         if (abs(C(cx, cy + 1) - c) < 2 && abs(c - C(cx, cy - 1)) < 2) gy = g;
     }
@@ -444,7 +451,7 @@ kernel void refine_slanted(device const uchar* left [[buffer(0)]], device const 
     const int ncand = int(kRefineCandidates);
     float sa = 0, saa = 0, sb[kMaxRefineCandidates], sbb[kMaxRefineCandidates], sab[kMaxRefineCandidates];
     uint dead = 0;  // candidates whose window leaves the image
-    for (int k = 0; k < ncand; ++k) { sb[k] = 0; sbb[k] = 0; sab[k] = 0; if (lo + step * float(k) < 0) dead |= 1u << k; }
+    for (int k = 0; k < ncand; ++k) { sb[k] = 0; sbb[k] = 0; sab[k] = 0; }
     const int W = int(a.w);
     for (int v = -r; v <= r; ++v) {
         device const uchar* ra = left + (y + v) * W;
@@ -523,7 +530,7 @@ kernel void ccl_init(device const float* disp [[buffer(0)]], device atomic_int* 
                      uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= a.w || gid.y >= a.h) return;
     const uint i = gid.y * a.w + gid.x;
-    atomic_store_explicit(&L[i], disp[i] >= 0 ? int(i) : -1, memory_order_relaxed);
+    atomic_store_explicit(&L[i], valid(disp[i]) ? int(i) : -1, memory_order_relaxed);
     atomic_store_explicit(&sizes[i], 0u, memory_order_relaxed);
 }
 
@@ -532,14 +539,14 @@ kernel void ccl_merge(device const float* disp [[buffer(0)]], device atomic_int*
     if (gid.x >= a.w || gid.y >= a.h) return;
     const uint i = gid.y * a.w + gid.x;
     const float d = disp[i];
-    if (d < 0) return;
+    if (!valid(d)) return;
     if (gid.x + 1 < a.w) {
         const float dr = disp[i + 1];
-        if (dr >= 0 && abs(dr - d) <= a.max_diff) ccl_unite(L, int(i), int(i + 1));
+        if (valid(dr) && abs(dr - d) <= a.max_diff) ccl_unite(L, int(i), int(i + 1));
     }
     if (gid.y + 1 < a.h) {
         const float dd = disp[i + a.w];
-        if (dd >= 0 && abs(dd - d) <= a.max_diff) ccl_unite(L, int(i), int(i + a.w));
+        if (valid(dd) && abs(dd - d) <= a.max_diff) ccl_unite(L, int(i), int(i + a.w));
     }
 }
 
@@ -548,7 +555,7 @@ kernel void ccl_count(device const float* disp [[buffer(0)]], device atomic_int*
                       uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= a.w || gid.y >= a.h) return;
     const uint i = gid.y * a.w + gid.x;
-    if (disp[i] < 0) return;
+    if (!valid(disp[i])) return;
     const int root = ccl_find(L, int(i));
     atomic_fetch_add_explicit(&sizes[root], 1u, memory_order_relaxed);
     // Flatten: a root is a valid ancestor for concurrent finds, and ccl_filter then needs one load.
@@ -560,7 +567,7 @@ kernel void ccl_filter(device float* disp [[buffer(0)]], device float* conf [[bu
                        uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= a.w || gid.y >= a.h) return;
     const uint i = gid.y * a.w + gid.x;
-    if (disp[i] < 0) { conf[i] = 0.0f; return; }
+    if (!valid(disp[i])) { conf[i] = 0.0f; return; }
     const int root = atomic_load_explicit(&L[i], memory_order_relaxed);  // flattened by ccl_count
     if (atomic_load_explicit(&sizes[root], memory_order_relaxed) < a.min_size) {
         disp[i] = kInvalid;
@@ -569,7 +576,7 @@ kernel void ccl_filter(device float* disp [[buffer(0)]], device float* conf [[bu
 }
 
 // ---- disparity -> organised points, normals, weights (mirrors depth::disparity_to_points) ----
-struct PointsArgs { uint w; uint h; float f; float cx; float cy; float baseline; float min_depth; float max_depth; float max_jump; };
+struct PointsArgs { uint w; uint h; float f; float cx; float cy; float baseline; float min_depth; float max_depth; float max_jump; float cx_offset; };
 
 kernel void disparity_points(device const float* disp [[buffer(0)]], device const float* conf [[buffer(1)]],
                              device float4* pts [[buffer(2)]], constant PointsArgs& a [[buffer(3)]],
@@ -578,8 +585,8 @@ kernel void disparity_points(device const float* disp [[buffer(0)]], device cons
     const uint i = gid.y * a.w + gid.x;
     float4 p = float4(0);
     const float d = disp[i];
-    if (d > 0) {
-        const float z = a.f * a.baseline / d;
+    if (valid(d) && d + a.cx_offset > 0) {
+        const float z = a.f * a.baseline / (d + a.cx_offset);
         if (z >= a.min_depth && z <= a.max_depth)
             p = float4((float(gid.x) - a.cx) * z / a.f, (float(gid.y) - a.cy) * z / a.f, z, 1.0f);
     }

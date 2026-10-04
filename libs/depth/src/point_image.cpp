@@ -1,4 +1,5 @@
 #include "einstar/depth/point_image.hpp"
+#include "einstar/depth/stereo.hpp"
 
 #include <cmath>
 
@@ -14,7 +15,7 @@ PointImage disparity_to_points(const ImageF32& disparity, const ImageF32& confid
     tbb::parallel_for(0, h, [&](int y) {
         for (int x = 0; x < w; ++x) {
             const float d = disparity(x, y);
-            if (d <= 0.0f) continue;
+            if (!valid_disparity(d) || d + g.cx_offset <= 0.0) continue;
             const double z = g.depth_from_disparity(d);
             if (z < params.min_depth || z > params.max_depth) continue;
             out.points(x, y) = Vec3f(static_cast<float>((x - g.cx) * z / g.f), static_cast<float>((y - g.cy) * z / g.f),

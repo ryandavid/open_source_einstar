@@ -131,12 +131,12 @@ ImageF32 median3(const ImageF32& in) {
     parallel_rows(in.height(), [&](int y) {
         float buf[9];
         for (int x = 0; x < in.width(); ++x) {
-            if (in(x, y) < 0) continue;
+            if (!valid_disparity(in(x, y))) continue;
             int n = 0;
             for (int v = -1; v <= 1; ++v)
                 for (int u = -1; u <= 1; ++u) {
                     const int xx = x + u, yy = y + v;
-                    if (xx < 0 || yy < 0 || xx >= in.width() || yy >= in.height() || in(xx, yy) < 0) continue;
+                    if (xx < 0 || yy < 0 || xx >= in.width() || yy >= in.height() || !valid_disparity(in(xx, yy))) continue;
                     buf[n++] = in(xx, yy);
                 }
             std::nth_element(buf, buf + n / 2, buf + n);
@@ -159,11 +159,11 @@ void refine_level(ImageView<const std::uint8_t> left, ImageView<const std::uint8
     auto slope = [&](int cx, int cy, float& gx, float& gy) {
         gx = gy = 0.0f;
         const float c = coarse(cx, cy);
-        if (cx > 0 && cx + 1 < cw && coarse(cx - 1, cy) >= 0 && coarse(cx + 1, cy) >= 0) {
+        if (cx > 0 && cx + 1 < cw && valid_disparity(coarse(cx - 1, cy)) && valid_disparity(coarse(cx + 1, cy))) {
             const float g = 0.5f * (coarse(cx + 1, cy) - coarse(cx - 1, cy));
             if (std::abs(coarse(cx + 1, cy) - c) < 2 && std::abs(c - coarse(cx - 1, cy)) < 2) gx = g;
         }
-        if (cy > 0 && cy + 1 < ch && coarse(cx, cy - 1) >= 0 && coarse(cx, cy + 1) >= 0) {
+        if (cy > 0 && cy + 1 < ch && valid_disparity(coarse(cx, cy - 1)) && valid_disparity(coarse(cx, cy + 1))) {
             const float g = 0.5f * (coarse(cx, cy + 1) - coarse(cx, cy - 1));
             if (std::abs(coarse(cx, cy + 1) - c) < 2 && std::abs(c - coarse(cx, cy - 1)) < 2) gy = g;
         }
@@ -179,7 +179,7 @@ void refine_level(ImageView<const std::uint8_t> left, ImageView<const std::uint8
         for (int x = r; x < w - r; ++x) {
             const int cx = std::min(x / 2, cw - 1);
             const float d0 = coarse(cx, cy);
-            if (d0 < 0.0f) continue;
+            if (!valid_disparity(d0)) continue;
             float gx, gy;
             slope(cx, cy, gx, gy);
             const float center = 2.0f * d0;
@@ -189,7 +189,7 @@ void refine_level(ImageView<const std::uint8_t> left, ImageView<const std::uint8
             int best_k = -1;
             for (int k = 0; k < nd; ++k) {
                 const float d = lo + kStep * static_cast<float>(k);
-                scores[k] = d < 0 ? -2.0f : zncc_slanted(left, right, x, y, d, gx, gy, r);
+                scores[k] = zncc_slanted(left, right, x, y, d, gx, gy, r);
                 if (scores[k] > best) {
                     best = scores[k];
                     best_k = k;
@@ -255,6 +255,7 @@ ImageF32 sgm_disparity(ImageView<const std::uint8_t> left, ImageView<const std::
             for (int k = 0; k < nd; ++k) {
                 const int xr = x - (p.min_disparity + k);
                 if (xr < 0) break;
+                if (xr >= w) continue;
                 c[k] = static_cast<Cost>(std::popcount(a ^ cr(xr, y)));
             }
         }
@@ -291,28 +292,31 @@ ImageF32 sgm_disparity(ImageView<const std::uint8_t> left, ImageView<const std::
 
     // Winner-takes-all (left) plus the right-referenced disparity from the same volume.
     ImageF32 disp(w, h, kInvalidDisparity);
-    Image<int> right_disp(w, h, -1);
+    constexpr int kNoMatch = std::numeric_limits<int>::min();
+    Image<int> right_disp(w, h, kNoMatch);
     parallel_rows(h, [&](int y) {
         for (int x = 0; x < w; ++x) {
             const Cost* s = sum.at(x, y);
+            // Candidates whose right pixel x - (min_disparity + k) lies inside the image.
+            const int min_k = std::max(0, x - p.min_disparity - (w - 1));
             const int max_k = std::min(nd, x - p.min_disparity + 1);
-            if (max_k <= 0) continue;
-            int best_k = 0;
-            for (int k = 1; k < max_k; ++k)
+            if (max_k <= min_k) continue;
+            int best_k = min_k;
+            for (int k = min_k + 1; k < max_k; ++k)
                 if (s[k] < s[best_k]) best_k = k;
             Cost second = kMaxCost;
-            for (int k = 0; k < max_k; ++k)
+            for (int k = min_k; k < max_k; ++k)
                 if (std::abs(k - best_k) > 1) second = std::min(second, s[k]);
             if (second != kMaxCost && static_cast<float>(s[best_k]) >= p.uniqueness * static_cast<float>(second)) continue;
             float d = static_cast<float>(p.min_disparity + best_k);
-            if (subpixel && best_k > 0 && best_k + 1 < max_k)
+            if (subpixel && best_k > min_k && best_k + 1 < max_k)
                 d += subpixel_offset(s[best_k - 1], s[best_k], s[best_k + 1]);
             disp(x, y) = d;
         }
         for (int xr = 0; xr < w; ++xr) {
             int best_k = -1;
             Cost best = kMaxCost;
-            for (int k = 0; k < nd; ++k) {
+            for (int k = std::max(0, -(xr + p.min_disparity)); k < nd; ++k) {
                 const int xl = xr + p.min_disparity + k;
                 if (xl >= w) break;
                 const Cost v = sum.at(xl, y)[k];
@@ -321,7 +325,7 @@ ImageF32 sgm_disparity(ImageView<const std::uint8_t> left, ImageView<const std::
                     best_k = k;
                 }
             }
-            right_disp(xr, y) = best_k < 0 ? -1 : p.min_disparity + best_k;
+            right_disp(xr, y) = best_k < 0 ? kNoMatch : p.min_disparity + best_k;
         }
     });
 
@@ -329,9 +333,10 @@ ImageF32 sgm_disparity(ImageView<const std::uint8_t> left, ImageView<const std::
     parallel_rows(h, [&](int y) {
         for (int x = 0; x < w; ++x) {
             const float d = disp(x, y);
-            if (d < 0) continue;
+            if (!valid_disparity(d)) continue;
             const int xr = static_cast<int>(std::lround(static_cast<float>(x) - d));
-            if (xr < 0 || xr >= w || right_disp(xr, y) < 0 || std::abs(static_cast<float>(right_disp(xr, y)) - d) > static_cast<float>(p.lr_max_diff)) {
+            if (xr < 0 || xr >= w || right_disp(xr, y) == kNoMatch ||
+                std::abs(static_cast<float>(right_disp(xr, y)) - d) > static_cast<float>(p.lr_max_diff)) {
                 disp(x, y) = kInvalidDisparity;
             }
         }
@@ -345,7 +350,7 @@ void remove_speckles(ImageF32& disparity, const SpeckleParams& p) {
     std::vector<int> stack;
     std::vector<int> region;  // pixels as y * w + x
     for (int start = 0; start < w * h; ++start) {
-        if (seen.data()[start] || disparity.data()[start] < 0) continue;
+        if (seen.data()[start] || !valid_disparity(disparity.data()[start])) continue;
         region.clear();
         stack.push_back(start);
         seen.data()[start] = 1;
@@ -360,7 +365,7 @@ void remove_speckles(ImageF32& disparity, const SpeckleParams& p) {
                 if (n[0] < 0 || n[1] < 0 || n[0] >= w || n[1] >= h) continue;
                 const int j = n[1] * w + n[0];
                 const float dj = disparity.data()[j];
-                if (seen.data()[j] || dj < 0 || std::abs(dj - d) > p.max_diff) continue;
+                if (seen.data()[j] || !valid_disparity(dj) || std::abs(dj - d) > p.max_diff) continue;
                 seen.data()[j] = 1;
                 stack.push_back(j);
             }
@@ -386,7 +391,7 @@ StereoResult compute_disparity(ImageView<const std::uint8_t> left, ImageView<con
     if (params.pyramid_levels == 0) {
         result.confidence = ImageF32(disp.width(), disp.height(), 1.0f);
         for (std::size_t i = 0; i < disp.size(); ++i)
-            if (disp.data()[i] < 0) result.confidence.data()[i] = 0.0f;
+            if (!valid_disparity(disp.data()[i])) result.confidence.data()[i] = 0.0f;
     }
     for (int level = params.pyramid_levels - 1; level >= 0; --level) {
         const auto l = level == 0 ? left : pyr_l[static_cast<std::size_t>(level - 1)].view();
@@ -398,7 +403,7 @@ StereoResult compute_disparity(ImageView<const std::uint8_t> left, ImageView<con
     }
     remove_speckles(disp, params.speckle);
     for (std::size_t i = 0; i < disp.size(); ++i)
-        if (disp.data()[i] < 0) result.confidence.data()[i] = 0.0f;
+        if (!valid_disparity(disp.data()[i])) result.confidence.data()[i] = 0.0f;
     result.disparity = std::move(disp);
     return result;
 }

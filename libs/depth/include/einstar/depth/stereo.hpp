@@ -19,10 +19,12 @@
 
 namespace einstar::depth {
 
-inline constexpr float kInvalidDisparity = -1.0f;
+// Disparities are signed (see depth::RectifiedGeometry), so "no match" is a value no disparity reaches.
+inline constexpr float kInvalidDisparity = -1.0e9f;
+[[nodiscard]] constexpr bool valid_disparity(float d) { return d > -1.0e8f; }
 
 struct SgmParams {
-    int min_disparity = 0;     // at the SGM level
+    int min_disparity = 0;     // at the SGM level (may be negative)
     int num_disparities = 64;  // search range at the SGM level
     int census_radius_x = 2;   // 5x5 window by default
     int census_radius_y = 2;
@@ -61,7 +63,7 @@ struct StereoResult {
     ImageF32 confidence; // 0..1 (ZNCC score at full resolution)
 };
 
-// Both images must be rectified, same size, row-aligned; disparity = x_left - x_right.
+// Both images must be rectified, same size, row-aligned; disparity = x_left - x_right (signed).
 [[nodiscard]] StereoResult compute_disparity(ImageView<const std::uint8_t> left,
                                              ImageView<const std::uint8_t> right,
                                              const StereoParams& params);

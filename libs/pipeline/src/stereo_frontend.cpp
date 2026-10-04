@@ -15,16 +15,18 @@
 namespace einstar::pipeline {
 
 StereoFrontend::StereoFrontend(const RigCalibration& rig, StereoFrontendParams params) : params_(params) {
-    rect_ = calib::compute_rectification(rig);
+    rect_ = calib::compute_rectification(rig, {.reference_depth_mm = params_.reference_depth_mm});
     map_left_ = calib::build_remap(rig.left, rect_.R_left, rect_.rectified);
-    map_right_ = calib::build_remap(rig.right, rect_.R_right, rect_.rectified);
+    map_right_ = calib::build_remap(rig.right, rect_.R_right, rect_.rectified_right);
 
     // Stereo runs on the half-resolution rectified pair; SGM one level below (quarter resolution).
+    // Disparities are signed (zero at the rectification's reference depth).
     const auto& g = rect_.geometry;
     stereo_.pyramid_levels = 1;
-    const double d_max = g.disparity_from_depth(params_.min_depth_mm) / 4.0;
-    const double d_min = g.disparity_from_depth(params_.max_depth_mm) / 4.0;
-    stereo_.sgm.min_disparity = std::max(0, static_cast<int>(std::floor(d_min)) - 2);
+    const auto quarter = g.scaled(2);
+    const double d_max = quarter.disparity_from_depth(params_.min_depth_mm);
+    const double d_min = quarter.disparity_from_depth(params_.max_depth_mm);
+    stereo_.sgm.min_disparity = static_cast<int>(std::floor(d_min)) - 2;
     stereo_.sgm.num_disparities = static_cast<int>(std::ceil(d_max - d_min)) + 4;
     stereo_.refine = params_.refine;
     stereo_.speckle = params_.speckle;
@@ -39,11 +41,7 @@ StereoFrontend::StereoFrontend(const RigCalibration& rig, StereoFrontendParams p
         auto m = ctx ? depth_metal::MetalStereo::create(*ctx, stereo_, rect_.rectified.width / 2, rect_.rectified.height / 2)
                      : Result<std::unique_ptr<depth_metal::MetalStereo>>(std::unexpected(ctx.error()));
         if (m && (*m)->set_rectification(map_left_, map_right_, rig.left.width, rig.left.height)) {
-            depth::RectifiedGeometry half = rect_.geometry;
-            half.f = depth_k_.fx;
-            half.cx = depth_k_.cx;
-            half.cy = depth_k_.cy;
-            (*m)->set_point_params(half, static_cast<float>(params_.min_depth_mm), static_cast<float>(params_.max_depth_mm), 4.0f);
+            (*m)->set_point_params(rect_.geometry.scaled(1), static_cast<float>(params_.min_depth_mm), static_cast<float>(params_.max_depth_mm), 4.0f);
             depth_metal::BlobParams bp;
             const auto& d = params_.marker_detect;
             bp.threshold = static_cast<std::uint32_t>(d.threshold);
@@ -263,17 +261,16 @@ void StereoFrontend::add_markers(const ImageU8& raw_left, const ImageU8& raw_rig
                 nsum += fa.normal(x, y);
             }
     };
-    const auto& g = rect_.geometry;
     std::vector<float> zs;
     Vec3f nsum;
-    const markers::MarkerStereo::DisparityPrior prior = [&](const Vec2& rl, double radius) -> double {
+    const markers::MarkerStereo::DepthPrior prior = [&](const Vec2& rl, double radius) -> double {
         const double x = rl.x() * 0.5, y = rl.y() * 0.5, r = radius;
         if (x - r < 0 || y - r < 0 || x + r >= fa.width || y + r >= fa.height) return 0.0;  // outside the depth image
         neighbourhood(rl, radius, zs, nsum);
         if (zs.size() < 6) return -1.0;
         auto mid = zs.begin() + static_cast<std::ptrdiff_t>(zs.size() / 2);
         std::nth_element(zs.begin(), mid, zs.end());
-        return g.disparity_from_depth(*mid);
+        return *mid;
     };
     out.markers = marker_stereo_->reconstruct(left, right, prior);
 
@@ -335,10 +332,7 @@ DepthOutput StereoFrontend::process(const ImageU8& raw_left, const ImageU8& raw_
     out.rectified_right = depth::downsample2(rr.view());
     const auto stereo = depth::compute_disparity(out.rectified_left.view(), out.rectified_right.view(), stereo_);
     // Disparity at half resolution -> depth with the half-resolution geometry.
-    depth::RectifiedGeometry half = rect_.geometry;
-    half.f = depth_k_.fx;
-    half.cx = depth_k_.cx;
-    half.cy = depth_k_.cy;
+    const depth::RectifiedGeometry half = rect_.geometry.scaled(1);
     depth::PointImageParams pp;
     pp.min_depth = static_cast<float>(params_.min_depth_mm);
     pp.max_depth = static_cast<float>(params_.max_depth_mm);

@@ -191,6 +191,7 @@ std::vector<std::uint8_t> encode_device(const DeviceRecord& d) {
     put_pose(p, d.rig.T_right_left), put_pose(p, d.rig.T_texture_left);
     p.put_mat3(d.R_rect_left), p.put_mat3(d.R_rect_right);
     p.put_camera(d.rectified);
+    p.put_camera(d.rectified_right);  // (absent before per-camera principal points)
     return std::move(p.b);
 }
 
@@ -202,6 +203,8 @@ DeviceRecord decode_device(Reader& rd) {
     d.rig.T_right_left = get_pose(rd), d.rig.T_texture_left = get_pose(rd);
     d.R_rect_left = rd.get_mat3(), d.R_rect_right = rd.get_mat3();
     d.rectified = rd.get_camera();
+    d.rectified_right = d.rectified;
+    if (rd.p < rd.end) d.rectified_right = rd.get_camera();
     return d;
 }
 
@@ -327,6 +330,7 @@ Result<std::unique_ptr<SessionWriter>> SessionWriter::create(const std::string& 
     p.put(k.fx), p.put(k.fy), p.put(k.cx), p.put(k.cy);
     p.put(header.rect_f), p.put(header.rect_cx), p.put(header.rect_cy), p.put(header.baseline_mm);
     p.put_string(header.description);
+    p.put(header.rect_cx_offset);  // (absent before per-camera principal points)
     w->write_record(kHead, p.b);
     w->thread_ = std::thread([raw = w.get()] { raw->run(); });
     return w;
@@ -671,6 +675,7 @@ Result<std::unique_ptr<SessionReader>> SessionReader::open(const std::string& pa
                 r->header_.baseline_mm = rd.get<double>();
                 r->header_.description = rd.get_string();
                 have_header = rd.ok;
+                if (rd.ok && rd.p < rd.end) r->header_.rect_cx_offset = rd.get<double>();
             } else if (t == kGlobal) {
                 const auto n = rd.get<std::uint32_t>();
                 std::vector<markers::MapMarker> map;

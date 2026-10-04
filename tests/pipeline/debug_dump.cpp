@@ -134,7 +134,7 @@ int main(int argc, char** argv) {
                 truth(x, y) = static_cast<float>(R.geometry.disparity_from_depth(z_rect) / 4.0);
             }
         depth::SgmParams sp;
-        sp.min_disparity = std::max(0, static_cast<int>(g.disparity_from_depth(700) / 4) - 2);
+        sp.min_disparity = static_cast<int>(std::floor(g.disparity_from_depth(700) / 4)) - 2;
         sp.num_disparities = static_cast<int>(g.disparity_from_depth(150) / 4) - sp.min_disparity + 4;
         struct V { const char* name; int p1, p2, cr; bool eight, slant; float uniq; int lr; };
         for (const V var : {V{"base", 8, 96, 2, false, false, 0.9f, 1}, V{"slant", 8, 96, 2, false, true, 0.9f, 1},
@@ -181,7 +181,7 @@ int main(int argc, char** argv) {
                                                    std::tuple{0.5f, 4, 0}}) {
         depth::StereoParams p;
         p.pyramid_levels = 1;
-        p.sgm.min_disparity = std::max(0, static_cast<int>(g.disparity_from_depth(700) / 4) - 2);
+        p.sgm.min_disparity = static_cast<int>(std::floor(g.disparity_from_depth(700) / 4)) - 2;
         p.sgm.num_disparities = static_cast<int>(g.disparity_from_depth(150) / 4) - p.sgm.min_disparity + 4;
         p.refine.min_zncc = min_zncc;
         p.refine.search_radius = radius;
@@ -194,7 +194,7 @@ int main(int argc, char** argv) {
     for (float uniq : {0.9f, 0.97f, 1.01f}) {
         for (int lr : {1, 3, 1000}) {
             depth::SgmParams sp;
-            sp.min_disparity = std::max(0, static_cast<int>(g.disparity_from_depth(700) / 4) - 2);
+            sp.min_disparity = static_cast<int>(std::floor(g.disparity_from_depth(700) / 4)) - 2;
             sp.num_disparities = static_cast<int>(g.disparity_from_depth(150) / 4) - sp.min_disparity + 4;
             sp.uniqueness = uniq;
             sp.lr_max_diff = lr;
@@ -206,7 +206,7 @@ int main(int argc, char** argv) {
                 ImageU8 vis(sgm.width(), sgm.height(), 0);
                 for (int y = 0; y < vis.height(); ++y)
                     for (int x = 0; x < vis.width(); ++x)
-                        if (sgm(x, y) >= 0) vis(x, y) = static_cast<std::uint8_t>(std::clamp((sgm(x, y) - static_cast<float>(sp.min_disparity)) * 255.0f / static_cast<float>(sp.num_disparities), 1.0f, 255.0f));
+                        if (depth::valid_disparity(sgm(x, y))) vis(x, y) = static_cast<std::uint8_t>(std::clamp((sgm(x, y) - static_cast<float>(sp.min_disparity)) * 255.0f / static_cast<float>(sp.num_disparities), 1.0f, 255.0f));
                 pgm(out + "/sgm_raw.pgm", vis);
                 pgm(out + "/q_left.pgm", q_l);
                 pgm(out + "/q_right.pgm", q_r);

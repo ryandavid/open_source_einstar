@@ -1,6 +1,8 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include <cmath>
 #include <random>
+#include <tuple>
 
 #include "einstar/calib/rectify.hpp"
 
@@ -29,7 +31,7 @@ RigCalibration make_rig() {
 
 }  // namespace
 
-TEST_CASE("rectified projections are row aligned with disparity f*B/z") {
+TEST_CASE("rectified projections are row aligned with disparity f*B/z - cx_offset") {
     const RigCalibration rig = make_rig();
     const auto rect = calib::compute_rectification(rig);
     REQUIRE(std::abs(rect.geometry.baseline - rig.baseline_mm()) < 1e-9);
@@ -40,18 +42,56 @@ TEST_CASE("rectified projections are row aligned with disparity f*B/z") {
         const Vec3 p_left(ux(rng), uy(rng), uz(rng));
         const Vec3 p_right = rig.T_right_left * p_left;
         // Observed distorted pixels -> rectified pixels.
-        auto to_rect = [&](const CameraModel& cam, const Mat3& R, const Vec3& p) {
+        auto to_rect = [&](const CameraModel& cam, const Mat3& R, const CameraModel& rc, const Vec3& p) {
             const Vec2 px = cam.project(p);
             const Vec2 n = calib::undistort_to_normalized(cam, px);
             const Vec3 ray = R * Vec3(n.x(), n.y(), 1.0);
-            return Vec2(rect.rectified.fx * ray.x() / ray.z() + rect.rectified.cx,
-                        rect.rectified.fy * ray.y() / ray.z() + rect.rectified.cy);
+            return Vec2(rc.fx * ray.x() / ray.z() + rc.cx, rc.fy * ray.y() / ray.z() + rc.cy);
         };
-        const Vec2 l = to_rect(rig.left, rect.R_left, p_left);
-        const Vec2 r = to_rect(rig.right, rect.R_right, p_right);
+        const Vec2 l = to_rect(rig.left, rect.R_left, rect.rectified, p_left);
+        const Vec2 r = to_rect(rig.right, rect.R_right, rect.rectified_right, p_right);
         REQUIRE(std::abs(l.y() - r.y()) < 1e-6);
         const double z_rect = (rect.R_left * p_left).z();
         REQUIRE(std::abs((l.x() - r.x()) - rect.geometry.disparity_from_depth(z_rect)) < 1e-6);
+        REQUIRE(std::abs(rect.geometry.depth_from_disparity(l.x() - r.x()) - z_rect) < 1e-6 * z_rect);
+    }
+}
+
+TEST_CASE("rectification keeps the cameras' overlap in frame at the reference depth") {
+    // A converging rig like the Einstar's (160 mm baseline, 22 degrees toe-in): with one shared principal
+    // point the overlap at 300 mm would sit ~f*B/z = 600 px apart in the two images.
+    RigCalibration rig = make_rig();
+    rig.right = rig.left;
+    SE3 T = SE3::Identity();
+    T.linear() = Eigen::AngleAxisd(22.0 * M_PI / 180, Vec3::UnitY()).toRotationMatrix();
+    T.translation() = -T.linear() * Vec3(160.0, 0, 0);
+    rig.T_right_left = T;
+    const auto rect = calib::compute_rectification(rig, {.reference_depth_mm = 300.0});
+    const auto shared = calib::compute_rectification(rig, {.reference_depth_mm = 0.0});
+    CHECK(shared.geometry.cx_offset == 0.0);
+    // Points on the plane z = 300 mm (rectified frame) across the left image: how many have their right
+    // view inside the right image.
+    auto matchable = [&](const calib::StereoRectification& r) {
+        int in = 0, total = 0;
+        for (int y = 0; y < r.rectified.height; y += 16)
+            for (int x = 0; x < r.rectified.width; x += 16) {
+                ++total;
+                const double d = r.geometry.disparity_from_depth(300.0);
+                const double xr = x - d;
+                in += xr >= 0 && xr < r.rectified_right.width;
+            }
+        return static_cast<double>(in) / total;
+    };
+    INFO("shared cx keeps " << matchable(shared) << ", per-camera cx " << matchable(rect));
+    CHECK(matchable(shared) < 0.6);
+    CHECK(matchable(rect) > 0.99);
+    // Both sensors' centres stay well inside their rectified windows.
+    for (const auto& [cam, R, rc] : {std::tuple{rig.left, rect.R_left, rect.rectified}, std::tuple{rig.right, rect.R_right, rect.rectified_right}}) {
+        const Vec2 n = calib::undistort_to_normalized(cam, Vec2(cam.cx, cam.cy));
+        const Vec3 ray = R * Vec3(n.x(), n.y(), 1.0);
+        const double u = rc.fx * ray.x() / ray.z() + rc.cx;
+        CHECK(u > 0.2 * rc.width);
+        CHECK(u < 0.8 * rc.width);
     }
 }
 

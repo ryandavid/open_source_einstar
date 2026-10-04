@@ -25,8 +25,16 @@ Alongside the frames:
 - `RAWI` (optional, the app's "Keep raw IR images", off by default): both raw 1280x1024 IR images
   of every frame that reaches the host, recorded on arrival (so dropped frames keep theirs), each
   row delta-coded and zstd-compressed: 1.5-1.9x, about 20-25 MB/s. With these, future stereo and
-  marker algorithms can be re-run on the scan. The writer drops raw frames rather than growing
-  memory if the disk falls behind, and the HUD counts them.
+  marker algorithms can be re-run on the scan: `einstar-cli replay <scan.estr> -o <new.estr>` feeds
+  them through this build's live pipeline (stereo, markers, tracking, fusion) in order, none dropped,
+  into a new recording (a recorded marker capture is replayed and bundle-adjusted as one, or
+  `--recorded-map` keeps the recorded map and replays only the surface). Replay the same scan before
+  and after a front-end change, then `process` / `inspect` both. The writer drops raw frames rather
+  than growing memory if the disk falls behind, and the HUD counts them.
+
+The scanner starts its frame count and clock over whenever streaming restarts (a settings change,
+the marker capture ending); the pipeline continues both past the last frame instead, so frame numbers
+in a recording are unique and time only moves forward.
 - `GMRK`: the global-marker map in use.
 - `ERAS` / `UNDO`: a paused scan's lasso delete and its undo. An erase holds the lasso strokes (each a
   screen polygon with the view it was drawn in; everything that projects inside it, front to back, is

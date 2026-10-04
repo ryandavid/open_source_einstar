@@ -97,7 +97,7 @@ TEST_CASE("markers on the real calibration board triangulate to the board pitch"
             return out;
         };
         const auto seeds = stereo.reconstruct(big(el), big(er));
-        markers::MarkerStereo::DisparityPrior prior;
+        markers::MarkerStereo::DepthPrior prior;
         if (seeds.size() >= 3) {
             Eigen::MatrixXd A(seeds.size(), 3);
             Eigen::VectorXd bvec(seeds.size());
@@ -106,7 +106,9 @@ TEST_CASE("markers on the real calibration board triangulate to the board pitch"
                 bvec(static_cast<Eigen::Index>(s2)) = seeds[s2].left_rect.x() - seeds[s2].right_rect.x();
             }
             const Eigen::Vector3d plane = A.colPivHouseholderQr().solve(bvec);
-            prior = [plane](const Vec2& q, double) { return plane(0) * q.x() + plane(1) * q.y() + plane(2); };
+            prior = [plane, g = rect.geometry](const Vec2& q, double) {
+                return g.depth_from_disparity(plane(0) * q.x() + plane(1) * q.y() + plane(2));
+            };
         }
         const auto m = stereo.reconstruct(el, er, prior);
         if (m.size() < 20) continue;

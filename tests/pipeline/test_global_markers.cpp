@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <future>
 #include <map>
+#include <set>
 #include <mutex>
 #include <print>
 #include <thread>
@@ -118,7 +119,11 @@ TEST_CASE("global markers: capture, bundle adjustment and a surface scan locked 
         results.clear();
     }
     pipe.set_phase(pipeline::ScanPhase::surface);
+    // The scanner starts its frame count over when streaming restarts: these frames reuse numbers of the
+    // capture's. The pipeline continues the count instead (60 was the last), so the recording keeps every
+    // frame number unique: frame `id` here arrives as 61 + (id - 10).
     for (std::uint32_t id = 10; id < 40; ++id, t += 68000) pipe.push(render_group(setup, rig, id, t));
+    constexpr std::uint64_t kRenumbered = 61 - 10;
     for (int i = 0; i < 600; ++i) {
         {
             std::lock_guard lock(m);
@@ -136,6 +141,9 @@ TEST_CASE("global markers: capture, bundle adjustment and a surface scan locked 
         auto ses = session::SessionReader::open(session_path);
         REQUIRE(ses.has_value());
         CHECK((*ses)->frame_count() == 21 + 30);
+        std::set<std::uint64_t> numbers;
+        for (std::size_t i = 0; i < (*ses)->frame_count(); ++i) numbers.insert((*ses)->meta(i).index);
+        CHECK(numbers.size() == (*ses)->frame_count());  // unique across the stream restart
         CHECK((*ses)->global_markers().size() == map.size());
         // Mesh error against the analytic scene: mean distance and fraction of samples off it.
         auto mesh_error = [&](const recon::TriangleMesh& mesh) {
@@ -205,7 +213,8 @@ TEST_CASE("global markers: capture, bundle adjustment and a surface scan locked 
         if (!s.accepted) continue;
         ++tracked;
         // Absolute error in the map frame: no per-scan alignment is applied.
-        const SE3 truth = T_truth_map.inverse() * truth_pose(static_cast<std::uint32_t>(id)) * T_left_rect;
+        CHECK(id >= 61);
+        const SE3 truth = T_truth_map.inverse() * truth_pose(static_cast<std::uint32_t>(id - kRenumbered)) * T_left_rect;
         const SE3 e = truth.inverse() * s.pose;
         max_t = std::max(max_t, translation_norm(e));
         max_r = std::max(max_r, rotation_angle(e) * 180 / M_PI);

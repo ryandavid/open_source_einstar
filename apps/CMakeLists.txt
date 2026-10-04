@@ -53,6 +53,6 @@ add_executable(einstar-firmware einstar-firmware/main.cpp)
 target_link_libraries(einstar-firmware PRIVATE einstar::device einstar::sim)
 einstar_target_defaults(einstar-firmware)
 
-add_executable(einstar-cli einstar-cli/main.cpp)
+add_executable(einstar-cli einstar-cli/main.cpp einstar-cli/replay.cpp)
 target_link_libraries(einstar-cli PRIVATE einstar::device einstar::sim einstar::calib einstar::fixtures einstar::track einstar::track_metal einstar::session einstar::recon einstar::eval einstar::pipeline einstar::optim einstar::calibrate)
 einstar_target_defaults(einstar-cli)

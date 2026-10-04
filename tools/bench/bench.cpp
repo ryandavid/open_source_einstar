@@ -208,7 +208,7 @@ int main(int argc, char** argv) {
     depth::StereoParams sp;
     sp.pyramid_levels = 1;
     const auto& g = rect.geometry;
-    sp.sgm.min_disparity = static_cast<int>(g.disparity_from_depth(700) / 4) - 2;
+    sp.sgm.min_disparity = static_cast<int>(std::floor(g.disparity_from_depth(700) / 4)) - 2;
     sp.sgm.num_disparities = static_cast<int>(g.disparity_from_depth(150) / 4) - sp.sgm.min_disparity + 4;
     time_it("SGM quarter res", 10, [&] { (void)depth::sgm_disparity(ql.view(), qr.view(), sp.sgm, true); });
     depth::StereoResult sr;
