@@ -39,19 +39,68 @@ struct ExtractParams {
 // voxel edge. Normals from the SDF gradient (pointing into free space).
 [[nodiscard]] TriangleMesh extract_mesh(const track::Volume& volume, const ExtractParams& params = {});
 
+// Pieces are triangles connected through edges two triangles share: a flap hanging off the surface by
+// a non-manifold edge or a single vertex (surface nets make a few where sheets touch) is a piece of
+// its own.
 struct CleanupParams {
-    // Connected pieces smaller than this fraction of the largest piece (or this many triangles) are
-    // removed: stray blobs from stereo outliers, fragments of the background.
-    double min_component_fraction = 0.02;
-    std::size_t min_component_triangles = 200;
+    // Pieces smaller than this are removed: crumbs and flaps (EXStar removes 25 mm^2 at 0.5 mm).
+    double min_component_area_mm2 = 25.0;
+    // Pieces up to this fraction of the total area with no larger piece within about isolation_mm
+    // are removed: floaters and fragments of the background. Fragments of the surface broken off by
+    // holes lie next to it and stay.
+    double isolated_component_fraction = 0.01;
+    double isolation_mm = 50.0;
+    // Pieces smaller than this fraction of the largest piece, or with fewer triangles, are removed
+    // (0 = off; 0.02 / 200 was the default before the absolute rules, and also removed real
+    // fragments: parts seen through openings, a bucket's rim).
+    double min_component_fraction = 0.0;
+    std::size_t min_component_triangles = 0;
 };
 struct CleanupReport {
     std::size_t components = 0;
     std::size_t removed_components = 0;
+    std::size_t removed_isolated = 0;  // ... of them by the isolation rule
     std::size_t removed_triangles = 0;
+    double removed_area_mm2 = 0;
 };
 CleanupReport remove_small_components(TriangleMesh& mesh, const CleanupParams& params = {});
 void remove_unreferenced_vertices(TriangleMesh& mesh);
+
+// Marker stickers: the depth front end fills the hole a sticker leaves in the depth with a plane,
+// but the surface over it still comes out with a bump or dent (0.3-0.8 mm over ~8 mm on the car
+// display recordings: the sticker's dark ring, stereo bleeding, a plane on a curved part). The
+// surface over each marker is replaced by the smooth surface around it: a quadric height field
+// fitted to an annulus, blended in at the edge. Markers whose surroundings are not smooth (an edge,
+// a step) are left alone.
+struct MarkerDisc {
+    Vec3f center;
+    Vec3f normal;  // out of the surface
+    float radius = 3.0f;
+};
+struct MarkerFlattenParams {
+    float cover_radii = 2.2f;   // replaced out to this many sticker radii...
+    float blend_mm = 2.0f;      // ... blended into the surrounding surface over this width
+    float ring_mm = 5.0f;       // the annulus outside that the surface is fitted to
+    float max_ring_rms_mm = 0.2f;
+    float max_height_mm = 3.0f;  // vertices this far off the marker's plane belong to other surfaces
+};
+// Returns the number of markers flattened.
+std::size_t flatten_markers(TriangleMesh& mesh, const std::vector<MarkerDisc>& markers, const MarkerFlattenParams& params = {});
+
+// Closes holes whose boundary is a simple loop no longer than `max_perimeter_mm`: a fan around a new
+// vertex at the loop's centroid (a triangle for three edges). Returns the number of holes closed.
+std::size_t fill_small_holes(TriangleMesh& mesh, double max_perimeter_mm);
+// A closed surface from a scan's mesh: screened Poisson reconstruction (PoissonRecon) of its vertices
+// and normals, so holes are bridged by a smooth surface and the result encloses a volume. Pieces it
+// makes from stray samples are removed as in remove_small_components.
+struct WatertightParams {
+    double cell_mm = 0;            // finest octree cell; 0 = 0.5 mm (in the process step: its voxel size)
+    double point_weight = 2.0;     // screening weight (PoissonRecon's default; EXStar uses 3)
+    double samples_per_node = 1.5;
+    CleanupParams cleanup;
+};
+[[nodiscard]] Result<TriangleMesh> watertight_mesh(const TriangleMesh& surface, const WatertightParams& params = {});
+
 // Taubin (lambda/mu) smoothing: reduces voxel-scale noise without shrinking the surface.
 void taubin_smooth(TriangleMesh& mesh, int iterations = 5, float lambda = 0.5f, float mu = -0.53f);
 

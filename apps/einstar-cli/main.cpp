@@ -108,7 +108,7 @@ int usage() {
                  "       calib-refine <session.estr> [--calibration <calibration>] [--swap-cameras] [--offset-only] [--save <file> [--force]] |\n"
                  "       fixture-pack --out DIR [--mustang <Project1.ir_E10_prj>] [--stl mesh.stl] [--board <dir>] |\n"
                  "       track-fixture <project.ir_E10_prj> [--start N] [--count N] [--skip K] [--stl ref.stl] [--cpu] [--mode geometry|hybrid|markers] [--global-markers] [--marker-confirm N] [--record out.estr] [--quiet] |\n"
-                 "       process <session.estr> [-o mesh.stl|ply|obj] [--voxel MM] [--no-optimize] [--smooth N] [--stl reference.stl] [--reference-poses file] [--render out.pgm [--render-frame view.txt]] [--no-edge-filter | --edge-radius N --rim-radius N --min-region PX] [--no-grazing-weight] [--no-grazing-filter | --max-view-angle DEG --steep-rim PX --steep-rim-angle DEG] [--min-weight W] [--min-observations N] [--min-component F] |\n"
+                 "       process <session.estr> [-o mesh.stl|ply|obj] [--voxel MM] [--no-optimize] [--smooth N] [--stl reference.stl] [--reference-poses file] [--render out.pgm [--render-frame view.txt]] [--no-edge-filter | --edge-radius N --rim-radius N --min-region PX] [--grazing-weight] [--no-grazing-filter | --max-view-angle DEG --steep-rim PX --steep-rim-angle DEG] [--no-consistency | --consistency-tol MM --consistency-noise MM --consistency-radius MM --consistency-normal DEG] [--min-weight W] [--min-observations N] [--min-area MM2] [--isolation MM] [--min-component F] [--no-marker-flatten] [--fill-holes PERIMETER_MM] [--watertight closed.stl [--poisson-weight W] [--poisson-cell MM]] |\n"
                  "       track-session <session.estr> [--fake-time] [--count N] [--cpu] |\n"
                  "       replay <session.estr> -o out.estr [--start N] [--count N] [--cpu] [--reference-depth MM] [--recorded-map] |\n"
                  "       inspect <session.estr> [--dump-blob out.bin] [--detail] [--dump-depth out.pgm [--frame N]]");
@@ -2590,7 +2590,16 @@ int process_cmd(const char* path, std::span<char*> args) {
         pp.edge_filter->radius_rim_px = static_cast<int>(arg_int(args, "--rim-radius", pp.edge_filter->radius_rim_px));
         pp.edge_filter->min_region_px = static_cast<int>(arg_int(args, "--min-region", pp.edge_filter->min_region_px));
     }
-    pp.grazing_weight = !has_flag(args, "--no-grazing-weight");
+    // (--no-grazing-weight is the default now: the recorded confidence already has the viewing angle in it.)
+    pp.grazing_weight = has_flag(args, "--grazing-weight");
+    if (has_flag(args, "--no-consistency")) pp.consistency.reset();
+    if (pp.consistency) {
+        auto& c = *pp.consistency;
+        c.tolerance_mm = static_cast<float>(arg_double(args, "--consistency-tol", c.tolerance_mm));
+        c.noise_tolerance_mm = static_cast<float>(arg_double(args, "--consistency-noise", c.noise_tolerance_mm));
+        c.support_radius_mm = static_cast<float>(arg_double(args, "--consistency-radius", c.support_radius_mm));
+        c.max_normal_angle_deg = arg_double(args, "--consistency-normal", c.max_normal_angle_deg);
+    }
     if (has_flag(args, "--no-grazing-filter")) pp.grazing_filter.reset();
     if (pp.grazing_filter) {
         pp.grazing_filter->max_view_angle_deg = arg_double(args, "--max-view-angle", pp.grazing_filter->max_view_angle_deg);
@@ -2600,6 +2609,16 @@ int process_cmd(const char* path, std::span<char*> args) {
     pp.extract.min_weight = static_cast<float>(arg_double(args, "--min-weight", pp.extract.min_weight));
     pp.extract.min_observations = static_cast<int>(arg_int(args, "--min-observations", pp.extract.min_observations));
     pp.cleanup.min_component_fraction = arg_double(args, "--min-component", pp.cleanup.min_component_fraction);
+    pp.cleanup.min_component_area_mm2 = arg_double(args, "--min-area", pp.cleanup.min_component_area_mm2);
+    pp.cleanup.isolation_mm = arg_double(args, "--isolation", pp.cleanup.isolation_mm);
+    if (has_flag(args, "--no-marker-flatten")) pp.marker_flatten.reset();
+    pp.fill_holes_max_perimeter_mm = arg_double(args, "--fill-holes", pp.fill_holes_max_perimeter_mm);
+    const char* watertight_out = arg_str(args, "--watertight");
+    if (watertight_out) {
+        pp.watertight = recon::WatertightParams{};
+        pp.watertight->point_weight = arg_double(args, "--poisson-weight", pp.watertight->point_weight);
+        pp.watertight->cell_mm = arg_double(args, "--poisson-cell", pp.watertight->cell_mm);
+    }
     std::string last_stage;
     pp.progress = [&](const std::string& stage, double) {
         if (stage != last_stage) {
@@ -2621,8 +2640,19 @@ int process_cmd(const char* path, std::span<char*> args) {
                  rep.max_correction_deg);
     std::println("islands: {} unverified segments, {} excluded ({} frames); {} lost frames recovered", rep.islands, rep.islands_excluded,
                  rep.frames_excluded, rep.frames_recovered);
-    std::println("mesh: {} vertices, {} triangles ({} small pieces removed; simplified from {} triangles, max error {:.3f} mm)", rep.vertices,
-                 rep.triangles, rep.cleanup.removed_components, rep.simplified.triangles_before, rep.simplified.max_error_mm);
+    if (const auto& c = rep.consistency; c.pixels > 0)
+        std::println("consistency: {:.2f}% of {} depth pixels dropped ({:.2f}% in front of the model, {:.2f}% behind it, {:.2f}% by normal); "
+                     "{:.1f}% not seen by it",
+                     100.0 * static_cast<double>(c.rejected()) / static_cast<double>(c.pixels), c.pixels,
+                     100.0 * static_cast<double>(c.in_front) / static_cast<double>(c.pixels),
+                     100.0 * static_cast<double>(c.behind) / static_cast<double>(c.pixels),
+                     100.0 * static_cast<double>(c.normal) / static_cast<double>(c.pixels),
+                     100.0 * static_cast<double>(c.unseen) / static_cast<double>(c.pixels));
+    std::println("mesh: {} vertices, {} triangles ({} small pieces removed, {} of them isolated, {:.0f} mm^2; simplified from {} triangles, "
+                 "max error {:.3f} mm)",
+                 rep.vertices, rep.triangles, rep.cleanup.removed_components, rep.cleanup.removed_isolated, rep.cleanup.removed_area_mm2,
+                 rep.simplified.triangles_before, rep.simplified.max_error_mm);
+    std::println("surface: {} marker stickers flattened, {} small holes closed", rep.markers_flattened, rep.holes_filled);
     std::string times;
     for (const auto& [stage, ms] : rep.stage_ms) times += std::format(" {} {:.1f} s,", stage, ms / 1000.0);
     std::println("time:{}", times);
@@ -2683,6 +2713,13 @@ int process_cmd(const char* path, std::span<char*> args) {
             return 1;
         }
         std::println("wrote {}", outp);
+    }
+    if (watertight_out) {
+        if (auto w = recon::save_mesh(r->watertight, watertight_out); !w) {
+            std::println(stderr, "{}", w.error().message);
+            return 1;
+        }
+        std::println("wrote {} (watertight: {} triangles)", watertight_out, r->watertight.triangles.size());
     }
     return 0;
 }

@@ -63,7 +63,7 @@ target_link_libraries(debug_markers PRIVATE einstar::pipeline einstar::synth)
 einstar_add_test(test_session session/test_session.cpp)
 target_link_libraries(test_session PRIVATE einstar::session)
 
-einstar_add_test(test_recon recon/test_mesh.cpp recon/test_process.cpp)
+einstar_add_test(test_recon recon/test_mesh.cpp recon/test_process.cpp recon/test_consistency.cpp)
 target_link_libraries(test_recon PRIVATE einstar::recon einstar::fixtures einstar::synth)
 add_executable(debug_depth_errors pipeline/debug_depth_errors.cpp)
 einstar_target_defaults(debug_depth_errors)
