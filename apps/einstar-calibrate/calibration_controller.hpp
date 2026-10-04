@@ -105,7 +105,9 @@ public:
     Result<void> load_reference(const std::filesystem::path& path);
 
     // ---- solve ----
-    bool keep_factory_distortion = false;  // EXStar's quick calibration re-fits all but the distortion
+    // EXStar's quick calibration re-fits all but the distortion. The board views leave the image's corners
+    // empty, and a distortion fitted without them bends the rectified rows there (docs/calibration.md 8).
+    bool keep_factory_distortion = true;
     void solve();
     [[nodiscard]] SolveState solve_state() const;
     // Writes calibration.txt (and report.txt) to the session folder.

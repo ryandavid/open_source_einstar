@@ -309,6 +309,8 @@ void results_tab(app::CalibrationController& c, const app::SolveState& st) {
     const auto& o = *st.ours;
     ImGui::Text("Ours:  reprojection %.3f px, rectified rows %.3f px (max %.2f), %d dots in %d views, %d outliers dropped, %.0f ms", o.rms_px, o.row_rms_px,
                 o.max_row_px, o.dots, static_cast<int>(std::ranges::count_if(o.views, &calibrate::ViewReport::used)), o.dropped, st.solve_ms);
+    if (o.board_rms_mm > 0)
+        ImGui::Text("Board: its dots fitted %.3f mm off the nominal grid (%.3f mm out of its plane)", o.board_rms_mm, o.board_flatness_mm);
     if (st.flash)
         ImGui::Text("Flash (EXStar, %s) on these captures:  reprojection %.3f px, rectified rows %.3f px (max %.2f)", c.flash_time().c_str(), st.flash->rms_px,
                     st.flash->row_rms_px, st.flash->max_row_px);
@@ -371,6 +373,7 @@ void results_tab(app::CalibrationController& c, const app::SolveState& st) {
         if (!d) continue;
         ImGui::Text("vs %s: rig turned %.3f deg; a ray lands up to %.2f px (left) / %.2f px (right) apart over the image, distortion alone %.2f / %.2f px", name,
                     d->rotation_deg.norm(), d->left.mapping_px, d->right.mapping_px, d->left.distortion_px, d->right.distortion_px);
+        ImGui::Text("   rectified rows of its rays through ours: %+.3f px on average, up to %.2f px (250-500 mm)", d->row_mean_px, d->row_max_px);
     }
     ImGui::Separator();
     // Per-view rows: ours vs flash.
