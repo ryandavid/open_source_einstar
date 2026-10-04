@@ -87,7 +87,10 @@ variants on discrete GPUs.
 - **Deviation map:** the scan against the built solid, with hot spots where the model departs from it.
 - **Photos of the part:** kept in the model file and marked up with dimensions, diameters, angles, callouts and
   notes. A photo taken anywhere can be matched to the scan from a few points. The model is then drawn over it,
-  each measurement is compared with the scan, and a measurement can be applied as a constraint.
+  each measurement is compared with the scan, and a measurement can be applied as a constraint. A hole the scan
+  filled in is placed from a diameter marked on a photo.
+- **Blocks:** features the scan barely saw, or hollow ones, are regions bounded by their own planes, added to
+  the part or cut from it, e.g. a clip, or a tray with 3 mm walls.
 - **Agents:** every modelling command is an MCP tool. An agent can work headless, or attach to the window you
   have open.
 - Headless: `--snapshot out.png` (the demo part, modelled). See `docs/model.md`.
