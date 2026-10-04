@@ -1,7 +1,9 @@
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <numeric>
+#include <unordered_set>
 
 #include "einstar/recon/mesh.hpp"
 
@@ -46,26 +48,102 @@ struct UnionFind {
 CleanupReport remove_small_components(TriangleMesh& mesh, const CleanupParams& params) {
     CleanupReport rep;
     if (mesh.triangles.empty()) return rep;
-    UnionFind uf(mesh.vertices.size());
-    for (const auto& t : mesh.triangles) {
-        uf.unite(t[0], t[1]);
-        uf.unite(t[0], t[2]);
+    const std::size_t nt = mesh.triangles.size();
+    // Pieces: triangles joined across edges with exactly two triangles.
+    UnionFind uf(nt);
+    {
+        std::vector<std::pair<std::uint64_t, std::uint32_t>> edges;  // (edge key, triangle)
+        edges.reserve(3 * nt);
+        for (std::uint32_t f = 0; f < nt; ++f)
+            for (int e = 0; e < 3; ++e) {
+                const auto a = mesh.triangles[f][static_cast<std::size_t>(e)], b = mesh.triangles[f][static_cast<std::size_t>((e + 1) % 3)];
+                edges.emplace_back(static_cast<std::uint64_t>(std::min(a, b)) << 32 | std::max(a, b), f);
+            }
+        std::ranges::sort(edges);
+        for (std::size_t i = 0; i < edges.size();) {
+            std::size_t j = i;
+            while (j < edges.size() && edges[j].first == edges[i].first) ++j;
+            if (j - i == 2) uf.unite(edges[i].second, edges[i + 1].second);
+            i = j;
+        }
     }
-    std::vector<std::size_t> tri_count(mesh.vertices.size(), 0);
-    for (const auto& t : mesh.triangles) ++tri_count[uf.find(t[0])];
+    std::vector<double> area(nt, 0.0);
+    std::vector<std::size_t> count(nt, 0);
+    for (std::uint32_t f = 0; f < nt; ++f) {
+        const auto& t = mesh.triangles[f];
+        const auto r = uf.find(f);
+        area[r] += 0.5 * (mesh.vertices[t[1]] - mesh.vertices[t[0]]).cross(mesh.vertices[t[2]] - mesh.vertices[t[0]]).cast<double>().norm();
+        ++count[r];
+    }
     std::size_t largest = 0;
-    for (std::size_t v = 0; v < tri_count.size(); ++v)
-        if (tri_count[v] > 0) {
+    double total = 0;
+    for (std::size_t r = 0; r < nt; ++r)
+        if (count[r] > 0) {
             ++rep.components;
-            largest = std::max(largest, tri_count[v]);
+            largest = std::max(largest, count[r]);
+            total += area[r];
         }
     const auto keep_min = std::max(params.min_component_triangles,
                                    static_cast<std::size_t>(params.min_component_fraction * static_cast<double>(largest)));
-    const auto before = mesh.triangles.size();
-    for (std::size_t v = 0; v < tri_count.size(); ++v)
-        if (tri_count[v] > 0 && tri_count[v] < keep_min) ++rep.removed_components;
-    std::erase_if(mesh.triangles, [&](const auto& t) { return tri_count[uf.find(t[0])] < keep_min; });
-    rep.removed_triangles = before - mesh.triangles.size();
+    std::vector<std::uint8_t> removed(nt, 0);  // per root
+    std::vector<std::uint32_t> candidates;     // roots of small kept pieces (isolation rule)
+    for (std::uint32_t r = 0; r < nt; ++r) {
+        if (count[r] == 0) continue;
+        if (count[r] < keep_min || area[r] < params.min_component_area_mm2) removed[r] = 1;
+        else if (area[r] < params.isolated_component_fraction * total) candidates.push_back(r);
+    }
+    if (!candidates.empty() && params.isolation_mm > 0) {
+        // Occupancy of the kept pieces on a grid of a third of the isolation distance: a piece is
+        // isolated when no cell within three cells of its own holds a larger kept piece (anything
+        // within isolation_mm is found; up to ~2.3x that may count as near).
+        const double cell = params.isolation_mm / 3.0;
+        auto key = [](std::int64_t x, std::int64_t y, std::int64_t z) { return (x + (1 << 20)) << 42 | (y + (1 << 20)) << 21 | (z + (1 << 20)); };
+        auto cell_key = [&](const Vec3f& p) {
+            return key(static_cast<std::int64_t>(std::floor(p.x() / cell)), static_cast<std::int64_t>(std::floor(p.y() / cell)),
+                       static_cast<std::int64_t>(std::floor(p.z() / cell)));
+        };
+        std::vector<std::vector<std::uint32_t>> tris_of(nt);
+        for (std::uint32_t f = 0; f < nt; ++f) {
+            const auto r = uf.find(f);
+            if (!removed[r] && area[r] < params.isolated_component_fraction * total) tris_of[r].push_back(f);
+        }
+        std::unordered_set<std::int64_t> occupied;
+        for (std::uint32_t f = 0; f < nt; ++f) {
+            const auto r = uf.find(f);
+            if (!removed[r] && tris_of[r].empty())
+                for (const auto v : mesh.triangles[f]) occupied.insert(cell_key(mesh.vertices[v]));
+        }
+        std::ranges::sort(candidates, [&](auto a, auto b) { return area[a] > area[b]; });
+        constexpr std::int64_t kMask = (1 << 21) - 1;
+        for (const auto r : candidates) {
+            std::unordered_set<std::int64_t> own;
+            for (const auto f : tris_of[r])
+                for (const auto v : mesh.triangles[f]) own.insert(cell_key(mesh.vertices[v]));
+            bool near = false;
+            for (auto it = own.begin(); it != own.end() && !near; ++it) {
+                const std::int64_t x = (*it >> 42) - (1 << 20), y = ((*it >> 21) & kMask) - (1 << 20), z = (*it & kMask) - (1 << 20);
+                for (int dz = -3; dz <= 3 && !near; ++dz)
+                    for (int dy = -3; dy <= 3 && !near; ++dy)
+                        for (int dx = -3; dx <= 3 && !near; ++dx) near = occupied.contains(key(x + dx, y + dy, z + dz));
+            }
+            if (near) {
+                occupied.insert(own.begin(), own.end());
+            } else {
+                removed[r] = 1;
+                ++rep.removed_isolated;
+            }
+        }
+    }
+    for (std::size_t r = 0; r < nt; ++r)
+        if (count[r] > 0 && removed[r]) {
+            ++rep.removed_components;
+            rep.removed_area_mm2 += area[r];
+        }
+    std::vector<std::uint8_t> drop(nt);
+    for (std::uint32_t f = 0; f < nt; ++f) drop[f] = removed[uf.find(f)];
+    std::size_t f = 0;
+    std::erase_if(mesh.triangles, [&](const auto&) { return drop[f++] != 0; });
+    rep.removed_triangles = nt - mesh.triangles.size();
     remove_unreferenced_vertices(mesh);
     return rep;
 }

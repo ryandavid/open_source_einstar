@@ -100,7 +100,7 @@ int usage() {
                  "       calib-solve <captures dir> [--reference <calibration>] [--save <file>] [--no-distortion | --distortion-from <calibration>] |\n"
                  "       fixture-pack --out DIR [--mustang <Project1.ir_E10_prj>] [--stl mesh.stl] [--board <dir>] |\n"
                  "       track-fixture <project.ir_E10_prj> [--start N] [--count N] [--skip K] [--stl ref.stl] [--cpu] [--mode geometry|hybrid|markers] [--global-markers] [--marker-confirm N] [--record out.estr] [--quiet] |\n"
-                 "       process <session.estr> [-o mesh.stl|ply|obj] [--voxel MM] [--no-optimize] [--smooth N] [--stl reference.stl] [--reference-poses file] [--render out.pgm [--render-frame view.txt]] [--no-edge-filter | --edge-radius N --rim-radius N --min-region PX] [--grazing-weight] [--no-grazing-filter | --max-view-angle DEG --steep-rim PX --steep-rim-angle DEG] [--no-consistency | --consistency-tol MM --consistency-noise MM --consistency-radius MM --consistency-normal DEG] [--min-weight W] [--min-observations N] [--min-component F] |\n"
+                 "       process <session.estr> [-o mesh.stl|ply|obj] [--voxel MM] [--no-optimize] [--smooth N] [--stl reference.stl] [--reference-poses file] [--render out.pgm [--render-frame view.txt]] [--no-edge-filter | --edge-radius N --rim-radius N --min-region PX] [--grazing-weight] [--no-grazing-filter | --max-view-angle DEG --steep-rim PX --steep-rim-angle DEG] [--no-consistency | --consistency-tol MM --consistency-noise MM --consistency-radius MM --consistency-normal DEG] [--min-weight W] [--min-observations N] [--min-area MM2] [--isolation MM] [--min-component F] |\n"
                  "       track-session <session.estr> [--fake-time] [--count N] [--cpu] |\n"
                  "       inspect <session.estr> [--dump-blob out.bin] [--detail] [--dump-depth out.pgm [--frame N]]");
     return 2;
@@ -2511,6 +2511,8 @@ int process_cmd(const char* path, std::span<char*> args) {
     pp.extract.min_weight = static_cast<float>(arg_double(args, "--min-weight", pp.extract.min_weight));
     pp.extract.min_observations = static_cast<int>(arg_int(args, "--min-observations", pp.extract.min_observations));
     pp.cleanup.min_component_fraction = arg_double(args, "--min-component", pp.cleanup.min_component_fraction);
+    pp.cleanup.min_component_area_mm2 = arg_double(args, "--min-area", pp.cleanup.min_component_area_mm2);
+    pp.cleanup.isolation_mm = arg_double(args, "--isolation", pp.cleanup.isolation_mm);
     std::string last_stage;
     pp.progress = [&](const std::string& stage, double) {
         if (stage != last_stage) {
@@ -2540,8 +2542,10 @@ int process_cmd(const char* path, std::span<char*> args) {
                      100.0 * static_cast<double>(c.behind) / static_cast<double>(c.pixels),
                      100.0 * static_cast<double>(c.normal) / static_cast<double>(c.pixels),
                      100.0 * static_cast<double>(c.unseen) / static_cast<double>(c.pixels));
-    std::println("mesh: {} vertices, {} triangles ({} small pieces removed; simplified from {} triangles, max error {:.3f} mm)", rep.vertices,
-                 rep.triangles, rep.cleanup.removed_components, rep.simplified.triangles_before, rep.simplified.max_error_mm);
+    std::println("mesh: {} vertices, {} triangles ({} small pieces removed, {} of them isolated, {:.0f} mm^2; simplified from {} triangles, "
+                 "max error {:.3f} mm)",
+                 rep.vertices, rep.triangles, rep.cleanup.removed_components, rep.cleanup.removed_isolated, rep.cleanup.removed_area_mm2,
+                 rep.simplified.triangles_before, rep.simplified.max_error_mm);
     std::string times;
     for (const auto& [stage, ms] : rep.stage_ms) times += std::format(" {} {:.1f} s,", stage, ms / 1000.0);
     std::println("time:{}", times);

@@ -129,6 +129,42 @@ TEST_CASE("small disconnected pieces are removed") {
     CHECK(m.vertices.size() == static_cast<std::size_t>(n * n));
 }
 
+TEST_CASE("cleanup: flaps on a non-manifold edge go, near fragments stay, isolated ones go") {
+    recon::TriangleMesh m;
+    // A w x w grid of 1 mm squares with its corner at o, in the plane z = o.z.
+    auto add_grid = [&](Vec3f o, int w) {
+        const auto b = static_cast<std::uint32_t>(m.vertices.size());
+        const auto n = static_cast<std::uint32_t>(w + 1);
+        for (std::uint32_t y = 0; y < n; ++y)
+            for (std::uint32_t x = 0; x < n; ++x) m.vertices.push_back(o + Vec3f(static_cast<float>(x), static_cast<float>(y), 0.0f));
+        for (std::uint32_t y = 0; y + 1 < n; ++y)
+            for (std::uint32_t x = 0; x + 1 < n; ++x) {
+                const auto i = b + y * n + x;
+                m.triangles.push_back({i, i + 1, i + n + 1});
+                m.triangles.push_back({i, i + n + 1, i + n});
+            }
+    };
+    add_grid(Vec3f(0, 0, 0), 30);   // 900 mm^2
+    add_grid(Vec3f(40, 0, 0), 8);   // 64 mm^2, 10 mm away: a fragment broken off by a hole
+    add_grid(Vec3f(300, 0, 0), 8);  // 64 mm^2, far from everything
+    const auto main_triangles = 2u * 30u * 30u;
+    // A two-triangle flap standing on an inner edge of the main grid (that edge then has four
+    // triangles): connected by vertices, but a piece of its own.
+    const auto a = static_cast<std::uint32_t>(5 * 31 + 5), b = a + 1;
+    const auto top = static_cast<std::uint32_t>(m.vertices.size());
+    m.vertices.insert(m.vertices.end(), {Vec3f(5, 5, 1), Vec3f(6, 5, 1)});
+    m.triangles.push_back({a, b, top + 1});
+    m.triangles.push_back({a, top + 1, top});
+    recon::CleanupParams p;
+    p.isolated_component_fraction = 0.1;  // pieces up to ~100 mm^2 are tested for isolation
+    const auto rep = recon::remove_small_components(m, p);
+    CHECK(rep.components == 4);
+    CHECK(rep.removed_components == 2);
+    CHECK(rep.removed_isolated == 1);
+    CHECK(m.triangles.size() == main_triangles + 2u * 8u * 8u);
+    CHECK(std::ranges::all_of(m.vertices, [](const Vec3f& v) { return v.x() < 100 && v.z() == 0; }));
+}
+
 TEST_CASE("simplification keeps the shape, manifoldness and orientation") {
     track::TsdfParams tp;
     tp.voxel_mm = 0.5f;

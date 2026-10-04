@@ -39,16 +39,29 @@ struct ExtractParams {
 // voxel edge. Normals from the SDF gradient (pointing into free space).
 [[nodiscard]] TriangleMesh extract_mesh(const track::Volume& volume, const ExtractParams& params = {});
 
+// Pieces are triangles connected through edges two triangles share: a flap hanging off the surface by
+// a non-manifold edge or a single vertex (surface nets make a few where sheets touch) is a piece of
+// its own.
 struct CleanupParams {
-    // Connected pieces smaller than this fraction of the largest piece (or this many triangles) are
-    // removed: stray blobs from stereo outliers, fragments of the background.
-    double min_component_fraction = 0.02;
-    std::size_t min_component_triangles = 200;
+    // Pieces smaller than this are removed: crumbs and flaps (EXStar removes 25 mm^2 at 0.5 mm).
+    double min_component_area_mm2 = 25.0;
+    // Pieces up to this fraction of the total area with no larger piece within about isolation_mm
+    // are removed: floaters and fragments of the background. Fragments of the surface broken off by
+    // holes lie next to it and stay.
+    double isolated_component_fraction = 0.01;
+    double isolation_mm = 50.0;
+    // Pieces smaller than this fraction of the largest piece, or with fewer triangles, are removed
+    // (0 = off; 0.02 / 200 was the default before the absolute rules, and also removed real
+    // fragments: parts seen through openings, a bucket's rim).
+    double min_component_fraction = 0.0;
+    std::size_t min_component_triangles = 0;
 };
 struct CleanupReport {
     std::size_t components = 0;
     std::size_t removed_components = 0;
+    std::size_t removed_isolated = 0;  // ... of them by the isolation rule
     std::size_t removed_triangles = 0;
+    double removed_area_mm2 = 0;
 };
 CleanupReport remove_small_components(TriangleMesh& mesh, const CleanupParams& params = {});
 void remove_unreferenced_vertices(TriangleMesh& mesh);
