@@ -59,6 +59,10 @@ struct DeviceRecord {
     Mat3 R_rect_right = Mat3::Identity();
     CameraModel rectified;                       // full-resolution rectified left camera (no distortion)
     CameraModel rectified_right;                 // the right one (its cx differs; older files: = rectified)
+    // Which stream sensor is which camera (calib/convention.hpp): 1 = EXStar's (sensor 1 left, sensor 0 turned;
+    // from 2026-10-04), 0 = the old one (sensor 0 left, sensor 1 turned). `rig` and the recorded frames,
+    // markers and raw images are in this convention.
+    int camera_convention = 1;
 };
 
 // Settings the frame was captured with (as last sent to the scanner).
@@ -245,6 +249,9 @@ public:
     [[nodiscard]] double raw_timestamp(std::size_t i) const { return raws_[i].timestamp_s; }
     [[nodiscard]] std::uint64_t raw_bytes() const;  // on disk, all raw frames
     [[nodiscard]] Result<RawFrame> read_raw(std::size_t i) const;
+    // Recordings made before 2026-10-04 stamped scan-mode frames at a third of the trigger period (3 IR
+    // triggers per cycle taken as 3 frames per period): their times are multiplied back by this on reading.
+    [[nodiscard]] double time_scale() const { return time_scale_; }
 
 private:
     SessionHeader header_;
@@ -268,6 +275,7 @@ private:
         std::uint64_t offset = 0, size = 0;  // the RAWI payload in the file
     };
     std::vector<RawBlock> raws_;
+    double time_scale_ = 1.0;
     mutable std::mutex file_mutex_;
     mutable std::ifstream in_;
 };

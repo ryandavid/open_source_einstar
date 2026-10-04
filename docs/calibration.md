@@ -535,6 +535,10 @@ in the repo.
 
 ### 8.1 The row offset of the 2026-09-30 calibration
 
+(Written before 8.2 was found: the "frames are not EXStar's" below is the camera swap; with it, EXStar's
+calibration fits our frames to 0.07–0.09 px with no shift, and the 09-30 calibration was solved in the old
+convention.)
+
 Recordings made with our calibration of 2026-09-30 20:21 (local time; file names are UTC) showed rectified
 rows −0.26 / −0.30 px apart (scans at 21:43 and 21:46). What the recordings and the captures show:
 
@@ -559,3 +563,36 @@ rows −0.26 / −0.30 px apart (scans at 21:43 and 21:46). What the recordings 
   calibration: the 0.043 mm of EXStar's own project is its marker pipeline, not its calibration.
 * The 09-30 captures are not on disk (no session folder or flash backup under
   `~/Documents/Einstar/Calibration/<serial>/`), so that solve cannot be repeated with the board fitted.
+
+### 8.2 Which camera is left (2026-10-04)
+
+EXStar takes stream sensor 1 (packet field A = 2) as the left IR camera, upright, and turns sensor 0's frames
+180 degrees as the right camera (libSn3DDeviceEinStar's image stream callback; its saved board images agree:
+imageLeft carries the metadata bytes at its start, imageRight reversed at its end). Until 2026-10-04 Einstar
+had it the other way round. The two pairs are each other turned 180 degrees with left and right exchanged, so
+stereo works with either and a calibration solved from our own frames fit them, but a calibration describes
+one: EXStar's 09-27 calibration on our recorded marker pairs (`einstar-cli calib-refine <scan>
+--calibration tests/fixtures/calibration/einstar_e10 [--swap-cameras]`):
+
+| Recording | EXStar's, our old assignment | EXStar's, its assignment | ours of 09-30 |
+|---|---|---|---|
+| 044655 | rows −0.42 px, \|dy\| median 0.70 | −0.06 px, 0.09 | −0.30 px, 0.30 |
+| 044347 | −1.24 px, 1.24 | −0.02 px, 0.07 | −0.27 px, 0.27 |
+| 032722 | −2.69 px, 2.69 | +0.17 px, 0.20 | −0.10 px, 0.18 |
+
+So the scanner did not change after 09-27 (8.1's "rig changed" and "frames are not EXStar's" are this), the
+(+15, −10) px between our principal points and EXStar's is the turn (in one convention the two calibrations
+differ by ~5 px), and EXStar reading the 09-30 calibration from the flash sees rows 1–7 px apart.
+
+Now: the device layer uses EXStar's assignment (`usb::kLeftSensor`, `usb::kUpsideDownSensor`), calibrations
+solved from here on are in EXStar's convention, and `calib::swap_camera_convention` converts the old one
+(left and right exchanged, each camera turned: c' = (W−1−cx, H−1−cy), p1 and p2 negated, the relative pose
+D·T⁻¹·D with D = diag(−1, −1, 1)). `calib::read_flash_calibration` compares the quick calibration's principal
+points with the flash's factory section (EXStar's convention, Nov 2024): the 09-30 calibration is 40.5 px
+from it as stored and 17.2 px converted, so it is read converted (the app logs it). Recordings carry their
+convention in the scanner record (absent = old); `replay` converts old ones (rig, and both raw images turned).
+The factory calibration itself fits our scans with rows −6.6 px but scatter 0.18 px in EXStar's convention
+(1.06 px in the other): two years of a uniform offset.
+
+To make the scanner right for EXStar again, write EXStar's 09-27 calibration back (it fits better than ours)
+or recalibrate.

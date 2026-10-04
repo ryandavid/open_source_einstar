@@ -1,4 +1,4 @@
-add_library(einstar_calib src/rectify.cpp src/device_calibration.cpp src/epipolar.cpp)
+add_library(einstar_calib src/rectify.cpp src/device_calibration.cpp src/epipolar.cpp src/convention.cpp)
 add_library(einstar::calib ALIAS einstar_calib)
 target_include_directories(einstar_calib PUBLIC include)
 target_link_libraries(einstar_calib PUBLIC einstar::core einstar::depth PRIVATE TBB::tbb)

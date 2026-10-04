@@ -8,7 +8,9 @@
 #include <map>
 #include <unistd.h>
 
+#include "einstar/calib/convention.hpp"
 #include "einstar/core/log.hpp"
+#include "einstar/usb/constants.hpp"
 
 namespace einstar::pipeline {
 
@@ -16,8 +18,14 @@ Result<ReplayResult> replay_recording(const session::SessionReader& in, const st
     if (in.raw_count() == 0) return make_error(Errc::invalid_argument, "the recording has no raw IR images (record with \"Keep raw IR images\" on)");
     if (!in.device()) return make_error(Errc::invalid_argument, "the recording has no scanner record (calibration): its raw images cannot be rectified");
 
-    auto frontend = std::make_unique<StereoFrontend>(in.device()->rig, options.frontend);
+    // A recording in the old camera convention (calib/convention.hpp) is replayed in EXStar's: the rig
+    // converted, both raw images turned (the old one turned sensor 1 upright, ours turns sensor 0).
+    const bool old_convention = in.device()->camera_convention == 0;
+    const RigCalibration rig = old_convention ? calib::swap_camera_convention(in.device()->rig) : in.device()->rig;
+    auto frontend = std::make_unique<StereoFrontend>(rig, options.frontend);
     session::DeviceRecord device = *in.device();
+    device.rig = rig;
+    device.camera_convention = 1;
     device.R_rect_left = frontend->rectification().R_left;
     device.R_rect_right = frontend->rectification().R_right;
     device.rectified = frontend->rectification().rectified;
@@ -50,11 +58,15 @@ Result<ReplayResult> replay_recording(const session::SessionReader& in, const st
     }
     const bool recorded_map = options.recorded_map || !capture;
     if (recorded_map && !in.global_markers().empty()) pipe.set_global_markers(in.global_markers());
-    for (std::size_t i = 0; i < in.frame_count(); ++i)
-        if (const auto& ex = in.meta(i).extras; ex && ex->left_sensor >= 0) {
-            pipe.set_left_sensor(ex->left_sensor);
-            break;
-        }
+    if (old_convention) {
+        pipe.set_left_sensor(usb::kLeftSensor);
+    } else {
+        for (std::size_t i = 0; i < in.frame_count(); ++i)
+            if (const auto& ex = in.meta(i).extras; ex && ex->left_sensor >= 0) {
+                pipe.set_left_sensor(ex->left_sensor);
+                break;
+            }
+    }
     pipe.start();
 
     auto phase = ScanPhase::surface;
@@ -98,6 +110,7 @@ Result<ReplayResult> replay_recording(const session::SessionReader& in, const st
             sf.frame_id = g.frame_id;
             sf.timestamp = g.timestamp;
             sf.pixels = std::move(image);
+            if (old_convention) std::ranges::reverse(sf.pixels.pixels());
             g.sensors[static_cast<std::size_t>(sensor)] = std::move(sf);
         }
         pipe.push(std::move(g));

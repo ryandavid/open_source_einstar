@@ -590,9 +590,11 @@ bool SimDevice::stream_cycle(std::uint64_t generation, const usb::Transport::Pac
         provider = provider_;
     }
     if (s.mono_triggers == 0 && s.rgb_triggers == 0) return false;
-    // One trigger cycle: mono triggers produce IR pairs, rgb triggers add a colour frame.
+    // One trigger cycle: `mono` IR triggers one trigger period apart, each giving one IR pair, and rgb
+    // triggers a colour frame (the scanner: 14.77 Hz pairs at 68 ms with 3 mono triggers; its header's
+    // 64-bit field counts cycles). The emulator adds the colour frame to the cycle's first group.
     const int groups = std::max(s.mono_triggers, 1);
-    const auto period = std::chrono::microseconds(s.trigger_period_us) / groups;
+    const auto period = std::chrono::microseconds(s.trigger_period_us);
     auto next = clock::now();
     ImageU8 img(config_.width, config_.height);
     for (int g = 0; g < groups && !st.stop_requested(); ++g) {
@@ -603,13 +605,13 @@ bool SimDevice::stream_cycle(std::uint64_t generation, const usb::Transport::Pac
             if (!alive_locked(generation) || image_halted_) return true;
             // Device clock: frames are stamped on a virtual timeline (frame index x trigger interval) so
             // time and emulated motion stay consistent even if the consumer applies backpressure.
-            virtual_time_us_ += static_cast<std::uint64_t>(s.trigger_period_us / static_cast<std::uint32_t>(groups));
-            ts = virtual_time_us_;
+            virtual_time_us_ += s.trigger_period_us;
+            ts = frame_id_ / static_cast<std::uint32_t>(groups);  // the header's cycle counter
             frame_id = frame_id_++;
         }
         for (int sensor = 0; sensor < 2; ++sensor) {
             provider(sensor, frame_id, img);
-            // As the scanner sends it: this camera is mounted upside down (usb::kUpsideDownSensor).
+            // As the scanner sends it: the right camera is mounted upside down (usb::kUpsideDownSensor).
             if (sensor == usb::kUpsideDownSensor) std::ranges::reverse(img.pixels());
             emit_frame(sensor, frame_id, ts, img, handler, packets, bytes);
         }

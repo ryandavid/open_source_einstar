@@ -6,10 +6,12 @@
 #include <filesystem>
 #include <format>
 
+#include "einstar/calib/convention.hpp"
 #include "einstar/calib/device_calibration.hpp"
 #include "einstar/core/log.hpp"
 #include "einstar/sim/sim_transport.hpp"
 #include "einstar/synth/demo.hpp"
+#include "einstar/usb/constants.hpp"
 
 namespace einstar::app {
 namespace {
@@ -95,8 +97,9 @@ Result<std::unique_ptr<Session>> Session::open(bool emulator, UpdateSink updates
                 out.fill(0);
                 return;
             }
-            out = synth::render_view(emu->scene, p, sensor == 0 ? emu->rig.left : emu->rig.right,
-                                     sensor == 0 ? T_wl : T_wl * T_left_right, rp)
+            // The stream's left camera is sensor usb::kLeftSensor.
+            const bool left = sensor == usb::kLeftSensor;
+            out = synth::render_view(emu->scene, p, left ? emu->rig.left : emu->rig.right, left ? T_wl : T_wl * T_left_right, rp)
                       .image;
         });
         auto t = sim->connect();
@@ -117,10 +120,19 @@ Result<std::unique_ptr<Session>> Session::open(bool emulator, UpdateSink updates
     std::string calibration_source = "flash";
     auto blob = s->device_->read_flash(0, calib::kFlashBlobSize);
     if (!blob) return std::unexpected(blob.error());
-    if (auto cal = calib::decode_flash_blob(*blob)) {
-        rig = cal->rig();
-        calibration_source = std::format("flash, {}", cal->calibration_time);
-        log::info("calibration {} from device flash, baseline {:.3f} mm", cal->calibration_time, rig.baseline_mm());
+    if (auto cal = calib::read_flash_calibration(*blob)) {
+        rig = cal->rig;
+        const auto& when = cal->calibration.calibration_time;
+        calibration_source = std::format("flash, {}", when);
+        log::info("calibration {} from device flash, baseline {:.3f} mm", when, rig.baseline_mm());
+        if (cal->converted) {
+            // Written by Einstar Calibration before 2026-10-04, in the old camera convention (calib/convention.hpp).
+            calibration_source += ", converted from the old camera convention";
+            log::warn("the scanner's calibration ({}) is in Einstar's old camera convention (principal points {:.1f} px from the "
+                      "factory calibration as stored, {:.1f} px converted): used converted. EXStar reads it unconverted, with "
+                      "rows 1-7 px apart: recalibrate (EXStar or Einstar Calibration) or restore EXStar's calibration",
+                      when, cal->check.as_is_px, cal->check.swapped_px);
+        }
     } else if (s->emulated_) {
         rig = emu->rig;
     } else {

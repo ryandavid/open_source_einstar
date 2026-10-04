@@ -28,7 +28,9 @@ namespace einstar::recon {
 struct ProcessParams {
     // Fragments
     int fragment_frames = 40;
-    double fragment_max_gap_s = 0.5;  // a longer gap between tracked frames starts a new fragment
+    // A longer gap between tracked frames starts a new fragment (~22 frames at 14.77 Hz; 0.5 s while frame
+    // times ran 3x fast).
+    double fragment_max_gap_s = 1.5;
     int cloud_stride_px = 2;
     float cloud_voxel_mm = 1.0f;
     // Pose graph

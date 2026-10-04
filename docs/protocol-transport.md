@@ -378,7 +378,7 @@ which starts at slot+4. Multi-byte fields are big-endian.
 | 8 | 1 | **EOF flag**: 1 = last packet of the frame (used by both layer and plugin) | [H] |
 | 9–11 | 3 | not read by host | [L] |
 | 12–15 | 4 | BE32, taken from the **last** packet of the frame → metadata field (frame index/counter) | [M] |
-| 16–23 | 8 | BE64, taken from the **first** packet of the frame → metadata field (timestamp). **Constant** on the scanner (2344 in every frame, measured): EinstarDevice replaces it with time on the trigger schedule (group id × trigger period / IR triggers per cycle) | [H] |
+| 16–23 | 8 | BE64, taken from the **first** packet of the frame → metadata field (EXStar calls it a timestamp). On the scanner it **counts trigger cycles**: it rises once every 3 groups in scan mode (3 mono triggers), stands still while triggering is off, and ran 1733 → 2499 over EXStar's texture-mode board captures (an earlier reading of "2344 in every frame" was one stretch without triggers). EinstarDevice stamps groups on the trigger schedule instead: group id × trigger period (each IR trigger gives one pair, one period apart) | [H] |
 | 24–31 | 8 | not read by host | [L] |
 | 32… | actual_len−32 | image payload (raw 8-bit pixels, row-major) | [H] |
 
@@ -633,7 +633,7 @@ Answered by the firmware (firmware.md), kept for reference:
    written by the FPGA, not the FX3 firmware. Still open: are the two 3-bit
    fields in byte 2 the camera index and the image type? Are bytes 12–15 a
    frame counter (it counts modulo 256 on the scanner, status.md)? Bytes 16–23
-   are not a timestamp: the scanner sends the same value (2344) in every frame.
+   are not a timestamp: they count trigger cycles (3.6).
 6. ~~Masked replies or requests~~: never. The firmware ignores request byte 1.
 7. ~~Interrupt IN reply sizes~~: 9 + the declared length, at most 51 bytes
    (00/05). 00/04 and 00/07 declare more than they fill (firmware.md 5.1).

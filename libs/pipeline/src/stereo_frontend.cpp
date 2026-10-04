@@ -366,7 +366,7 @@ int StereoFrontend::detect_sensor_order(const usb::FrameGroup& group) {
     };
     const auto a = count(process(group.sensors[0]->pixels, group.sensors[1]->pixels));
     const auto b = count(process(group.sensors[1]->pixels, group.sensors[0]->pixels));
-    left_sensor_ = a >= b ? 0 : 1;
+    left_sensor_ = a > b ? 0 : b > a ? 1 : usb::kLeftSensor;
     log::info("sensor order: left IR is sensor {} ({} vs {} valid depth pixels)", left_sensor_, a, b);
     return left_sensor_;
 }

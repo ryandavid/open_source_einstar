@@ -520,7 +520,7 @@ Result<void> EinstarDevice::start_stream(GroupSink sink) {
                 if (last && g.frame_id < *last && *last <= 0xFFu) base += 256;
                 last = g.frame_id;
                 g.frame_id += base;
-                // Time from the trigger schedule (the header's timestamp field is a constant on the scanner).
+                // Time from the trigger schedule (the header's 64-bit field counts trigger cycles, not time).
                 const std::uint64_t interval = group_interval_us();
                 time_us = previous && g.frame_id > *previous ? time_us + (g.frame_id - *previous) * interval
                                                              : previous ? time_us + interval : (g.frame_id + 1ull) * interval;

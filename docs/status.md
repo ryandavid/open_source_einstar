@@ -28,9 +28,12 @@
   first request could repeat the last number of the previous session, which the firmware drops
   (docs/firmware.md 5): sessions now start at a random sequence number, and device status errors are
   reported with their meaning and not retried.
-- **Sensor 1 is mounted upside down**: its frames arrive rotated 180 degrees relative to the calibration
-  (only that orientation gives stereo depth; rectified rows then agree to ~1 px on the markers). The device
-  layer turns it upright; the emulator sends it rotated. Sensor 0 is the left camera.
+- **Sensor 1 is the left IR camera; sensor 0, the right one, is mounted upside down** (its frames arrive
+  turned 180 degrees). This is EXStar's assignment (libSn3DDeviceEinStar's image callback); until 2026-10-04
+  we had sensor 0 left and turned sensor 1, which is EXStar's pair turned 180 degrees with left and right
+  exchanged: stereo works either way, but a calibration of one does not fit the other. That is what the
+  "rows 1-7 px apart with the flash calibration" below was (docs/calibration.md 8.2). The device layer
+  turns sensor 0 upright; the emulator sends it turned.
 - **Group ids count modulo 256** (the header field is 32 bits): the device layer extends them so frame
   indices keep increasing (a 20 s stream: 300 of 300 groups, no gaps across the wrap).
 - Image-endpoint stalls are cleared and the stream resumed. Clearing the halt arms the firmware's full
@@ -40,6 +43,9 @@
 - Exposure and gain write + read back on all three sensors; state polling; 10/62 accepted for DISTANCE 0/1/2
   (which selects FPGA laser modes 4/1/2, docs/firmware.md 5, not only indicator LEDs).
 - Scan streaming: 14.77 Hz (68 ms trigger), every group complete, no frame-id gaps, resyncs or bad packets.
+  With 3 mono triggers per cycle each trigger gives one IR pair, one period apart (the header's 64-bit field
+  rises once every 3 groups). Frame times were stamped at a third of the period until 2026-10-04 (recordings
+  of before run 3x fast; the reader rescales them) and the emulator sent 3 pairs per period.
   Texture mode (1 IR + RGB): 10.04 Hz, all three sensors in every group. USB 2.0 carries both.
 - Strobe route 0 lights the scene (IR level 12 -> 200-252 at exposure 4400 / gain 120). The "LD" register
   (10/68, `set_laser_percent`) alone changed nothing in the images, with DISTANCE 1 (laser mode 1) selected
@@ -56,7 +62,9 @@
   after giving saturated blobs a looser dark-ring test and raising the minimum size to 6 px (on the
   scanner's IR the sticker surround is barely darker than the surface; real speckle and glints are
   under 7 px).
-- **The scanner no longer matches its stored calibration.** With the flash calibration, rectified rows of
+- **(Superseded 2026-10-04: the cameras were swapped, see the first bullet and docs/calibration.md 8.2.
+  EXStar's 09-27 calibration fits our scans to 0.07-0.09 px rows in its own convention.)**
+  **The scanner no longer matches its stored calibration.** With the flash calibration, rectified rows of
   matching markers disagree by up to ~7 px (stereo markers fail, depth is sparse), while EXStar's own
   captures from that calibration run (tests/fixtures/external/calibration_board) fit it to 0.05 px.
   EXStar forms frames exactly as we do (its saved right images carry the per-frame metadata at the end,
@@ -74,7 +82,7 @@
   ICP failed on ~99% of frames. Causes, found by replaying the recordings (`einstar-cli track-session`):
   the scanner's first frames after the lights switch on have no depth, and the tracker started its model
   on one, so nothing could ever align (also marker capture starting without markers: nothing registered);
-  and the stream header's timestamp is a constant, so motion prediction never ran. Now a scan starts on a
+  and the stream header's 64-bit field is not a time (it counts trigger cycles), so motion prediction never ran. Now a scan starts on a
   frame with depth over 5% of the view (or 3 markers; marker capture needs the markers), restarts itself
   if it loses track within its first 15 frames, and frame times come from the trigger schedule. Replayed
   with these, one recording went from 1 to 764 of 955 frames tracked.

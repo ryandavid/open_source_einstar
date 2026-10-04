@@ -105,7 +105,7 @@ int usage() {
                  "       board-check <calibration dir> <dir>... |\n"
                  "       board-poses <calibration> <dir>... [--pad N] |\n"
                  "       calib-solve <captures dir> [--reference <calibration>] [--save <file>] [--no-distortion | --distortion-from <calibration>] [--nominal-board] |\n"
-                 "       calib-refine <session.estr> [--calibration <calibration>] [--offset-only] [--save <file> [--force]] |\n"
+                 "       calib-refine <session.estr> [--calibration <calibration>] [--swap-cameras] [--offset-only] [--save <file> [--force]] |\n"
                  "       fixture-pack --out DIR [--mustang <Project1.ir_E10_prj>] [--stl mesh.stl] [--board <dir>] |\n"
                  "       track-fixture <project.ir_E10_prj> [--start N] [--count N] [--skip K] [--stl ref.stl] [--cpu] [--mode geometry|hybrid|markers] [--global-markers] [--marker-confirm N] [--record out.estr] [--quiet] |\n"
                  "       process <session.estr> [-o mesh.stl|ply|obj] [--voxel MM] [--no-optimize] [--smooth N] [--stl reference.stl] [--reference-poses file] [--render out.pgm [--render-frame view.txt]] [--no-edge-filter | --edge-radius N --rim-radius N --min-region PX] [--no-grazing-weight] [--no-grazing-filter | --max-view-angle DEG --steep-rim PX --steep-rim-angle DEG] [--min-weight W] [--min-observations N] [--min-component F] |\n"
@@ -2303,9 +2303,14 @@ int calib_refine(std::span<char*> args) {
         std::println(stderr, "{}: no scanner record (DEVC), so no calibration to check", args[0]);
         return 1;
     }
-    const auto pairs = session_marker_pairs(s);
+    auto pairs = session_marker_pairs(s);
     // Another calibration can be checked against the same markers (they are back in raw pixels).
     RigCalibration rig = s.device()->rig;
+    if (has_flag(args, "--swap-cameras")) {
+        // The other camera convention: left and right exchanged, each image turned 180 degrees.
+        const double W = rig.left.width - 1.0, H = rig.left.height - 1.0;
+        for (auto& p : pairs) p = {Vec2(W - p.right.x(), H - p.right.y()), Vec2(W - p.left.x(), H - p.left.y())};
+    }
     if (const char* other = arg_str(args, "--calibration")) {
         auto cal = load_calibration(other);
         if (!cal) {

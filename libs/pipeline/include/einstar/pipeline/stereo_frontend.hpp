@@ -12,6 +12,7 @@
 #include "einstar/markers/detect.hpp"
 #include "einstar/markers/stereo.hpp"
 #include "einstar/track/frame.hpp"
+#include "einstar/usb/constants.hpp"
 #include "einstar/usb/stream.hpp"
 
 namespace einstar::pipeline {
@@ -89,7 +90,7 @@ private:
     calib::RemapTable map_left_, map_right_;
     depth::StereoParams stereo_;
     track::Intrinsics depth_k_;
-    int left_sensor_ = 0;
+    int left_sensor_ = usb::kLeftSensor;
     std::unique_ptr<markers::MarkerStereo> marker_stereo_;
     std::unique_ptr<depth_metal::MetalStereo> metal_;
     mutable std::mutex metal_mutex_;

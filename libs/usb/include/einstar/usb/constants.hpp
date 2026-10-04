@@ -40,9 +40,14 @@ inline constexpr std::size_t kStreamMaxPayload = kStreamDeviceBufferSize - kStre
 inline constexpr unsigned kStreamTransferTimeoutMs = 500;
 inline constexpr std::size_t kStreamTransfersInFlight = 32;
 
-// Sensor 1 (the second IR camera) is mounted upside down: its frames arrive rotated by 180 degrees
-// relative to the calibration (measured on the scanner: only that rotation gives stereo depth).
-// EinstarDevice returns it upright; the emulator sends it rotated like the scanner.
-inline constexpr int kUpsideDownSensor = 1;
+// Which stream sensor is which camera, as EXStar has it (libSn3DDeviceEinStar's image callback): sensor 1
+// (packet field A = 2) is the left IR camera, sensor 0 (field A = 1) the right one, and the right one is
+// mounted upside down, so its frames arrive turned 180 degrees. EinstarDevice returns it upright; the
+// emulator sends it turned like the scanner. Until 2026-10-04 we had it the other way round (sensor 0 left,
+// sensor 1 turned): that pair is EXStar's turned 180 degrees with left and right exchanged, stereo works
+// either way, but a calibration from one convention does not fit images in the other
+// (calib::swap_camera_convention converts; docs/calibration.md 8.2).
+inline constexpr int kLeftSensor = 1;
+inline constexpr int kUpsideDownSensor = 0;
 
 }  // namespace einstar::usb

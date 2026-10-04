@@ -253,9 +253,11 @@ private:
     std::atomic<int> rgb_triggers_{0};  // (also set by the heartbeat when it replays the trigger)
     std::atomic<int> mono_triggers_{1};
     std::atomic<std::uint32_t> trigger_period_us_{68000};
-    [[nodiscard]] std::uint64_t group_interval_us() const {
-        return trigger_period_us_.load() / static_cast<std::uint32_t>(std::max(1, mono_triggers_.load()));
-    }
+    // Each IR trigger gives one image pair, one trigger period apart (14.77 Hz at 68 ms with 3 mono triggers
+    // per cycle, measured; the header's 64-bit field counts cycles, rising once every `mono` groups). Until
+    // 2026-10-04 this divided by the mono count, so recordings made before then run 3x fast in scan mode
+    // (session::SessionReader rescales them).
+    [[nodiscard]] std::uint64_t group_interval_us() const { return trigger_period_us_.load(); }
     std::mutex settings_mutex_;
     Settings settings_;
 

@@ -521,7 +521,7 @@ void ScanPipeline::push(usb::FrameGroup&& group) {
         auto t = static_cast<std::uint64_t>(static_cast<std::int64_t>(group.timestamp) + n.time_offset_us);
         if (n.any && (id <= n.last_id || t <= n.last_time_us)) {
             const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - n.last_arrival).count();
-            const std::uint64_t next_t = n.last_time_us + static_cast<std::uint64_t>(std::max<std::int64_t>(elapsed, 22'676));
+            const std::uint64_t next_t = n.last_time_us + static_cast<std::uint64_t>(std::max<std::int64_t>(elapsed, 68'000));
             n.id_offset = static_cast<std::int64_t>(n.last_id + 1) - static_cast<std::int64_t>(group.frame_id);
             n.time_offset_us = static_cast<std::int64_t>(next_t) - static_cast<std::int64_t>(group.timestamp);
             log::info("frame numbering: the stream restarted at frame {} (after {}); continuing from {}", group.frame_id, n.last_id, n.last_id + 1);
@@ -675,6 +675,8 @@ void ScanPipeline::load_recording(std::string recording, std::function<void(Load
         {
             std::lock_guard lock(recorder_mutex_);
             if (rd.device() && device_record_ && rd.device()->serial != device_record_->serial) res.resumable = false;
+            // (A recording in the old camera convention has its depth from the other camera.)
+            if (rd.device() && rd.device()->camera_convention != 1) res.resumable = false;
         }
         if (!res.resumable) res.note = "recorded with another scanner or calibration: it can be viewed, edited and processed; a new scan starts a new recording";
 

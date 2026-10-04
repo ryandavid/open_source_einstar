@@ -11,6 +11,7 @@
 
 #include <tbb/parallel_invoke.h>
 
+#include "einstar/calib/convention.hpp"
 #include "einstar/calib/device_calibration.hpp"
 #include "einstar/calibrate/captures.hpp"
 #include "einstar/calibrate/synthetic.hpp"
@@ -18,6 +19,7 @@
 #include "einstar/core/timing.hpp"
 #include "einstar/sim/sim_transport.hpp"
 #include "einstar/synth/demo.hpp"
+#include "einstar/usb/constants.hpp"
 
 namespace einstar::app {
 namespace {
@@ -142,7 +144,7 @@ Result<void> CalibrationController::connect(bool emulator) {
                 std::tie(emu->left, emu->right) = calibrate::render_board_pair(emu->truth, emu->hand, emu->board, sp);
                 emu->cached_id = frame_id;
             }
-            out = sensor == 0 ? emu->left : emu->right;
+            out = sensor == usb::kLeftSensor ? emu->left : emu->right;
         });
         auto t = sim->connect();
         if (!t) return std::unexpected(t.error());
@@ -189,7 +191,8 @@ Result<void> CalibrationController::reread_flash() {
     auto blob = device_->read_flash(0, calib::kFlashBlobSize);
     if (!blob) return std::unexpected(blob.error());
     flash_blob_ = *blob;
-    if (auto cal = calib::decode_flash_blob(*blob)) flash_ = cal->rig(), flash_time_ = cal->calibration_time;
+    // (In EXStar's camera convention, converted if it was written in the old one: calib/convention.hpp.)
+    if (auto cal = calib::read_flash_calibration(*blob)) flash_ = cal->rig, flash_time_ = cal->calibration.calibration_time;
     if (auto cal = calib::decode_factory_section(*blob)) factory_ = cal->rig();
     guidance_rig_ = flash_ ? *flash_ : synth::synthetic_einstar_rig();
     return {};
@@ -438,9 +441,9 @@ Result<void> CalibrationController::load_reference(const fs::path& path) {
     } else if (path.extension() == ".bin") {
         std::ifstream f(path, std::ios::binary);
         const std::vector<std::uint8_t> blob((std::istreambuf_iterator<char>(f)), {});
-        auto cal = calib::decode_flash_blob(blob);
+        auto cal = calib::read_flash_calibration(blob);
         if (!cal) return std::unexpected(cal.error());
-        flash = cal->rig(), time = cal->calibration_time;
+        flash = cal->rig, time = cal->calibration.calibration_time;
         if (auto fac = calib::decode_factory_section(blob)) factory = fac->rig();
     } else {
         auto file = calibrate::read_calibration_file(path.string());

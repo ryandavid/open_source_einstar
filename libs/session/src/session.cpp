@@ -192,6 +192,7 @@ std::vector<std::uint8_t> encode_device(const DeviceRecord& d) {
     p.put_mat3(d.R_rect_left), p.put_mat3(d.R_rect_right);
     p.put_camera(d.rectified);
     p.put_camera(d.rectified_right);  // (absent before per-camera principal points)
+    p.put(static_cast<std::int32_t>(d.camera_convention));  // (absent before 2026-10-04: the old convention)
     return std::move(p.b);
 }
 
@@ -205,6 +206,7 @@ DeviceRecord decode_device(Reader& rd) {
     d.rectified = rd.get_camera();
     d.rectified_right = d.rectified;
     if (rd.p < rd.end) d.rectified_right = rd.get_camera();
+    d.camera_convention = rd.p < rd.end ? rd.get<std::int32_t>() : 0;
     return d;
 }
 
@@ -739,6 +741,30 @@ Result<std::unique_ptr<SessionReader>> SessionReader::open(const std::string& pa
     }
     r->in_.clear();
     if (!have_header) return make_error(Errc::protocol, path + " has no session header");
+    // Frame times of the old convention: steps of period / k per frame number (k IR triggers per cycle) where
+    // each frame is one period after the last.
+    if (!r->device_ || r->device_->camera_convention == 0) {
+        std::vector<double> steps;
+        std::uint32_t period = 0;
+        for (std::size_t i = 1; i < r->frames_.size(); ++i) {
+            const auto& a = r->frames_[i - 1];
+            const auto& b = r->frames_[i];
+            if (b.extras && b.extras->capture.trigger_period_us > 0) period = b.extras->capture.trigger_period_us;
+            if (b.index > a.index && b.timestamp_s > a.timestamp_s)
+                steps.push_back((b.timestamp_s - a.timestamp_s) / static_cast<double>(b.index - a.index));
+        }
+        if (period > 0 && steps.size() >= 10) {
+            std::ranges::nth_element(steps, steps.begin() + static_cast<std::ptrdiff_t>(steps.size() / 2));
+            const double step = steps[steps.size() / 2], p = period * 1e-6;
+            const double k = std::round(p / step);
+            if (k >= 2 && k <= 8 && std::abs(step * k - p) < 0.03 * p) {
+                r->time_scale_ = k;
+                for (auto& f : r->frames_) f.timestamp_s *= k;
+                for (auto& d : r->dropped_) d.timestamp_s *= k;
+                for (auto& w : r->raws_) w.timestamp_s *= k;
+            }
+        }
+    }
     return r;
 }
 
@@ -802,7 +828,7 @@ Result<RawFrame> SessionReader::read_raw(std::size_t i) const {
     Reader rd{data.data(), data.data() + data.size()};
     RawFrame f;
     f.index = rd.get<std::uint64_t>();
-    f.timestamp_s = rd.get<double>();
+    f.timestamp_s = rd.get<double>() * time_scale_;
     const auto n = rd.get<std::uint32_t>();
     for (std::uint32_t k = 0; k < n && rd.ok; ++k) {
         const auto sensor = rd.get<std::int32_t>(), w = rd.get<std::int32_t>(), h = rd.get<std::int32_t>();

@@ -752,9 +752,13 @@ and 14:24:56. Each is followed by the replay (section 2) and ClearState
    and a long press as 3 followed 1-2 s later by 2.
 3. **Packet byte 2 bits 2..0** (sub-field B, written to image byte 0): is it
    the pattern/trigger index within a MONOTRIGCOUNT burst?
-4. **Which physical sensor is index 0 or 1**: sensor 0 is the left IR camera.
-   Sensor 1 is mounted upside down; its frames must be rotated 180° to match
-   the calibration (status.md "Verified on the scanner").
+4. **Which physical sensor is index 0 or 1** (answered 2026-10-04, from
+   libSn3DDeviceEinStar's image callback): sensor 1 (field A = 2) is the left IR
+   camera and sensor 0 (field A = 1) the right one, mounted upside down: its frames
+   are turned 180° before use (docs/calibration.md 8.2). Earlier text here had it
+   the other way round (sensor 0 left, sensor 1 turned).
+3a. **Sub-field B** is 0 in all of EXStar's saved board images and EXStar never reads it;
+   the three triggers of a scan cycle each give one IR pair, one period apart.
 5. **Bayer phase.** Code 48 implies BGGR at (0,0) under OpenCV naming. Check
    the SC130GS CFA readout and any FPGA flip.
 6. **Strobe route 0 / route 1 and "LD"** hardware mapping (IR flood versus

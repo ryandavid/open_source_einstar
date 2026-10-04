@@ -15,6 +15,7 @@
 #include "einstar/pipeline/scan_pipeline.hpp"
 #include "einstar/sim/sim_transport.hpp"
 #include "einstar/synth/speckle_scene.hpp"
+#include "einstar/usb/constants.hpp"
 #include "synthetic_setup.hpp"
 
 using namespace einstar;
@@ -28,7 +29,9 @@ TEST_CASE("emulated scanner through the full live pipeline tracks the true traje
 
     auto [emulator, transport] = sim::make_sim_scanner();
     emulator->set_frame_provider([&](int sensor, std::uint32_t frame_id, ImageU8& out) {
-        e2e::render_sensor(setup, rig, truth_pose(frame_id), sensor, frame_id * 3 + static_cast<std::uint32_t>(sensor), out);
+        // (render_sensor takes the camera: 0 left, 1 right; the stream's left camera is usb::kLeftSensor.)
+        const int camera = sensor == usb::kLeftSensor ? 0 : 1;
+        e2e::render_sensor(setup, rig, truth_pose(frame_id), camera, frame_id * 3 + static_cast<std::uint32_t>(camera), out);
     });
 
     device::ConnectOptions opts;

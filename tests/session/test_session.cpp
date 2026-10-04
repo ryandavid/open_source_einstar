@@ -305,3 +305,36 @@ TEST_CASE("a recording is continued: appended after its last complete record, th
     CHECK((*r)->complete_bytes() == std::filesystem::file_size(path));
     REQUIRE((*r)->read(13).has_value());
 }
+
+TEST_CASE("recordings from before the camera-convention change get their frame times back") {
+    // Until 2026-10-04 scan-mode frames were stamped a third of the 68 ms trigger period apart and the scanner
+    // record had no camera convention: such a file reads at the real 68 ms per frame. A current one as written.
+    std::mt19937 rng(9);
+    for (const bool old : {true, false}) {
+        const auto path = (std::filesystem::temp_directory_path() / (old ? "einstar_old_times.estr" : "einstar_new_times.estr")).string();
+        {
+            auto w = session::SessionWriter::create(path, {});
+            REQUIRE(w.has_value());
+            session::DeviceRecord dev;
+            dev.serial = "S";
+            dev.camera_convention = old ? 0 : 1;
+            (*w)->write_device(dev);
+            for (std::uint64_t i = 0; i < 20; ++i) {
+                auto f = make_frame(i, rng);
+                f.timestamp_s = (old ? 0.068 / 3 : 0.068) * static_cast<double>(i);
+                session::FrameExtras ex;
+                ex.capture.trigger_period_us = 68000;
+                f.extras = ex;
+                (*w)->write(std::move(f));
+            }
+            (*w)->close();
+        }
+        auto r = session::SessionReader::open(path);
+        REQUIRE(r.has_value());
+        REQUIRE((*r)->device().has_value());
+        CHECK((*r)->device()->camera_convention == (old ? 0 : 1));
+        CHECK((*r)->time_scale() == (old ? 3.0 : 1.0));
+        CHECK(std::abs((*r)->meta(19).timestamp_s - 19 * 0.068) < 1e-9);
+        std::filesystem::remove(path);
+    }
+}
