@@ -41,6 +41,10 @@ Modelling (the model app) -- the user describes the part in words and measuremen
   model_constraint_add (distance between faces, offset from the datum, diameter, angle, axis_distance for hole
   pitches and bolt circles, tangent, symmetric, equal_radius ...). Holes can be named wherever an axis is meant.
 - Holes: detection measures counterbores, countersinks and drill points; model_hole_update sets or corrects them.
+  Small holes the scan bridged over have no opening to find: model_hole_add places one from a diameter the user
+  marked on a registered photo (or at a centre point).
+- A feature the scan barely saw (a clip) or a hollow one (a tab with walls): model_block_add on planes of its own
+  (model_face_add_plane), added or cut (a pocket). An unseen face added without a block splits the whole part.
 - A face no primitive fits (a domed or sculpted surface): model_freeform on a label painted on it.
 - model_solve's 'scale' says whether the user's measurements show the scan too large or small; offer model_scale
   when it is significant (and suggest checking the scanner's calibration).

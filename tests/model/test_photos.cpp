@@ -337,3 +337,112 @@ TEST_CASE("a measurement on a photo applied to the model: by its links, a distan
     CHECK(listed[0]["applied"]["last_solve"]["status"].is_string());
     std::println("D1 after the solve: {}", listed[0]["applied"]["last_solve"].dump());
 }
+
+TEST_CASE("holes the scan bridged over: placed from a diameter marked on a photo, or at a point, then solved and built") {
+    TempDir tmp;
+    model::Document doc;
+    run(doc, "open_demo");
+    run(doc, "detect");
+    const auto label_at = [&](json origin, json dir) { return run(doc, "raycast", {{"origin", origin}, {"direction", dir}})["label"].get<std::string>(); };
+    run(doc, "label.update", {{"label", label_at({10, 8, 100}, {0, 0, -1})}, {"name", "top"}});
+    run(doc, "label.update", {{"label", label_at({80, 3, 12}, {-1, 0, 0})}, {"name", "right"}});
+    run(doc, "label.update", {{"label", label_at({-80, 3, 12}, {1, 0, 0})}, {"name", "left"}});
+    const std::string flange = label_at({45, 0, 100}, {0, 0, -1});
+    run(doc, "datum.create", {{"name", "part"}, {"z", "top"}, {"x", "right"}});
+    run(doc, "square", {{"datum", "part"}});
+    run(doc, "constraint.add", {{"type", "symmetric"}, {"a", "left"}, {"b", "right"}, {"datum", "part"}, {"axis", "x"}});  // x = 0 in the middle
+    const auto hole_at = [&](double x, double y) -> json {
+        for (const auto& h : run(doc, "summary")["holes"])
+            if (std::hypot(h["center"][0].get<double>() - x, h["center"][1].get<double>() - y) < 1) return h;
+        return nullptr;
+    };
+    const double volume_scanned = run(doc, "build")["volume_mm3"];
+
+    // Two of the flange holes as if the scan had filled them in: gone from the model.
+    run(doc, "hole.delete", {{"hole", hole_at(42, -19)["name"]}});
+    run(doc, "hole.delete", {{"hole", hole_at(-42, -19)["name"]}});
+
+    // A photo from above and to one side, matched to the scan.
+    const int W = 1600, H = 1200;
+    fit::PinholeCamera truth;
+    truth.focal = fit::focal_from_35mm(28, W, H);
+    truth.principal = Vec2(W / 2.0, H / 2.0);
+    const Vec3 eye(110, -150, 160), target(0, 0, 8);
+    const Vec3 z = (target - eye).normalized(), x = z.cross(Vec3::UnitZ()).normalized(), y = z.cross(x);
+    Mat3 R;
+    R.row(0) = x.transpose();
+    R.row(1) = y.transpose();
+    R.row(2) = z.transpose();
+    truth.T_camera_world.linear() = R;
+    truth.T_camera_world.translation() = -R * eye;
+    run(doc, "photo.import", {{"path", write_photo(tmp.path, "side.jpg", W, H).string()}});
+    for (const Vec3& c : std::vector<Vec3>{{-50, -25, 4}, {50, -25, 4}, {50, 25, 4}, {-30, -20, 20}, {30, -20, 20}, {30, 20, 20}, {-30, 20, 20}, {50, -25, 1.5}}) {
+        const Vec3 on = doc.bvh().closest(c.cast<float>())->point.cast<double>();
+        const Vec2 px = *truth.project(on);
+        run(doc, "photo.correspond", {{"photo", "side"}, {"pixel", {px.x(), px.y()}}, {"point", {on.x(), on.y(), on.z()}}});
+    }
+
+    // The user's caliper reading, marked on the hole's rim in the photo.
+    json rim = json::array();
+    for (const double t : {0.3, 2.2, 4.1}) {
+        const Vec2 q = *truth.project(Vec3(42 + 2.75 * std::cos(t), -19 + 2.75 * std::sin(t), 4));
+        rim.push_back({q.x(), q.y()});
+    }
+    const json dia = run(doc, "photo.annotate", {{"photo", "side"}, {"kind", "diameter"}, {"points", rim}, {"value", "5.5"}});
+    CHECK(fails(doc, "photo.apply", {{"annotation", dia["name"]}}));  // no hole to apply it to yet
+
+    // Placed from the photo: on the face under its rim, where the photo sees it, the reading as its size.
+    const json placed = run(doc, "hole.add", {{"annotation", dia["name"]}}, model::Author::agent);
+    std::println("placed from the photo: {}", placed.dump());
+    CHECK(placed["host"] == flange);
+    CHECK(std::hypot(placed["center"][0].get<double>() - 42, placed["center"][1].get<double>() + 19) < 0.1);
+    CHECK(std::abs(placed["center"][2].get<double>() - 4) < 0.1);
+    CHECK(placed["axis"][2].get<double>() < -0.999);  // into the flange
+    CHECK(placed["measured_from"] == "photo");
+    CHECK(std::abs(placed["measured_diameter"].get<double>() - 5.5) < 0.1);
+    CHECK(placed.contains("applied"));
+    CHECK(placed["diameter"].get<double>() == 5.5);  // the reading, not the photo's measure
+    const json listed = run(doc, "photo.list", {{"photo", "side"}})["photos"][0]["annotations"][0];
+    CHECK(listed["links"] == json::array({placed["name"]}));
+    CHECK(run(doc, "summary")["holes"].back()["diameter"].get<double>() == Approx(5.5));
+    CHECK(fails(doc, "hole.add", {{"annotation", dia["name"]}}));  // it is there already
+
+    // At a point: the face and the diameter are needed.
+    CHECK(fails(doc, "hole.add", {{"center", {-42, -19, 4}}, {"diameter", 5.5}}));
+    CHECK(fails(doc, "hole.add", {{"face", flange}, {"center", {-42, -19, 4}}}));
+    const json pointed = run(doc, "hole.add", {{"face", flange}, {"center", {-42.3, -19, 9}}, {"diameter", 5.5}, {"name", "left hole"}});
+    CHECK(pointed["measured_from"] == "point");
+    CHECK(std::abs(pointed["center"][2].get<double>() - 4) < 0.1);  // on the face
+
+    // A mirrored pair: the solve moves the placed holes (they have no scan to hold them), and keeps them on the face.
+    run(doc, "constraint.add", {{"type", "symmetric"}, {"a", placed["name"]}, {"b", "left hole"}, {"datum", "part"}, {"axis", "x"}});
+    const json solved = run(doc, "solve");
+    CHECK(solved["converged"].get<bool>());
+    for (const auto& c : solved["constraints"])
+        if (c["constraint"]["type"] == "symmetric") {
+            INFO(c.dump());
+            CHECK(c["last_solve"]["status"] == "satisfied");
+        }
+    CHECK(solved["scale"].is_null());  // a placed hole's size is not the scan's measure
+    const json a = hole_at(42, -19), b = hole_at(-42, -19);
+    REQUIRE(!a.is_null());
+    REQUIRE(!b.is_null());
+    CHECK(std::abs(a["center"][2].get<double>() - 4) < 0.1);
+    CHECK(std::abs(b["center"][2].get<double>() - 4) < 0.1);
+    // Mirrored about the datum's yz plane.
+    const json datum = run(doc, "summary")["datums"][0];
+    const auto v3 = [](const json& j) { return Vec3(j[0].get<double>(), j[1].get<double>(), j[2].get<double>()); };
+    const Vec3 o = v3(datum["origin"]), ex = v3(datum["x"]);
+    CHECK(std::abs((v3(a["center"]) - o).dot(ex) + (v3(b["center"]) - o).dot(ex)) < 0.01);
+
+    // Built as the scanned ones were; saved and read back as placed.
+    const json built = run(doc, "build");
+    CHECK(built["ok"].get<bool>());
+    CHECK(std::abs(built["volume_mm3"].get<double>() - volume_scanned) < 5.0);
+    const auto path = tmp.path / "placed.emodel";
+    run(doc, "save", {{"path", path.string()}});
+    model::Document again;
+    run(again, "open", {{"path", path.string()}});
+    const json back = run(again, "summary")["holes"];
+    CHECK(std::ranges::count_if(back, [](const json& h) { return h["measured_from"] == "photo" || h["measured_from"] == "point"; }) == 2);
+}

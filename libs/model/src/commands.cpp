@@ -104,6 +104,7 @@ struct Document::Impl {
         return std::ranges::any_of(d.state_.labels, [&](const Label& l) { return l.name == name; }) ||
                std::ranges::any_of(d.state_.holes, [&](const Hole& h) { return h.name == name; }) ||
                std::ranges::any_of(d.state_.fillets, [&](const Fillet& f) { return f.name == name; }) ||
+               std::ranges::any_of(d.state_.blocks, [&](const Block& b) { return b.name == name; }) ||
                std::ranges::any_of(d.state_.datums, [&](const Datum& x) { return x.name == name; });
     }
     std::string unique_name(const std::string& base) const {
@@ -210,6 +211,8 @@ struct Document::Impl {
         for (const auto& h : d.state_.holes) out["holes"].push_back(hole_json(h));
         out["fillets"] = json::array();
         for (const auto& f : d.state_.fillets) out["fillets"].push_back(fillet_json(f));
+        out["blocks"] = json::array();
+        for (const auto& b : d.state_.blocks) out["blocks"].push_back(block_json(b));
         out["datums"] = json::array();
         for (const auto& x : d.state_.datums)
             out["datums"].push_back({{"id", x.id}, {"name", x.name}, {"origin", vec_to_json(x.frame.translation())},
@@ -241,7 +244,7 @@ struct Document::Impl {
                   {"axis", vec_to_json(h.axis)},
                   {"diameter", h.used_diameter()},
                   {"measured_diameter", h.measured_diameter},
-                  {"measured_from", h.wall_seen ? "wall" : "opening"},
+                  {"measured_from", h.wall_seen ? "wall" : h.placed.empty() ? "opening" : h.placed},
                   {"wall_seen_to_depth", h.seen_depth},
                   {"through", !h.depth.has_value()}};
         if (h.diameter) j["set_diameter"] = *h.diameter;
@@ -253,6 +256,12 @@ struct Document::Impl {
         if (h.point_angle_deg) j["point_angle_deg"] = *h.point_angle_deg;
         if (h.wall_label) j["wall_label"] = label_name(h.wall_label);
         return j;
+    }
+    json block_json(const Block& b) const {
+        json faces = json::array(), bounds = json::array();
+        for (const int f : b.faces) faces.push_back(label_name(f));
+        for (const auto& bb : b.bounds) bounds.push_back({{"label", label_name(bb.label)}, {"side", bb.outside ? "outside" : "inside"}});
+        return {{"id", b.id}, {"name", b.name}, {"faces", faces}, {"bounds", bounds}, {"cut", b.cut}};
     }
     json fillet_json(const Fillet& f) const {
         json j = {{"id", f.id}, {"name", f.name}, {"between", {label_name(f.face_a), label_name(f.face_b)}}, {"radius", f.used_radius()},
@@ -417,11 +426,16 @@ struct Document::Impl {
         std::erase_if(d.state_.fillets, [&](const Fillet& f) { return f.face_a == id || f.face_b == id; });
         for (auto& f : d.state_.fillets)
             if (f.label == id) f.label = 0;
+        const auto blocks_removed = std::erase_if(d.state_.blocks, [&](const Block& b) {
+            return std::ranges::contains(b.faces, id) || std::ranges::any_of(b.bounds, [&](const BlockBound& bb) { return bb.label == id; });
+        });
         const auto removed = std::erase_if(d.state_.constraints, [&](const ConstraintDef& c) { return refers_to_label(c.spec, id); });
         d.state_.solved.erase(id);
         forget_links(id);
         for (const int h : holes_gone) forget_links(h);
-        return {{"deleted", id}, {"constraints_removed", removed}};
+        json out = {{"deleted", id}, {"constraints_removed", removed}};
+        if (blocks_removed) out["blocks_removed"] = blocks_removed;
+        return out;
     }
 
     static bool refers_to_label(const json& spec, int id) {
@@ -822,6 +836,147 @@ struct Document::Impl {
             h.depth = *depth;
         }
         return hole_json(h);
+    }
+
+    // The plane face a diameter marked on a photo is on: a face it is linked to, else the plane face nearest its
+    // rim on the scan (within a few mm of the face's plane, beside the face's region). 0: none.
+    int face_of_rim(const Photo& ph, const Annotation& a) const {
+        const auto plane_face = [&](int id) {
+            const Label* l = d.label(id);
+            const auto s = l && l->role == Role::face ? surface_of(*l) : std::nullopt;
+            return s && std::holds_alternative<fit::Plane>(*s);
+        };
+        for (const int id : a.links)
+            if (plane_face(id)) return id;
+        const ScanReading r = read_on_scan(d, ph, a);
+        Vec3 c = Vec3::Zero();
+        int n = 0;
+        for (const auto& h : r.hits)
+            if (h) c += h->point, ++n;
+        if (n == 0) return 0;
+        c /= n;
+        int best = 0;
+        double best_distance = 3.0;  // mm
+        for (const auto& l : d.state_.labels) {
+            if (!plane_face(l.id)) continue;
+            const fit::Plane pl = std::get<fit::Plane>(*surface_of(l));
+            const double distance = std::abs(pl.normal.dot(c) - pl.offset);
+            if (distance >= best_distance) continue;
+            const auto tris = triangles_of(l.id);
+            if (std::ranges::any_of(tris, [&](std::uint32_t t) { return (d.topology().centroid(t).cast<double>() - c).norm() < 20.0; })) {
+                best = l.id;
+                best_distance = distance;
+            }
+        }
+        return best;
+    }
+
+    // A hole the scan has no opening for (bridged over, or never seen), on a plane face: from a diameter marked on
+    // a registered photo (its rim where the photo's rays cross the face) or at a point. It takes part in solves
+    // through its axis, held along the face's normal, as a hole found in the scan does.
+    json hole_add(const json& p) {
+        need_scan();
+        Photo* ph = nullptr;
+        Annotation* a = nullptr;
+        if (p.contains("annotation")) {
+            std::tie(ph, a) = annotation_ref(p["annotation"]);
+            if (a->kind != AnnotationKind::diameter) fail(std::format("{} is not a diameter", a->name));
+            if (!ph->camera) refuse(std::format("{}'s photo is not matched to the scan yet: match points on it first (model.photo.correspond)", a->name));
+        } else if (!p.contains("center")) {
+            fail("give a diameter marked on a photo (annotation) or the hole's centre (center)");
+        }
+        int host = p.contains("face") ? label_ref(p["face"]).id : a ? face_of_rim(*ph, *a) : 0;
+        if (!host) refuse(std::format("say which face {} opens in (face): no plane face is under its rim", a ? a->name : std::string("the hole")));
+        const Label& face = *d.label(host);
+        const auto s = face.role == Role::face ? surface_of(face) : std::nullopt;
+        const auto* plane = s ? std::get_if<fit::Plane>(&*s) : nullptr;
+        if (!plane) fail(std::format("'{}' is not a plane face", face.name));
+
+        Hole h;
+        h.host = host;
+        h.axis = -plane->normal;
+        if (a) {
+            const auto circle = circle_on_plane(*ph, *a, *plane);
+            if (!circle) refuse(std::format("{}'s rim does not meet '{}' as its photo sees it", a->name, face.name));
+            h.center = circle->centre;
+            h.measured_diameter = circle->diameter;
+            h.placed = "photo";
+        } else {
+            h.center = fit::project(*plane, vec_from_json(need(p, "center")));
+            h.placed = "point";
+        }
+        if (const auto v = opt<double>(p, "diameter")) {
+            if (!(*v > 0)) fail("the diameter must be positive");
+            h.diameter = *v;
+            if (!a) h.measured_diameter = *v;
+        } else if (!a) {
+            fail("give the hole's diameter (diameter)");
+        }
+        if (const auto depth = opt<double>(p, "depth")) {
+            if (!(*depth > 0)) fail("the depth must be positive");
+            h.depth = *depth;
+        }
+        h.measured_center = h.center;
+        for (const auto& other : d.state_.holes) {
+            const Vec3 q = h.center - other.center;
+            if (other.axis.cross(h.axis).norm() < 0.02 && (q - q.dot(other.axis) * other.axis).norm() < 0.5 * std::min(h.used_diameter(), other.used_diameter()))
+                refuse(std::format("'{}' is already there", other.name));
+        }
+        h.id = new_id();
+        int k = 1;
+        while (name_taken(std::format("hole {}", k))) ++k;
+        h.name = checked_name(p, std::format("hole {}", k));
+        d.state_.holes.push_back(h);
+        json applied;
+        if (a) {
+            // The annotation is now about the hole; its value (a caliper reading) is the hole's size.
+            a->links = {h.id};
+            if (a->value && !p.contains("diameter")) applied = photo_apply({{"annotation", a->id}})["applied"];
+        }
+        json out = hole_json(hole_ref(h.id));
+        if (a) out["annotation"] = a->name;
+        if (!applied.is_null()) out["applied"] = applied;
+        return out;
+    }
+
+    // A region bounded by planes, added to the built solid or cut from it (model.block.add).
+    json block_add(const json& p) {
+        need_scan();
+        Block b;
+        const auto plane_face = [&](const json& ref) {
+            const Label& l = label_ref(ref);
+            const auto s = l.role == Role::face ? surface_of(l) : std::nullopt;
+            if (!s || !std::holds_alternative<fit::Plane>(*s)) fail(std::format("'{}' is not a plane face", l.name));
+            return l.id;
+        };
+        for (const auto& ref : need(p, "faces")) {
+            const int id = plane_face(ref);
+            if (std::ranges::contains(b.faces, id)) fail(std::format("'{}' is listed twice", label_name(id)));
+            b.faces.push_back(id);
+        }
+        if (p.contains("bounds"))
+            for (const auto& bj : p["bounds"]) {
+                const json ref = bj.is_object() ? need(bj, "label") : bj;
+                const std::string side = bj.is_object() ? bj.value("side", std::string("inside")) : "inside";
+                if (side != "inside" && side != "outside") fail("a bound's side is 'inside' (its material side) or 'outside' (past it)");
+                const int id = plane_face(ref);
+                if (std::ranges::contains(b.faces, id)) fail(std::format("'{}' is both a face and a bound", label_name(id)));
+                b.bounds.push_back({id, side == "outside"});
+            }
+        if (b.faces.size() + b.bounds.size() < 4) fail("a block needs at least four planes to enclose a region");
+        b.cut = opt<bool>(p, "cut").value_or(false);
+        b.id = new_id();
+        b.name = checked_name(p, std::format("{} {}", b.cut ? "pocket" : "block", d.state_.blocks.size() + 1));
+        d.state_.blocks.push_back(b);
+        return block_json(b);
+    }
+    json block_delete(const json& p) {
+        const json& ref = need(p, "block");
+        const auto n = std::erase_if(d.state_.blocks, [&](const Block& b) {
+            return (ref.is_number_integer() && b.id == ref.get<int>()) || (ref.is_string() && b.name == ref.get<std::string>());
+        });
+        if (!n) fail(std::format("no block {}", ref.dump()));
+        return {{"deleted", ref}};
     }
 
     json hole_delete(const json& p) {
@@ -1501,6 +1656,10 @@ struct Document::Impl {
             }();
             spec = {{"type", "axis_distance"}, {"a", axes[0]}, {"b", axes[1]}, {"value", v}};
         }
+        if (spec.is_null() && !fillet && diameter && holes.empty() && fillets.empty() && round.empty())
+            refuse(std::format("{}: link the hole it measures. If the scan shows none there (it bridged over the hole), "
+                               "model.hole.add makes one from this annotation",
+                               a->name));
         if (spec.is_null() && !fillet)
             refuse(std::format("{}: its links do not say what it measures. Link two faces for a distance, two holes for a pitch, a hole "
                                "(with a diameter) for its size, a fillet (R...) for its radius, or two faces for an angle",
@@ -1593,6 +1752,11 @@ struct Document::Impl {
                 f = static_cast<int>(in.features.size());
                 rim_feature[h.id] = f;
                 in.features.push_back({fit::Cylinder{h.center, h.axis, r}, std::move(pts), {}, false});
+            } else {
+                // No opening in the scan (a placed hole): its axis, held by its constraints alone.
+                f = static_cast<int>(in.features.size());
+                rim_feature[h.id] = f;
+                in.features.push_back({fit::Cylinder{h.center, h.axis, 0.5 * h.used_diameter()}, {}, {}, false});
             }
             if (f < 0) continue;
             feature_of[h.id] = f;
@@ -1703,6 +1867,7 @@ struct Document::Impl {
             for (const auto& h : d.state_.holes)
                 if (h.id == id) {
                     if (const Label* wall = d.label(h.wall_label); wall && wall->fit) return wall->fit;
+                    if (!h.placed.empty()) return std::nullopt;  // not measured by the scan
                     return fit::Surface(fit::Cylinder{h.measured_center, h.axis, 0.5 * h.measured_diameter});
                 }
             return std::nullopt;
@@ -1714,7 +1879,7 @@ struct Document::Impl {
             const double m = s["value"].get<double>();
             if (type == "diameter" && s.contains("hole")) {
                 for (const auto& h : d.state_.holes)
-                    if (h.id == s["hole"].get<int>()) pairs.push_back({c.id, m, h.measured_diameter});
+                    if (h.id == s["hole"].get<int>() && h.placed.empty()) pairs.push_back({c.id, m, h.measured_diameter});
             } else if (type == "diameter" || type == "radius") {
                 const auto f = fitted(s["label"].get<int>());
                 const auto* cyl = f ? std::get_if<fit::Cylinder>(&*f) : nullptr;
@@ -1879,6 +2044,17 @@ struct Document::Impl {
             in.faces.push_back(std::move(f));
         }
         if (in.faces.empty()) refuse("no face labels with surfaces: paint and grow faces, or run model.detect");
+        for (const auto& b : d.state_.blocks) {
+            brep::BlockInput bi{b.name, {}, b.cut};
+            for (const int f : b.faces)
+                if (face_of.contains(f)) {
+                    in.faces[static_cast<std::size_t>(face_of[f])].arrangement = false;  // it bounds the block only
+                    bi.faces.push_back({face_of[f], false});
+                }
+            for (const auto& bb : b.bounds)
+                if (face_of.contains(bb.label)) bi.faces.push_back({face_of[bb.label], bb.outside});
+            in.blocks.push_back(std::move(bi));
+        }
         for (const auto& h : d.state_.holes)
             in.holes.push_back({h.name, h.center, h.axis, h.used_diameter(), h.depth, h.counterbore_diameter, h.counterbore_depth, h.countersink_diameter,
                                 h.countersink_angle_deg, h.point_angle_deg});
@@ -1986,6 +2162,9 @@ const std::map<std::string, CommandInfo, std::less<>>& table() {
         {"detect", {[](I& i, const json& p) { return i.detect(p); }, true}},
         {"find_holes", {[](I& i, const json& p) { return i.find_holes(p); }, true}},
         {"freeform", {[](I& i, const json& p) { return i.freeform(p); }, true}},
+        {"hole.add", {[](I& i, const json& p) { return i.hole_add(p); }, true}},
+        {"block.add", {[](I& i, const json& p) { return i.block_add(p); }, true}},
+        {"block.delete", {[](I& i, const json& p) { return i.block_delete(p); }, true}},
         {"hole.update", {[](I& i, const json& p) { return i.hole_update(p); }, true}},
         {"hole.delete", {[](I& i, const json& p) { return i.hole_delete(p); }, true}},
         {"fillet.add", {[](I& i, const json& p) { return i.fillet_add(p); }, true}},

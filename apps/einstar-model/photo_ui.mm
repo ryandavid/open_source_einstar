@@ -640,6 +640,8 @@ struct PhotoUi::Impl {
             if (ImGui::BeginPopupContextItem("annotation menu")) {
                 if (ImGui::MenuItem("Edit...")) begin_edit(a.id, a.kind, a.points, &a);
                 if (ImGui::MenuItem("Apply to the model", nullptr, false, a.value && !a.links.empty())) app.run("photo.apply", {{"annotation", a.id}});
+                if (a.kind == model::AnnotationKind::diameter && ImGui::MenuItem("Make a hole here", nullptr, false, ph.camera.has_value()))
+                    app.run("hole.add", {{"annotation", a.id}});
                 if (ImGui::MenuItem("Delete")) remove = a.id;
                 ImGui::EndPopup();
             }
@@ -690,6 +692,15 @@ struct PhotoUi::Impl {
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                 ImGui::SetTooltip("Make the value hold on the model, by its links: two faces (a distance), two holes (their pitch),\n"
                                   "a hole (its diameter), a fillet (R: its radius), two faces with an angle.");
+            if (sel->kind == model::AnnotationKind::diameter) {
+                ImGui::SameLine();
+                ImGui::BeginDisabled(!ph.camera);
+                if (ImGui::Button("Make hole")) app.run("hole.add", {{"annotation", selected}});
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip("A hole the scan bridged over: placed on the face under this rim, where the photo sees it,\n"
+                                      "with this value as its size (the photo must be matched to the scan).");
+            }
             ImGui::SameLine();
             if (ImGui::Button("Delete")) {
                 app.run("photo.annotation.delete", {{"annotation", selected}});

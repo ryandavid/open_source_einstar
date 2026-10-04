@@ -1544,6 +1544,53 @@
   },
   {
     "app": "model",
+    "description": "Places a hole the scan has no opening for (it bridged over the hole, or never saw it) on a plane face: from a diameter marked on a registered photo (its rim where the photo's rays cross the face; the annotation then links the hole and its value becomes the hole's size), or at a centre point with a diameter. The face: as given, else one the annotation links, else the plane face under its rim. Through unless a depth is given. It takes part in solves like a scanned hole (symmetric, axis_distance, coaxial ...).",
+    "kind": "mutating",
+    "name": "model.hole.add",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "annotation": {
+          "description": "A diameter annotation (DIA1 ...): its name or id.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "center": {
+          "description": "The hole's centre, mm (projected onto the face), when there is no annotation.",
+          "items": {
+            "type": "number"
+          },
+          "maxItems": 3,
+          "minItems": 3,
+          "type": "array"
+        },
+        "depth": {
+          "description": "Blind hole depth, mm.",
+          "type": "number"
+        },
+        "diameter": {
+          "description": "mm (needed with a centre; with an annotation it overrides the annotation's value).",
+          "type": "number"
+        },
+        "face": {
+          "description": "A label: its name or id.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "name": {
+          "description": "Name (default 'hole N').",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
     "description": "Sets a hole's true size from a measurement (overrides the scan's), its depth, or makes it through; and its forms: a counterbore (diameter and depth), a countersink (diameter at the face and included angle, default 90), a drill point at a blind hole's bottom (included angle, 118 for a twist drill; the depth is then to the shoulder). Detection measures the forms it sees; null removes one.",
     "kind": "mutating",
     "name": "model.hole.update",
@@ -1618,6 +1665,88 @@
       },
       "required": [
         "hole"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "A region bounded by planes, added to the built solid or cut from it (cut=true: a pocket, the inside of a hollow tab). For features the cells' vote cannot make: one the scan barely saw (a clip whose faces are mostly unseen) or a hollow one. faces: its own plane labels (often model.face.add_plane faces); the block lies on each one's material side (for a pocket, give its walls facing out of the pocket), and they do not split the rest of the part into cells. bounds: other planes that limit it, kept in the part (side 'outside' to lie past one, e.g. behind the back face so that a clip overlaps the body).",
+    "kind": "mutating",
+    "name": "model.block.add",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "bounds": {
+          "description": "Other planes that limit it.",
+          "items": {
+            "properties": {
+              "label": {
+                "description": "A label: its name or id.",
+                "type": [
+                  "string",
+                  "integer"
+                ]
+              },
+              "side": {
+                "description": "The face's material side (default) or past it.",
+                "enum": [
+                  "inside",
+                  "outside"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "label"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "cut": {
+          "description": "Cut it from the solid (a pocket) instead of adding it.",
+          "type": "boolean"
+        },
+        "faces": {
+          "description": "Its own plane labels.",
+          "items": {
+            "type": [
+              "string",
+              "integer"
+            ]
+          },
+          "type": "array"
+        },
+        "name": {
+          "description": "Name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "faces"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "app": "model",
+    "description": "Deletes a block.",
+    "kind": "mutating",
+    "name": "model.block.delete",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "block": {
+          "description": "A block: its name or id.",
+          "type": [
+            "string",
+            "integer"
+          ]
+        }
+      },
+      "required": [
+        "block"
       ],
       "type": "object"
     }

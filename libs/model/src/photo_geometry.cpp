@@ -134,6 +134,26 @@ ScanReading read_on_scan(const Document& doc, const Photo& ph, const Annotation&
     return out;
 }
 
+std::optional<PlaneCircle> circle_on_plane(const Photo& ph, const Annotation& a, const fit::Plane& plane) {
+    if (!ph.camera || a.kind != AnnotationKind::diameter || (a.points.size() != 2 && a.points.size() != 3)) return std::nullopt;
+    const auto cam = pinhole_of(*ph.camera);
+    std::vector<Vec3> p;
+    for (const auto& q : a.points) {
+        const auto [o, d] = cam.ray(q);
+        const double den = plane.normal.dot(d);
+        if (std::abs(den) < 1e-6) return std::nullopt;
+        const double t = (plane.offset - plane.normal.dot(o)) / den;
+        if (t <= 0) return std::nullopt;
+        p.push_back(o + t * d);
+    }
+    // Two points: the centre, then the rim. Three: the circle through them (they lie on the plane).
+    if (p.size() == 2) return PlaneCircle{p[0], 2 * (p[1] - p[0]).norm()};
+    const Vec3 ab = p[1] - p[0], ac = p[2] - p[0], n = ab.cross(ac);
+    if (n.squaredNorm() < 1e-12) return std::nullopt;
+    const Vec3 c = p[0] + (ac.squaredNorm() * n.cross(ab) + ab.squaredNorm() * ac.cross(n)) / (2 * n.squaredNorm());
+    return PlaneCircle{c, 2 * (c - p[0]).norm()};
+}
+
 std::vector<std::array<std::uint8_t, 4>> photo_colours(const Document& doc, int max_edge) {
     std::vector<std::array<std::uint8_t, 4>> out;
     if (!doc.has_scan()) return out;

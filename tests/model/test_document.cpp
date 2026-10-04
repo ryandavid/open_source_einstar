@@ -1,3 +1,4 @@
+#include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
@@ -473,4 +474,57 @@ TEST_CASE("a scan whose source changed is processed again with its modelling car
     CHECK(built["closed"].get<bool>());
     CHECK(run(doc, "deviation")["overall"]["p95_mm"].get<double>() < 0.15);
     std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("blocks: a boss the scan never saw added on planes of its own, a pocket cut from it, the rest of the part untouched") {
+    model::Document doc;
+    run(doc, "open_demo");
+    squared_demo(doc);
+    run(doc, "face.add_plane", {{"name", "bottom"}, {"datum", "part"}, {"axis", "z"}, {"offset", -20.0}, {"facing", "-"}});
+    const double base = run(doc, "build")["volume_mm3"];
+
+    // Planes square to the datum at world coordinates (the datum's axes are the world's here).
+    const json datum = run(doc, "summary")["datums"][0];
+    const auto plane = [&](const std::string& name, std::size_t axis, double at, const char* facing) {
+        const std::string key(1, "xyz"[axis]);
+        const double origin = datum["origin"][axis].get<double>();
+        REQUIRE(std::abs(datum[key][axis].get<double>()) > 0.999);
+        run(doc, "face.add_plane", {{"name", name}, {"datum", "part"}, {"axis", key}, {"offset", at - origin}, {"facing", facing}});
+    };
+    // A boss 16 x 10 standing 6 mm on the top (z = 20), down into the body to the flange (z = 4) so they overlap.
+    plane("boss -x", 0, 8, "-");
+    plane("boss +x", 0, 24, "+");
+    plane("boss -y", 1, -5, "-");
+    plane("boss +y", 1, 5, "+");
+    plane("boss top", 2, 26, "+");
+    const std::string flange = label_below(doc, 45, 0);
+    CHECK(!doc.apply("block.add", {{"faces", {"boss -x", "boss +x"}}}).ok);  // encloses nothing
+    run(doc, "block.add", {{"name", "boss"}, {"faces", {"boss -x", "boss +x", "boss -y", "boss +y", "boss top"}},
+                           {"bounds", {{{"label", flange}, {"side", "outside"}}}}});
+    json built = run(doc, "build");
+    std::println("with the boss: {}", built["log"].dump());
+    REQUIRE(built["ok"].get<bool>());
+    CHECK(built["volume_mm3"].get<double>() == Catch::Approx(base + 16 * 10 * 6).epsilon(1e-4));
+
+    // A pocket 6 x 4 down to z = 15, open at the top: its walls face out of it.
+    plane("pocket -x", 0, 12, "-");
+    plane("pocket +x", 0, 18, "+");
+    plane("pocket -y", 1, -2, "-");
+    plane("pocket +y", 1, 2, "+");
+    plane("pocket floor", 2, 15, "-");
+    run(doc, "block.add", {{"name", "pocket"}, {"faces", {"pocket -x", "pocket +x", "pocket -y", "pocket +y", "pocket floor"}}, {"cut", true}});
+    built = run(doc, "build");
+    REQUIRE(built["ok"].get<bool>());
+    CHECK(built["volume_mm3"].get<double>() == Catch::Approx(base + 16 * 10 * 6 - 6 * 4 * 11).epsilon(1e-4));
+
+    // Saved and read back; a block goes with a face it uses.
+    const auto path = std::filesystem::temp_directory_path() / std::format("einstar_blocks_{}.emodel", ::getpid());
+    run(doc, "save", {{"path", path.string()}});
+    model::Document again;
+    run(again, "open", {{"path", path.string()}});
+    std::filesystem::remove(path);
+    REQUIRE(run(again, "summary")["blocks"].size() == 2);
+    CHECK(run(again, "build")["volume_mm3"].get<double>() == Catch::Approx(built["volume_mm3"].get<double>()).epsilon(1e-6));
+    CHECK(run(again, "label.delete", {{"label", "pocket floor"}})["blocks_removed"] == 1);
+    CHECK(run(again, "build")["volume_mm3"].get<double>() == Catch::Approx(base + 16 * 10 * 6).epsilon(1e-4));
 }

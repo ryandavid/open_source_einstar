@@ -5,7 +5,8 @@
 // The part's main faces (planes and large curved faces) are extended past the part and split space into
 // cells (BOPAlgo_MakerVolume). Each cell is material or air by a vote of the scan: the scan points
 // supporting a face lie on the pieces of it that bound material, and the scan's normals say which side of
-// each piece the material is on. The material cells are fused and coplanar pieces merged. Holes are then
+// each piece the material is on. The material cells are fused and coplanar pieces merged. Blocks (regions
+// bounded by their own planes, which stay out of the arrangement) are added or cut. Holes are then
 // cut and fillets rolled on the edges between their two faces, rather than putting those surfaces into
 // the arrangement, where near-tangent fillets make the booleans fragile.
 
@@ -27,6 +28,19 @@ struct FaceInput {
     fit::Surface surface;
     std::vector<Vec3> points;    // scan support (may be empty: a face the scan did not see, e.g. a bottom)
     std::vector<Vec3> normals;   // scan normals of the points (pointing out of the material)
+    bool arrangement = true;     // false: it only bounds blocks (it does not split space into cells)
+};
+
+// A region bounded by planes, added to the solid or cut from it after the cells are joined: a feature the
+// scan barely saw (a clip, a boss) or one that is hollow (a pocket), which the cells' vote cannot make.
+struct BlockFace {
+    int face = 0;          // index into faces (a plane)
+    bool outside = false;  // the region lies past the face (on its outward side), not on its material side
+};
+struct BlockInput {
+    std::string name;
+    std::vector<BlockFace> faces;
+    bool cut = false;  // removed from the solid (a pocket), else added
 };
 
 struct HoleInput {
@@ -50,6 +64,7 @@ struct BuildInput {
     std::vector<FaceInput> faces;
     std::vector<HoleInput> holes;
     std::vector<FilletInput> fillets;
+    std::vector<BlockInput> blocks;
     double margin_mm = 10;           // faces extend this far past the part's bounding box
     std::size_t max_vote_points = 400;  // per face
 };

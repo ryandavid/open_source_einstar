@@ -291,6 +291,16 @@ std::vector<MethodSpec> build() {
         "Finds round holes in a plane label (openings in its region): centre, axis, diameter (from the wall if scanned, else "
         "from the opening), through or blind.",
         object({{"label", kLabel}}, {"label"}));
+    add("model.hole.add", model, mutating,
+        "Places a hole the scan has no opening for (it bridged over the hole, or never saw it) on a plane face: from a "
+        "diameter marked on a registered photo (its rim where the photo's rays cross the face; the annotation then links the "
+        "hole and its value becomes the hole's size), or at a centre point with a diameter. The face: as given, else one the "
+        "annotation links, else the plane face under its rim. Through unless a depth is given. It takes part in solves like "
+        "a scanned hole (symmetric, axis_distance, coaxial ...).",
+        object({{"annotation", ref("A diameter annotation (DIA1 ...): its name or id.")}, {"face", kLabel},
+                {"center", vec3("The hole's centre, mm (projected onto the face), when there is no annotation.")},
+                {"diameter", num("mm (needed with a centre; with an annotation it overrides the annotation's value).")},
+                {"depth", num("Blind hole depth, mm.")}, {"name", str("Name (default 'hole N').")}}));
     add("model.hole.update", model, mutating,
         "Sets a hole's true size from a measurement (overrides the scan's), its depth, or makes it through; and its forms: "
         "a counterbore (diameter and depth), a countersink (diameter at the face and included angle, default 90), a drill "
@@ -303,6 +313,22 @@ std::vector<MethodSpec> build() {
                 {"point_angle_deg", num("Included angle of a drill point.")}},
                {"hole"}));
     add("model.hole.delete", model, mutating, "Deletes a hole.", object({{"hole", ref("A hole: its name or id.")}}, {"hole"}));
+    add("model.block.add", model, mutating,
+        "A region bounded by planes, added to the built solid or cut from it (cut=true: a pocket, the inside of a hollow "
+        "tab). For features the cells' vote cannot make: one the scan barely saw (a clip whose faces are mostly unseen) or a "
+        "hollow one. faces: its own plane labels (often model.face.add_plane faces); the block lies on each one's material "
+        "side (for a pocket, give its walls facing out of the pocket), and they do not split the rest of the part into "
+        "cells. bounds: other planes that limit it, kept in the part (side 'outside' to lie past one, e.g. behind the back "
+        "face so that a clip overlaps the body).",
+        object({{"faces", refs("Its own plane labels.")},
+                {"bounds", {{"type", "array"},
+                            {"items", {{"type", "object"},
+                                       {"properties", {{"label", kLabel}, {"side", one_of({"inside", "outside"}, "The face's material side (default) or past it.")}}},
+                                       {"required", {"label"}}}},
+                            {"description", "Other planes that limit it."}}},
+                {"cut", boolean("Cut it from the solid (a pocket) instead of adding it.")}, {"name", str("Name.")}},
+               {"faces"}));
+    add("model.block.delete", model, mutating, "Deletes a block.", object({{"block", ref("A block: its name or id.")}}, {"block"}));
     add("model.fillet.add", model, mutating,
         "A fillet on the edge between two faces: from a fillet label (its faces and radius found from it), or between labels "
         "'a' and 'b' with a radius.",

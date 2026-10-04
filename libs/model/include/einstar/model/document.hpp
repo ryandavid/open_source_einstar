@@ -67,6 +67,9 @@ struct Hole {
                                    // floor, may not have been seen: the depth is then the user's to give)
     int wall_label = 0;            // a label on its wall, if any
     std::vector<std::uint32_t> rim;  // the opening's boundary (scan vertices): its position when no wall is labelled
+    // A hole the scan has no opening for (bridged over, or never seen), placed by hand (model.hole.add): "photo"
+    // (a rim marked on a photo; the measured diameter is the photo's) or "point". Empty: found in the scan.
+    std::string placed;
     // Forms, measured from the scan or set: a counterbore, a countersink (included angle), a drill point at a blind
     // hole's bottom (included angle; the depth is then to the shoulder).
     std::optional<double> counterbore_diameter, counterbore_depth;
@@ -83,6 +86,21 @@ struct Fillet {
     double measured_radius = 0;
     std::optional<double> radius;  // set by the user
     [[nodiscard]] double used_radius() const { return radius.value_or(measured_radius); }
+};
+
+// A region bounded by planes, added to the built solid or cut from it: a feature the scan barely saw (a clip),
+// or a hollow one (a pocket). Its own faces bound only it (they do not split the part into cells); bounds are
+// other faces it is limited by, on their material side or past them.
+struct BlockBound {
+    int label = 0;
+    bool outside = false;  // the block lies past the face (on its outward side)
+};
+struct Block {
+    int id = 0;
+    std::string name;
+    std::vector<int> faces;  // plane labels; the block lies on their material side
+    std::vector<BlockBound> bounds;
+    bool cut = false;
 };
 
 struct Datum {
@@ -108,6 +126,7 @@ struct State {
     std::vector<Label> labels;
     std::vector<Hole> holes;
     std::vector<Fillet> fillets;
+    std::vector<Block> blocks;
     std::vector<Datum> datums;
     std::vector<ConstraintDef> constraints;
     std::map<int, fit::Surface> solved;  // label id -> surface after the last solve

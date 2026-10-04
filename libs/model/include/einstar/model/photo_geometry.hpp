@@ -49,6 +49,14 @@ struct ScanReading {
 };
 [[nodiscard]] ScanReading read_on_scan(const Document& doc, const Photo& photo, const Annotation& annotation);
 
+// A diameter marked on a registered photo, as a circle on a plane face: its points taken where the photo's rays
+// cross the plane (what the scan shows there does not matter, so a hole the scan bridged over still has its rim).
+struct PlaneCircle {
+    Vec3 centre = Vec3::Zero();
+    double diameter = 0;
+};
+[[nodiscard]] std::optional<PlaneCircle> circle_on_plane(const Photo& photo, const Annotation& annotation, const fit::Plane& plane);
+
 // The scan coloured from its registered photos (those allowed to colour it): each vertex takes the colour of the
 // photo that sees it most head-on, where nothing of the part hides it. Alpha 0: no photo sees it, or it is not
 // the part. Photos are decoded with their longer side at most max_edge px.

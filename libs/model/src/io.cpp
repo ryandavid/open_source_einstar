@@ -302,6 +302,7 @@ Result<void> Document::save(const std::filesystem::path& path) const {
                       {"seen_depth", h.seen_depth}, {"rim", h.rim}, {"measured_center", vec_to_json(h.measured_center)}};
             if (h.diameter) j["diameter"] = *h.diameter;
             if (h.depth) j["depth"] = *h.depth;
+            if (!h.placed.empty()) j["placed"] = h.placed;
             const auto put = [&](const char* key, const std::optional<double>& v) {
                 if (v) j[key] = *v;
             };
@@ -316,6 +317,12 @@ Result<void> Document::save(const std::filesystem::path& path) const {
             json j = {{"id", fl.id}, {"name", fl.name}, {"label", fl.label}, {"a", fl.face_a}, {"b", fl.face_b}, {"measured_radius", fl.measured_radius}};
             if (fl.radius) j["radius"] = *fl.radius;
             doc["fillets"].push_back(j);
+        }
+        doc["blocks"] = json::array();
+        for (const auto& b : state_.blocks) {
+            json bounds = json::array();
+            for (const auto& bb : b.bounds) bounds.push_back({{"label", bb.label}, {"outside", bb.outside}});
+            doc["blocks"].push_back({{"id", b.id}, {"name", b.name}, {"faces", b.faces}, {"bounds", bounds}, {"cut", b.cut}});
         }
         for (const auto& x : state_.datums) doc["datums"].push_back({{"id", x.id}, {"name", x.name}, {"frame", frame_to_json(x.frame)}});
         for (const auto& c : state_.constraints) doc["constraints"].push_back({{"id", c.id}, {"spec", c.spec}});
@@ -428,6 +435,7 @@ Result<void> Document::load(const std::filesystem::path& path) {
             h.measured_center = j.contains("measured_center") ? vec_from_json(j["measured_center"]) : h.center;
             if (j.contains("diameter")) h.diameter = j["diameter"].get<double>();
             if (j.contains("depth")) h.depth = j["depth"].get<double>();
+            h.placed = j.value("placed", std::string());
             const auto take = [&](const char* key, std::optional<double>& v) {
                 if (j.contains(key)) v = j[key].get<double>();
             };
@@ -449,6 +457,16 @@ Result<void> Document::load(const std::filesystem::path& path) {
             if (j.contains("radius")) fl.radius = j["radius"].get<double>();
             s.fillets.push_back(fl);
         }
+        if (doc.contains("blocks"))
+            for (const auto& j : doc["blocks"]) {
+                Block b;
+                b.id = j.at("id");
+                b.name = j.at("name");
+                b.faces = j.at("faces").get<std::vector<int>>();
+                for (const auto& bb : j.value("bounds", json::array())) b.bounds.push_back({bb.at("label"), bb.value("outside", false)});
+                b.cut = j.value("cut", false);
+                s.blocks.push_back(std::move(b));
+            }
         for (const auto& j : doc.at("datums")) s.datums.push_back({j.at("id"), j.at("name"), frame_from_json(j.at("frame"))});
         for (const auto& j : doc.at("constraints")) s.constraints.push_back({j.at("id"), j.at("spec")});
         for (const auto& [k, v] : doc.at("solved").items()) s.solved[std::stoi(k)] = surface_from_json(v);

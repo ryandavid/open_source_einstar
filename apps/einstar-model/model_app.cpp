@@ -523,7 +523,10 @@ void ModelApp::draw_ui(render::ViewCamera& camera) {
             ImGui::SetNextItemWidth(90);
             if (ImGui::InputDouble("dia", &dia, 0, 0, "%.3f", ImGuiInputTextFlags_EnterReturnsTrue)) run("hole.update", {{"hole", h["id"]}, {"diameter", dia}});
             ImGui::SameLine();
-            ImGui::TextDisabled("scan %.3f (%s)", h["measured_diameter"].get<double>(), h["measured_from"].get<std::string>().c_str());
+            const std::string from = h["measured_from"];
+            if (from == "point") ImGui::TextDisabled("placed");
+            else if (from == "photo") ImGui::TextDisabled("photo %.3f (placed)", h["measured_diameter"].get<double>());
+            else ImGui::TextDisabled("scan %.3f (%s)", h["measured_diameter"].get<double>(), from.c_str());
             std::string forms;
             if (h.contains("counterbore_diameter"))
                 forms += std::format("  counterbore {:.2f} x {:.2f}", h["counterbore_diameter"].get<double>(), h.value("counterbore_depth", 0.0));
@@ -538,7 +541,7 @@ void ModelApp::draw_ui(render::ViewCamera& camera) {
                 double depth = h.value("depth", 0.0);
                 ImGui::SetNextItemWidth(90);
                 if (ImGui::InputDouble("depth", &depth, 0, 0, "%.2f", ImGuiInputTextFlags_EnterReturnsTrue)) run("hole.update", {{"hole", h["id"]}, {"depth", depth}});
-            } else {
+            } else if (from != "photo" && from != "point") {
                 ImGui::SameLine();
                 ImGui::TextDisabled("wall seen to %.1f mm", h["wall_seen_to_depth"].get<double>());
             }
@@ -552,6 +555,17 @@ void ModelApp::draw_ui(render::ViewCamera& camera) {
             if (ImGui::InputDouble("R", &r, 0, 0, "%.3f", ImGuiInputTextFlags_EnterReturnsTrue)) run("fillet.update", {{"fillet", f["id"]}, {"radius", r}});
             ImGui::SameLine();
             ImGui::TextDisabled("scan %.3f", f["measured_radius"].get<double>());
+            ImGui::PopID();
+        }
+        for (const auto& b : summary["blocks"]) {
+            ImGui::PushID(b["id"].get<int>() + 200000);
+            std::string faces;
+            for (const auto& f : b["faces"]) faces += (faces.empty() ? "" : ", ") + f.get<std::string>();
+            ImGui::Text("%s", b["name"].get<std::string>().c_str());
+            ImGui::SameLine(110);
+            ImGui::TextDisabled("%s: %s", b["cut"].get<bool>() ? "pocket" : "block", faces.c_str());
+            ImGui::SameLine();
+            if (ImGui::SmallButton("delete")) run("block.delete", {{"block", b["id"]}});
             ImGui::PopID();
         }
     }

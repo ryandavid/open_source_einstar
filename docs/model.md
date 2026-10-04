@@ -61,6 +61,7 @@ Every change is one undo step. An agent's change is one step for each request it
   - A graph cut picks the material cells. Each piece of a face votes with its scan points, through the scan
     normals, for the cell on its material side. Making a boundary where the scan saw nothing costs that
     piece's area, so cells hidden inside the part follow their neighbours.
+  - Blocks are added or cut after the cells are joined (see below).
   - Fillets are rolled on the edges between their faces, and holes are cut, after the cells are joined.
   - STEP is written with face names.
 - **`libs/model`**: the document.
@@ -179,11 +180,36 @@ Datums, constraints, measurements and unseen faces stay as they are. Solve and b
 
 - **Finding them:** holes are found as round openings in a plane face. The diameter comes from the scanned
   wall, or from the opening when little wall was seen.
+- **Holes the scan bridged over:** a small hole often comes out filled in, so there is no opening to find.
+  `model.hole.add` (*Make a hole* on a diameter marked on a photo) places one:
+  - from a diameter on a registered photo. Its rim is taken where the photo's rays cross the face, so what the
+    scan shows there does not matter. The annotation then links the hole, and its value becomes the hole's size;
+  - or at a centre point, with a diameter.
+
+  The face is the one given, else the one the annotation links, else the plane face under its rim. A placed
+  hole's diameter is not a scan measurement, so the scale check leaves it out.
 - **Forms:** the scan's counterbores, countersinks and drill points are measured. `model.hole.update` sets
   or corrects them, and they are built and named in the STEP file.
 - **In the solve:** holes take part through their axis: the wall's label, or a cylinder fitted to the
-  opening. They are held parallel to their face's normal. Constraints that mean an axis can name a hole,
-  e.g. `axis_distance` for a pitch or a bolt circle's radius, or `offset` from the datum.
+  opening, or for a placed hole an axis held by its constraints alone. They are held parallel to their face's
+  normal. Constraints that mean an axis can name a hole, e.g. `axis_distance` for a pitch or a bolt circle's
+  radius, `symmetric` for a mirrored pair, or `offset` from the datum.
+
+## Blocks
+
+Every face splits the whole part into cells, and the scan votes on which cells are material. That cannot
+make a feature the scan barely saw, such as a clip whose faces are mostly hidden, and it cannot make a hollow
+one. An unseen face added across the part (`model.face.add_plane`) would also cut through everything else.
+
+A block (`model.block.add`) is a region bounded by planes:
+- **Faces:** its own plane labels, usually unseen faces added with `model.face.add_plane`. The block lies on
+  each one's material side. Its faces bound only the block: they do not split the rest of the part.
+- **Bounds:** other planes that limit it, which stay in the part. `side: outside` puts the block past one.
+  For example, a clip on the back is bounded past the back's step, so it overlaps the body it stands on.
+- **Pocket:** `cut: true` removes the region instead of adding it, e.g. the inside of a hollow tab. Give a
+  pocket's walls facing out of the pocket. A side with no wall is open.
+
+Blocks are added or cut after the cells are joined, before fillets and holes.
 
 ## Constraints
 

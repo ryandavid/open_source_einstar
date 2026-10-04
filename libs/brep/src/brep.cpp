@@ -10,15 +10,19 @@
 #include <BOPAlgo_MakerVolume.hxx>
 #include <BRepAdaptor_Curve.hxx>
 #include <BRepAdaptor_Surface.hxx>
+#include <BRepAlgoAPI_Common.hxx>
 #include <BRepAlgoAPI_Cut.hxx>
+#include <BRepAlgoAPI_Fuse.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepCheck_Analyzer.hxx>
 #include <BRepClass_FaceClassifier.hxx>
 #include <BRepFilletAPI_MakeFillet.hxx>
 #include <BRepGProp.hxx>
 #include <BRepMesh_IncrementalMesh.hxx>
+#include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepPrimAPI_MakeCone.hxx>
 #include <BRepPrimAPI_MakeCylinder.hxx>
+#include <BRepPrimAPI_MakeHalfSpace.hxx>
 #include <BRepTools.hxx>
 #include <BRep_Tool.hxx>
 #include <GCPnts_TangentialDeflection.hxx>
@@ -359,9 +363,16 @@ static BuildResult build_unguarded(const BuildInput& in) {
     // 1. The arrangement of the extended faces.
     std::vector<TopoDS_Face> inputs;
     TopTools_ListOfShape args;
+    int arranged = 0;
     for (const auto& f : in.faces) {
         inputs.push_back(extended_face(f.surface, center, reach));
+        if (!f.arrangement) continue;
         args.Append(inputs.back());
+        ++arranged;
+    }
+    if (arranged == 0) {
+        out.log.push_back("no faces split space (all of them only bound blocks)");
+        return out;
     }
     BOPAlgo_MakerVolume mv;
     mv.SetArguments(args);
@@ -379,6 +390,7 @@ static BuildResult build_unguarded(const BuildInput& in) {
     TopTools_DataMapOfShapeInteger piece_owner;  // piece -> input face
     std::vector<std::vector<TopoDS_Face>> pieces(in.faces.size());
     for (std::size_t i = 0; i < inputs.size(); ++i) {
+        if (!in.faces[i].arrangement) continue;
         const TopTools_ListOfShape& images = mv.Modified(inputs[i]);
         if (images.IsEmpty()) pieces[i].push_back(inputs[i]);
         for (const auto& img : images) pieces[i].push_back(TopoDS::Face(img));
@@ -392,6 +404,7 @@ static BuildResult build_unguarded(const BuildInput& in) {
         double side = 0;
         for (std::size_t k = 0; k < f.points.size() && k < f.normals.size(); ++k) side += fit::normal_at(f.surface, f.points[k]).dot(f.normals[k]);
         outward[i] = side > 0 ? 1 : side < 0 ? -1 : 0;
+        if (!f.arrangement) continue;
         for (const auto& pc : pieces[i]) {
             piece_index.Bind(pc, static_cast<int>(support.size()));
             support.push_back({});
@@ -438,7 +451,7 @@ static BuildResult build_unguarded(const BuildInput& in) {
     TopTools_ListOfShape material;
     for (std::size_t c = 0; c < cell_shapes.size(); ++c)
         if (is_material[c]) material.Append(cell_shapes[c]);
-    out.log.push_back(std::format("{} faces split space into {} cells, {} of them material", in.faces.size(), cell_shapes.size(), material.Extent()));
+    out.log.push_back(std::format("{} faces split space into {} cells, {} of them material", arranged, cell_shapes.size(), material.Extent()));
 
     // How much of the scan ends up on the solid's boundary (pieces with material on exactly one side). Where
     // the scan is open (a bottom never seen) the faces enclose nothing there, and the scanned faces around
@@ -486,7 +499,58 @@ static BuildResult build_unguarded(const BuildInput& in) {
         shape = unify.Shape();
     }
 
-    // 3. Fillets on the edges between their two faces.
+    // 3. Blocks: each the intersection of half-spaces of its planes, added to the solid or cut from it.
+    for (const auto& b : in.blocks) {
+        try {
+            const Vec3 corner = center - Vec3::Constant(reach);
+            TopoDS_Shape region = BRepPrimAPI_MakeBox(to_pnt(corner), 2 * reach, 2 * reach, 2 * reach).Shape();
+            std::string problem;
+            for (const auto& bf : b.faces) {
+                const auto k = static_cast<std::size_t>(bf.face);
+                const auto* pl = k < in.faces.size() ? std::get_if<fit::Plane>(&in.faces[k].surface) : nullptr;
+                if (!pl) {
+                    problem = std::format("'{}' is not a plane", k < in.faces.size() ? in.faces[k].name : "?");
+                    break;
+                }
+                // Out of the material: as the scan's normals say, or (a face the scan did not see) as given.
+                const Vec3 out_dir = (outward[k] < 0 ? -1.0 : 1.0) * pl->normal;
+                const Vec3 on = fit::project(in.faces[k].surface, center);
+                const Vec3 keep = on + (bf.outside ? 1.0 : -1.0) * out_dir;
+                const TopoDS_Solid half = BRepPrimAPI_MakeHalfSpace(extended_face(in.faces[k].surface, center, 2 * reach), to_pnt(keep)).Solid();
+                BRepAlgoAPI_Common common(region, half);
+                if (!common.IsDone() || common.HasErrors()) {
+                    problem = std::format("it could not be bounded by '{}'", in.faces[k].name);
+                    break;
+                }
+                region = common.Shape();
+            }
+            if (problem.empty() && count_of(region, TopAbs_SOLID) == 0) problem = "its faces enclose nothing";
+            if (!problem.empty()) {
+                out.log.push_back(std::format("block '{}' left out: {}", b.name, problem));
+                continue;
+            }
+            TopoDS_Shape result;
+            if (b.cut) {
+                BRepAlgoAPI_Cut op(shape, region);
+                if (op.IsDone() && !op.HasErrors()) result = op.Shape();
+            } else {
+                BRepAlgoAPI_Fuse op(shape, region);
+                if (op.IsDone() && !op.HasErrors()) result = op.Shape();
+            }
+            if (result.IsNull() || !BRepCheck_Analyzer(result).IsValid()) {
+                out.log.push_back(std::format("block '{}' could not be {} the solid", b.name, b.cut ? "cut from" : "added to"));
+                continue;
+            }
+            ShapeUpgrade_UnifySameDomain unify(result, true, true, false);
+            unify.Build();
+            shape = unify.Shape();
+            out.log.push_back(std::format("block '{}' {}", b.name, b.cut ? "cut" : "added"));
+        } catch (const Standard_Failure& e) {
+            out.log.push_back(std::format("block '{}' could not be made: {}", b.name, e.GetMessageString()));
+        }
+    }
+
+    // 4. Fillets on the edges between their two faces.
     if (!in.fillets.empty()) {
         TopTools_IndexedDataMapOfShapeListOfShape edge_faces;
         TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, edge_faces);
@@ -577,7 +641,7 @@ static BuildResult build_unguarded(const BuildInput& in) {
         }
     }
 
-    // 4. Holes.
+    // 5. Holes.
     const double through = 2 * reach + 10;
     for (const auto& h : in.holes) {
         constexpr double kLead = 1.0;  // the cutters start outside the entry face
@@ -606,7 +670,7 @@ static BuildResult build_unguarded(const BuildInput& in) {
         }
     }
 
-    // 5. Check and describe.
+    // 6. Check and describe.
     out.shape = std::make_shared<Shape>(Shape{shape});
     out.ok = BRepCheck_Analyzer(shape).IsValid();
     if (!out.ok) out.log.push_back("the result is not a valid shape");
