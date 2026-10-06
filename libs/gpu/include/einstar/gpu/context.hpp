@@ -68,6 +68,9 @@ public:
     // so the Apple paths stay exactly as they are.
     [[nodiscard]] bool apple_gpu() const { return apple_gpu_; }
     [[nodiscard]] Ref<MTL::Buffer> gpu_buffer(std::size_t bytes);
+    // The same without clearing private memory, for outputs whose readers only see what a kernel wrote
+    // (a counted prefix). Clearing a large buffer on every allocation costs milliseconds on a discrete GPU.
+    [[nodiscard]] Ref<MTL::Buffer> gpu_buffer_uninitialized(std::size_t bytes);
     [[nodiscard]] Ref<MTL::Buffer> mirrored_buffer(std::size_t bytes);
     // Publishes CPU writes to a managed buffer (no-op for other storage modes).
     static void cpu_modified(MTL::Buffer* buffer, std::size_t offset, std::size_t bytes);

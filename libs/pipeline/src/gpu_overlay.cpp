@@ -55,7 +55,7 @@ GpuOverlay::Points GpuOverlay::frame_points(const gpu::MetalFrameData& f, const 
     Points out;
     const int gw = (f.width() + step - 1) / step, gh = (f.height() + step - 1) / step;
     const auto cap = static_cast<std::size_t>(gw * gh);
-    out.buffer = ctx_->gpu_buffer(cap * sizeof(render::PointVertex));  // drawn by the renderer only
+    out.buffer = ctx_->gpu_buffer_uninitialized(cap * sizeof(render::PointVertex));  // drawn by the renderer only (`count` vertices)
     Args a{};
     const Eigen::Matrix4f T = T_wc.matrix().cast<float>();
     std::memcpy(a.T, T.data(), sizeof(a.T));

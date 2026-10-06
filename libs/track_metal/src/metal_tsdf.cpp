@@ -79,7 +79,7 @@ struct MetalTsdfVolume::Impl {
     std::shared_ptr<gpu::Context> ctx;
     MetalTsdfOptions opt;
     Ref<MTL::ComputePipelineState> init_voxels, allocate, integrate, raycast, extract, extract_render, erase_voxels, restore_voxels;
-    mutable std::size_t render_capacity = 0;
+    mutable double render_per_brick = 0;  // surface points per brick at the last render extraction
     Ref<MTL::Buffer> keys, values, coords, brick_count, stamps, visible_count, visible, voxels, last_update, occupancy;
     Ref<MTL::Buffer> observations;  // one byte per voxel when counted, else a placeholder
     // per-frame inputs
@@ -389,9 +389,12 @@ MetalTsdfVolume::RenderPoints MetalTsdfVolume::extract_render_points(float min_w
     VolumeArgs a = im.args(params_, frame_);
     a.min_weight = min_weight;
     constexpr std::size_t kVertex = 28;  // render::PointVertex
+    // Sized from the last extraction's points per brick: the worst-case bound (96 per brick, ~230 MB for a
+    // large scan) cost more to allocate and clear than the extraction itself.
+    std::size_t cap = im.render_per_brick > 0 ? static_cast<std::size_t>(1.25 * im.render_per_brick * bricks) + 4096
+                                              : static_cast<std::size_t>(bricks) * 96;
     for (int attempt = 0; attempt < 2; ++attempt) {
-        const std::size_t cap = std::max<std::size_t>(im.render_capacity, static_cast<std::size_t>(bricks) * 96);
-        out.buffer = im.ctx->gpu_buffer(cap * kVertex);  // drawn by the renderer only
+        out.buffer = im.ctx->gpu_buffer_uninitialized(cap * kVertex);  // drawn by the renderer only (`count` vertices)
         *static_cast<std::uint32_t*>(im.ext_count->contents()) = 0;
         gpu::Context::cpu_modified(im.ext_count.get());
         const auto cap32 = static_cast<std::uint32_t>(cap);
@@ -408,12 +411,12 @@ MetalTsdfVolume::RenderPoints MetalTsdfVolume::extract_render_points(float min_w
             enc->dispatchThreadgroups(MTL::Size(bricks, 1, 1), MTL::Size(8, 8, 8));
         }, {im.ext_count.get()});
         const std::uint32_t found = *static_cast<std::uint32_t*>(im.ext_count->contents());
+        im.render_per_brick = static_cast<double>(found) / bricks;
         if (found <= cap) {
             out.count = found;
-            im.render_capacity = std::max(im.render_capacity, static_cast<std::size_t>(found) + found / 8);
             return out;
         }
-        im.render_capacity = found + found / 4;  // grow and retry once
+        cap = found + found / 4;  // grow and retry once
     }
     return out;
 }

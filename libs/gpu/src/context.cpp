@@ -85,6 +85,10 @@ Ref<MTL::Buffer> Context::gpu_buffer(std::size_t bytes) {
     return b;
 }
 
+Ref<MTL::Buffer> Context::gpu_buffer_uninitialized(std::size_t bytes) {
+    return buffer(bytes, unified_ ? MTL::ResourceStorageModeShared : MTL::ResourceStorageModePrivate);
+}
+
 Ref<MTL::Buffer> Context::mirrored_buffer(std::size_t bytes) {
     return buffer(bytes, unified_ ? MTL::ResourceStorageModeShared : MTL::ResourceStorageModeManaged);
 }
