@@ -121,10 +121,20 @@ tracking 22.6 ms and the frontend 26.4 ms (p95 41). Now, with identical results:
 - detail refinement's candidate count a function constant (accumulators in registers, as `refine_slanted`):
   5.6 -> 3.5 ms; blob statistics reduced over the SIMD group before the atomics (a white surface under the
   ring light is one huge blob): 3.4 -> 0.6 ms; frontend on real IR 26.4 -> 23.5 ms, p95 41 -> 29.
-Synthetic pipeline 51.9 -> 42.0 ms per frame. A real scan's frame: ~23 frontend + ~19 tracking + ~2 snapshot
+Synthetic pipeline 51.9 -> 41.4 ms per frame. A real scan's frame: ~23 frontend + ~19 tracking + ~2 snapshot
 + ~5 live view (GPU) = ~50 ms of the 68 ms period. Tried without gain: plain loads for hash lookups, a 4-entry
-or parity-indexed brick cache (spills on AMD), prefetching the next SGM step. The SGM paths (8 ms) are near
-the memory bandwidth; the rest of the stereo is split over many small kernels.
+or parity-indexed brick cache (spills on AMD).
+
+SGM on the 560X (census + cost 1.2, paths 7.6, row WTA 1.0 ms): the paths are bound by arithmetic, not memory
+(without any loads or stores a direction still takes 1.2 of its 2 ms) and the GPU is already full (two
+directions in one dispatch, into two sum volumes, took twice as long). The adaptive P2 now comes from a
+32-entry table (the integer division per step was 6%: 8.0 -> 7.6 ms, identical sums). No gain from: dropping
+the per-disparity range checks, 32-bit addressing, prefetching the next step (the compiler already does these),
+or aligned vector loads (rows of 248, -0.5 ms, not worth padding every volume). On AMD the paths cost
+ceil(disparities / 64) per lane, so only a narrower disparity range helps: the near limit sets it (150 mm:
+247 disparities at quarter resolution). Real scans have 0.1-0.5% of their depth below 200 mm and ~8% below
+250 mm; frontend on the 09-30 raw IR at a 200 mm limit 21.8 ms, at 245 mm 18.9 ms (vs 22.9) but 30.4% instead
+of 33.6% valid depth there.
 
 ### Tracking on EXStar's own recordings (`einstar-cli track-fixture`)
 mustang_differential, 6055 frames, depth-only (no markers/texture), GPU path. A single replay is not a

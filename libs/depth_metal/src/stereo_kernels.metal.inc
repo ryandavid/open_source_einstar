@@ -108,6 +108,8 @@ struct PathArgs {
     int dx; int dy;
     int p1; int p2; uint adaptive; uint slant;
     uint first;  // the first direction writes the sums (no clearing pass, no read)
+    // Adaptive P2 by intensity step |dI| / 8 (0..31): max(P1 + 1, P2 / (|dI| / 8 + 1)), divided on the host.
+    uint p2_by_step[32];
 };
 
 constant uint kMaxD = 512;
@@ -161,8 +163,7 @@ kernel void sgm_path(device const uchar* cost [[buffer(0)]], device ushort* sum 
     y += a.dy;
     while (x >= 0 && y >= 0 && x < W && y < H) {
         const int intensity = guide[uint(y) * a.w + uint(x)];
-        int p2 = a.p2;
-        if (a.adaptive) p2 = max(a.p1 + 1, a.p2 / (abs(intensity - prev_intensity) / 8 + 1));
+        const int p2 = a.adaptive ? int(a.p2_by_step[abs(intensity - prev_intensity) / 8]) : a.p2;
         prev_intensity = intensity;
         const int pm = prev_min_shared;
         ushort cur = 0xFFFF;
@@ -234,8 +235,7 @@ inline void sgm_path_simd_body(device const uchar* cost, device ushort* sum, dev
     y += a.dy;
     while (x >= 0 && y >= 0 && x < W && y < H) {
         const int intensity = guide[uint(y) * a.w + uint(x)];
-        int p2 = a.p2;
-        if (a.adaptive) p2 = max(a.p1 + 1, a.p2 / (abs(intensity - prev_intensity) / 8 + 1));
+        const int p2 = a.adaptive ? int(a.p2_by_step[abs(intensity - prev_intensity) / 8]) : a.p2;
         prev_intensity = intensity;
         // Neighbouring lanes' edge values (only read where k - 1, k - 2, k + 1, k + 2 are in range).
         const uint l1 = simd_shuffle_up(prev[DPL - 1], 1), l2 = simd_shuffle_up(prev[DPL - 2], 1);

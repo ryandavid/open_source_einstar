@@ -21,7 +21,7 @@ struct Size2 { std::uint32_t w, h; };
 struct RectifyArgs { std::uint32_t src_w, src_h, full_w, full_h, out_w, out_h; };
 struct CensusArgs { std::uint32_t w, h; std::int32_t rx, ry; };
 struct CostArgs { std::uint32_t w, h, nd; std::int32_t min_disp; std::uint16_t invalid_cost; std::uint16_t pad; };
-struct PathArgs { std::uint32_t w, h, nd; std::int32_t dx, dy, p1, p2; std::uint32_t adaptive, slant, first; };
+struct PathArgs { std::uint32_t w, h, nd; std::int32_t dx, dy, p1, p2; std::uint32_t adaptive, slant, first, p2_by_step[32]; };
 struct WtaArgs { std::uint32_t w, h, nd; std::int32_t min_disp; float uniqueness; std::uint32_t subpixel; };
 struct LrArgs { std::uint32_t w, h; float max_diff; };
 struct RefineArgs { std::uint32_t w, h, cw, ch; std::int32_t radius, search_radius; float min_zncc; std::uint32_t subpixel, reject_edge; };
@@ -517,9 +517,10 @@ Result<void> MetalStereo::encode_and_run(bool from_raw, bool make_points, ImageU
 
     for (std::size_t di = 0; di < dirs.size(); ++di) {
         const Dir d = dirs[di];
-        const PathArgs pa{static_cast<std::uint32_t>(cw), static_cast<std::uint32_t>(ch), static_cast<std::uint32_t>(im.nd),
-                          d.dx, d.dy, sp.p1, sp.p2, sp.adaptive_p2 ? 1u : 0u, sp.slant_steps ? 1u : 0u,
-                          di == 0 ? 1u : 0u};
+        PathArgs pa{static_cast<std::uint32_t>(cw), static_cast<std::uint32_t>(ch), static_cast<std::uint32_t>(im.nd),
+                    d.dx, d.dy, sp.p1, sp.p2, sp.adaptive_p2 ? 1u : 0u, sp.slant_steps ? 1u : 0u,
+                    di == 0 ? 1u : 0u, {}};
+        for (int q = 0; q < 32; ++q) pa.p2_by_step[q] = static_cast<std::uint32_t>(std::max(sp.p1 + 1, sp.p2 / (q + 1)));
         const int lines = d.dy == 0 ? ch : d.dx == 0 ? cw : ch + cw - 1;
         enc->setComputePipelineState(im.path_simd ? im.path_simd.get() : im.path.get());
         enc->setBuffer(im.cost_vol.get(), 0, 0);
