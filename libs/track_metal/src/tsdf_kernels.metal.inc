@@ -262,16 +262,20 @@ kernel void raycast(device const atomic_uint* keys [[buffer(0)]], device const a
     const float t_end = a.max_depth * dir_norm + a.trunc;
     float prev_sdf = 1.0f, prev_t = t;
     bool have_prev = false;
+    float t_hit = -1.0f;
     for (int step = 0; step < 4096 && t < t_end; ++step) {
         const float3 p = origin + t * dir;
         const float3 g = p * inv_voxel;
-        // Skip unallocated bricks in one jump to the brick exit.
         const int3 b = int3(floor(p / brick_mm));
         // Through the reader's brick cache: marching inside a brick costs no hash probe.
         uint word, bit;
         const bool maybe = occupancy_index(b, word, bit) && (occupancy[word] & bit) != 0;
         if (!maybe || r.brick_at(b) < 0) {
-            const float3 lo = float3(b) * brick_mm, hi = lo + brick_mm;
+            // Skip an unallocated brick in one jump to its exit, or the whole block of 8^3 bricks when its
+            // occupancy bit is clear (the block ends on a brick boundary, where brick jumps also arrive).
+            const float cell = maybe ? brick_mm : brick_mm * 8;
+            const int3 c = maybe ? b : int3(floor_div8(b.x), floor_div8(b.y), floor_div8(b.z));
+            const float3 lo = float3(c) * cell, hi = lo + cell;
             const float3 tx = select((lo - p) / dir, (hi - p) / dir, dir > 0);
             float exit = min(min(dir.x != 0 ? tx.x : 1e9f, dir.y != 0 ? tx.y : 1e9f), dir.z != 0 ? tx.z : 1e9f);
             t += max(exit, 0.0f) + 0.01f;
@@ -285,27 +289,30 @@ kernel void raycast(device const atomic_uint* keys [[buffer(0)]], device const a
             continue;
         }
         if (have_prev && prev_sdf > 0 && s <= 0) {
-            const float t_hit = prev_t + (t - prev_t) * prev_sdf / (prev_sdf - s);
-            const float3 hit = origin + t_hit * dir;
-            const float3 gh = hit * inv_voxel;
-            float sx0, sx1, sy0, sy1, sz0, sz1;
-            if (robust_sample(r, gh - float3(1, 0, 0), sx0) && robust_sample(r, gh + float3(1, 0, 0), sx1) &&
-                robust_sample(r, gh - float3(0, 1, 0), sy0) && robust_sample(r, gh + float3(0, 1, 0), sy1) &&
-                robust_sample(r, gh - float3(0, 0, 1), sz0) && robust_sample(r, gh + float3(0, 0, 1), sz1)) {
-                const float3 n = float3(sx1 - sx0, sy1 - sy0, sz1 - sz0);
-                const float len = length(n);
-                if (len > 1e-6f) {
-                    out_points[i] = float4(hit, 1);
-                    out_normals[i] = float4(n / len, 0);
-                }
-            }
-            return;
+            t_hit = prev_t + (t - prev_t) * prev_sdf / (prev_sdf - s);
+            break;
         }
         if (have_prev && prev_sdf < 0 && s < 0) return;
         prev_sdf = s;
         prev_t = t;
         have_prev = true;
         t += max(a.voxel * 0.5f, s * a.trunc * 0.8f);
+    }
+    // The normal after the march, not where the ray hit inside it: rays hit on different steps, and its 48
+    // voxel reads would run once per step that any ray of the SIMD group hit on.
+    if (t_hit < 0) return;
+    const float3 hit = origin + t_hit * dir;
+    const float3 gh = hit * inv_voxel;
+    float sx0, sx1, sy0, sy1, sz0, sz1;
+    if (robust_sample(r, gh - float3(1, 0, 0), sx0) && robust_sample(r, gh + float3(1, 0, 0), sx1) &&
+        robust_sample(r, gh - float3(0, 1, 0), sy0) && robust_sample(r, gh + float3(0, 1, 0), sy1) &&
+        robust_sample(r, gh - float3(0, 0, 1), sz0) && robust_sample(r, gh + float3(0, 0, 1), sz1)) {
+        const float3 n = float3(sx1 - sx0, sy1 - sy0, sz1 - sz0);
+        const float len = length(n);
+        if (len > 1e-6f) {
+            out_points[i] = float4(hit, 1);
+            out_normals[i] = float4(n / len, 0);
+        }
     }
 }
 
