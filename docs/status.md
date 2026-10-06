@@ -107,6 +107,25 @@ keep their kernels. Blob moments are exact integer sums everywhere (float atomic
 `einstar-bench pipeline` on the 560X: 583 -> 42 ms per frame (markers and recording on), within the 68 ms
 frame period; the live view adds ~5.8 ms of GPU per frame at 3200x2000.
 
+**On real data (2026-10-05).** The first hand-held scans on this Mac (09-30) dropped 37% / 22% of frames
+("live queue full"). Measured on the scanner's own data (`einstar-bench frontend` on the 09-30 raw IR
+captures, `einstar-bench session` replaying scan-20261001-044655, 2750 frames, ~1M-point model), the GPU
+was oversubscribed: the live view drew the model at the display rate at 8.1 ms a draw (~32 ms of GPU per
+scanner frame), the 250 ms model snapshot took 28.9 ms (allocating and clearing a worst-case 230 MB buffer),
+tracking 22.6 ms and the frontend 26.4 ms (p95 41). Now, with identical results:
+- splats drawn as point primitives (one vertex instead of a four-vertex quad; 0.14% of drawn pixels differ, at
+  splat edges): 8.1 -> 1.3 ms a draw;
+- model snapshot sized from the last extraction and not cleared: 28.9 -> 7.9 ms;
+- raycast normals computed after the march, not inside it (SIMD divergence), and empty 8^3-brick blocks
+  skipped whole: 7.6 -> 3.6 ms a raycast; tracking 22.6 -> 18.7 ms median, p95 38 -> 30;
+- detail refinement's candidate count a function constant (accumulators in registers, as `refine_slanted`):
+  5.6 -> 3.5 ms; blob statistics reduced over the SIMD group before the atomics (a white surface under the
+  ring light is one huge blob): 3.4 -> 0.6 ms; frontend on real IR 26.4 -> 23.5 ms, p95 41 -> 29.
+Synthetic pipeline 51.9 -> 42.0 ms per frame. A real scan's frame: ~23 frontend + ~19 tracking + ~2 snapshot
++ ~5 live view (GPU) = ~50 ms of the 68 ms period. Tried without gain: plain loads for hash lookups, a 4-entry
+or parity-indexed brick cache (spills on AMD), prefetching the next SGM step. The SGM paths (8 ms) are near
+the memory bandwidth; the rest of the stereo is split over many small kernels.
+
 ### Tracking on EXStar's own recordings (`einstar-cli track-fixture`)
 mustang_differential, 6055 frames, depth-only (no markers/texture), GPU path. A single replay is not a
 reliable measure: starting one frame later swung the old tracker between 74.5% and 94.5% tracked, because
