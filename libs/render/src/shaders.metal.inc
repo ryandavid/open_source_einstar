@@ -45,22 +45,28 @@ constant float3 kBackColor = float3(0.55, 0.42, 0.40);
 // Points in the selection being built (lasso.metal.inc).
 constant float3 kSelectedColor = float3(1.0, 0.32, 0.18);
 
+struct PointSplatOut {
+    float4 position [[position]];
+    float size [[point_size]];
+    float4 color;
+};
+
 // Camera-facing disc splats, sized in world units with a pixel floor, headlight shading; points seen
-// from behind take kBackColor, selected ones (in the model layer) kSelectedColor.
-vertex SplatOut splat_vs(uint vid [[vertex_id]], uint iid [[instance_id]],
-                         const device PointVertex* pts [[buffer(0)]],
-                         constant Uniforms& u [[buffer(1)]],
-                         const device LassoStroke* lasso [[buffer(2)]], const device uchar* lasso_masks [[buffer(3)]],
-                         constant uint& selectable [[buffer(4)]]) {
-    PointVertex p = pts[iid];
+// from behind take kBackColor, selected ones (in the model layer) kSelectedColor. Drawn as point
+// primitives: a point is the same screen-aligned square as a quad of two triangles at one vertex
+// instead of four (the live model has around a million points, drawn at the display rate).
+vertex PointSplatOut splat_vs(uint vid [[vertex_id]],
+                              const device PointVertex* pts [[buffer(0)]],
+                              constant Uniforms& u [[buffer(1)]],
+                              const device LassoStroke* lasso [[buffer(2)]], const device uchar* lasso_masks [[buffer(3)]],
+                              constant uint& selectable [[buffer(4)]]) {
+    PointVertex p = pts[vid];
     float4 view_pos = u.view * float4(float3(p.pos), 1.0);
     float3 n_view = normalize((u.view * float4(float3(p.normal), 0.0)).xyz);
-    float2 c = kCorners[vid];
     float4 clip = u.proj * view_pos;
     // world-size radius projected to pixels, clamped to a minimum
     float px_per_mm = u.proj[1][1] * u.viewport.y * 0.5 / max(-view_pos.z, 1e-3);
     float radius_px = max(0.5 * u.point_size * px_per_mm, u.min_point_px);
-    clip.xy += c * radius_px * 2.0 / u.viewport * clip.w;
 
     float4 base = float4(p.color) / 255.0;
     float shade = 1.0;
@@ -72,15 +78,16 @@ vertex SplatOut splat_vs(uint vid [[vertex_id]], uint iid [[instance_id]],
     }
     if (selectable != 0 && u.lasso_count > 0 && lasso_contains(float3(p.pos), lasso, u.lasso_count, lasso_masks))
         base.rgb = mix(base.rgb, kSelectedColor, 0.8);
-    SplatOut o;
+    PointSplatOut o;
     o.position = clip;
-    o.corner = c;
+    o.size = 2.0 * radius_px;
     o.color = float4(base.rgb * shade, base.a);
     return o;
 }
 
-fragment float4 splat_fs(SplatOut in [[stage_in]]) {
-    if (dot(in.corner, in.corner) > 1.0) discard_fragment();
+fragment float4 splat_fs(PointSplatOut in [[stage_in]], float2 pc [[point_coord]]) {
+    const float2 c = 2.0 * pc - 1.0;
+    if (dot(c, c) > 1.0) discard_fragment();
     return in.color;
 }
 

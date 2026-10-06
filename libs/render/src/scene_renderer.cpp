@@ -211,7 +211,7 @@ void SceneRenderer::encode(MTL::RenderCommandEncoder* enc, const ViewCamera& cam
         enc->setVertexBuffer(lasso_strokes_.get(), 0, 2);
         enc->setVertexBuffer(lasso_masks_.get(), 0, 3);
         enc->setVertexBytes(&selectable, sizeof(selectable), 4);
-        enc->drawPrimitives(MTL::PrimitiveTypeTriangleStrip, NS::UInteger(0), NS::UInteger(4), NS::UInteger(layer.count));
+        enc->drawPrimitives(MTL::PrimitiveTypePoint, NS::UInteger(0), NS::UInteger(layer.count));
     };
     if (s.show_mesh && mesh_index_count_ > 0) {
         enc->setRenderPipelineState(mesh_pso_.get());
