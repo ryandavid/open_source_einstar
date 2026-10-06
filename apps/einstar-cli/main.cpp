@@ -2430,6 +2430,21 @@ int inspect_cmd(const char* path, std::span<char*> args) {
         std::println("per frame: {:.1f} markers recorded, {:.1f} seen by the tracker; valid depth {:.1f}% (mean confidence {:.2f}) over {} sampled frames",
                      markers / nf, matched / nf, sampled ? 100 * valid / sampled : 0.0, sampled ? conf / sampled : 0.0, sampled);
         for (const auto& [reason, count] : why) std::println("  {:5}  {}", count, reason);
+        // Live pipeline times as measured while scanning (the frame period is 68 ms).
+        std::vector<double> stereo, track;
+        for (std::size_t i = 0; i < s.frame_count(); ++i)
+            if (const auto& m = s.meta(i); m.extras && m.extras->tracking.stereo_ms > 0) {
+                stereo.push_back(m.extras->tracking.stereo_ms);
+                track.push_back(m.extras->tracking.track_ms);
+            }
+        if (!stereo.empty()) {
+            auto pct = [](std::vector<double> v, double p) {
+                std::ranges::sort(v);
+                return v[std::min(v.size() - 1, static_cast<std::size_t>(p * static_cast<double>(v.size())))];
+            };
+            std::println("live time per frame: stereo median {:.1f} ms p95 {:.1f} ms, tracking median {:.1f} ms p95 {:.1f} ms",
+                         pct(stereo, 0.5), pct(stereo, 0.95), pct(track, 0.5), pct(track, 0.95));
+        }
     }
     if (const char* out = arg_str(args, "--dump-depth")) {  // frame --frame N (default: middle) as an 8-bit image, 0..800 mm
         const auto i = static_cast<std::size_t>(arg_int(args, "--frame", static_cast<long>(s.frame_count() / 2)));

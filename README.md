@@ -136,7 +136,10 @@ written by the calibration app.
 ### einstar-bench: performance
 
 `build/tools/einstar-bench [pipeline]`: timings of the depth stages (rectification, matching,
-points), or with `pipeline` the whole live pipeline on emulated frames.
+points), or with `pipeline` the whole live pipeline on emulated frames. On the scanner's own data:
+`frontend <hw-capture folder>` times stereo and markers on its raw IR images, and `session <scan.estr> [frames]`
+replays a real scan's depth through tracking (with the model snapshots the live view gets, and that view
+drawn). `EINSTAR_GPU_PROFILE=1` adds the GPU time of every stage.
 
 ## Scanner firmware
 

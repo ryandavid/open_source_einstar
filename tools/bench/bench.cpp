@@ -13,7 +13,9 @@
 #include <string_view>
 #include <vector>
 
+#include "einstar/calib/convention.hpp"
 #include "einstar/calib/device_calibration.hpp"
+#include "einstar/calibrate/captures.hpp"
 #include "einstar/core/timing.hpp"
 #include "einstar/depth/point_image.hpp"
 #include "einstar/depth/stereo.hpp"
@@ -21,6 +23,9 @@
 #include "einstar/pipeline/stereo_frontend.hpp"
 #include "einstar/gpu/profile.hpp"
 #include "einstar/pipeline/scan_pipeline.hpp"
+#include "einstar/render/scene_renderer.hpp"
+#include "einstar/render/view_camera.hpp"
+#include "einstar/session/session.hpp"
 #include "einstar/synth/demo.hpp"
 #include "einstar/synth/speckle_scene.hpp"
 #include "einstar/track/icp.hpp"
@@ -158,6 +163,156 @@ static void bench_pipeline(const RigCalibration& rig) {
     run("no recording, no markers", false, false);
 }
 
+// Tracking as live on a real scan: the recording's depth frames and markers through the tracker (Metal
+// volume and ICP), with the model snapshot the pipeline publishes every 250 ms (every 4th frame at 14.7 Hz).
+// Real scans have more surface, larger models and motion that synthetic frames do not; this times them.
+static int bench_session(const char* path, int count) {
+    auto reader = session::SessionReader::open(path);
+    if (!reader) {
+        std::println(stderr, "{}", reader.error().message);
+        return 1;
+    }
+    const auto& s = **reader;
+    auto ctx = gpu::Context::create();
+    if (!ctx) return 1;
+    auto vol = track_metal::MetalTsdfVolume::create(*ctx);
+    auto icp = track_metal::MetalIcp::create(*ctx);
+    if (!vol || !icp) return 1;
+    const auto* mv = vol->get();
+    track::TrackerParams tp;
+    tp.deterministic_relocalisation = false;  // as live
+    track::Tracker tracker(tp, std::move(*vol));
+    tracker.set_icp_solver((*icp)->as_function());
+    const auto n = std::min(s.frame_count(), static_cast<std::size_t>(count));
+    std::vector<double> track_ms, snap_ms;
+    int accepted = 0;
+    gpu::profile::reset();
+    for (std::size_t i = 0; i < n; ++i) {
+        auto rec = s.read(i);
+        if (!rec) continue;
+        const auto f = rec->depth_frame(s.header().depth_intrinsics);
+        Stopwatch sw;
+        const auto r = tracker.process(f);
+        track_ms.push_back(sw.elapsed_ms());
+        accepted += r.accepted;
+        if (r.integrated && i % 4 == 0) {
+            Stopwatch ss;
+            (void)mv->extract_render_points();
+            snap_ms.push_back(ss.elapsed_ms());
+        }
+    }
+    const auto pct = [](std::vector<double> v, double p) {
+        if (v.empty()) return 0.0;
+        std::ranges::sort(v);
+        return v[std::min(v.size() - 1, static_cast<std::size_t>(p * static_cast<double>(v.size())))];
+    };
+    std::println("== tracking on {} ({} frames, {} accepted, {} bricks) ==", path, n, accepted, tracker.volume().brick_count());
+    std::println("{:28} median {:7.2f} ms  p95 {:7.2f} ms  max {:7.2f} ms", "track", pct(track_ms, 0.5), pct(track_ms, 0.95), pct(track_ms, 1.0));
+    std::println("{:28} median {:7.2f} ms  p95 {:7.2f} ms  max {:7.2f} ms", "model snapshot", pct(snap_ms, 0.5), pct(snap_ms, 0.95), pct(snap_ms, 1.0));
+    if (gpu::profile::enabled()) std::print("{}", gpu::profile::report(static_cast<int>(n)));
+
+    // The live view of that model (the app draws at 60 Hz, ~4 times per scanner frame, on the same GPU):
+    // following the scanner, at a 1600 x 1000 point window on a 2x display.
+    auto renderer = render::SceneRenderer::create(*ctx, MTL::PixelFormatBGRA8Unorm, MTL::PixelFormatDepth32Float);
+    if (!renderer) return 1;
+    const auto model = mv->extract_render_points();
+    (*renderer)->set_model_buffer(model.buffer, model.count);
+    render::ViewCamera cam;
+    cam.follow(tracker.last_good_pose().matrix().cast<float>(), 1.0f);
+    constexpr int W = 3200, H = 2000;
+    auto texture = [&](MTL::PixelFormat format) {
+        auto* d = MTL::TextureDescriptor::texture2DDescriptor(format, W, H, false);
+        d->setUsage(MTL::TextureUsageRenderTarget);
+        d->setStorageMode(MTL::StorageModePrivate);
+        return gpu::Ref<MTL::Texture>((*ctx)->device()->newTexture(d));
+    };
+    const auto color = texture(MTL::PixelFormatBGRA8Unorm), depth = texture(MTL::PixelFormatDepth32Float);
+    auto* pass = MTL::RenderPassDescriptor::renderPassDescriptor();
+    pass->colorAttachments()->object(0)->setTexture(color.get());
+    pass->colorAttachments()->object(0)->setLoadAction(MTL::LoadActionClear);
+    pass->colorAttachments()->object(0)->setStoreAction(MTL::StoreActionStore);
+    pass->depthAttachment()->setTexture(depth.get());
+    pass->depthAttachment()->setLoadAction(MTL::LoadActionClear);
+    pass->depthAttachment()->setClearDepth(1.0);
+    TimingStats draw(20);
+    for (int f = 0; f < 21; ++f) {
+        auto* cmd = (*ctx)->queue()->commandBuffer();
+        auto* enc = cmd->renderCommandEncoder(pass);
+        (*renderer)->encode(enc, cam, float(W), float(H), {});  // framebuffer pixels, as the app
+        enc->endEncoding();
+        cmd->commit();
+        cmd->waitUntilCompleted();
+        if (f > 0) draw.add((cmd->GPUEndTime() - cmd->GPUStartTime()) * 1e3);
+    }
+    std::println("{:28} median {:7.2f} ms GPU per draw ({} points, {}x{} px)", "live view", draw.median(), model.count, W, H);
+    return 0;
+}
+
+// Stereo and markers as live on the scanner's own IR images: `einstar-cli hw-capture` folders
+// (<root>/calibration, <root>/<pose>/scan/gNNN_sS.pgm, sensor 0 left as captured then, so the calibration
+// is converted to that convention). Real IR has other marker candidates and depth coverage than rendered frames.
+static int bench_frontend(const std::filesystem::path& root) {
+    auto cal = calib::load_ccf_directory(root / "calibration");
+    if (!cal) {
+        std::println(stderr, "no calibration in {}", (root / "calibration").string());
+        return 1;
+    }
+    const RigCalibration rig = calib::swap_camera_convention(cal->rig());
+    std::vector<usb::FrameGroup> groups;
+    for (const auto& pose : std::filesystem::directory_iterator(root)) {
+        const auto dir = pose.path() / "scan";
+        for (int g = 0; std::filesystem::exists(dir / std::format("g{:03}_s0.pgm", g)); ++g) {
+            usb::FrameGroup group;
+            group.frame_id = static_cast<std::uint32_t>(groups.size());
+            for (int sensor = 0; sensor < 2; ++sensor) {
+                auto img = calibrate::read_pgm(dir / std::format("g{:03}_s{}.pgm", g, sensor));
+                if (!img) continue;
+                usb::StreamFrame sf;
+                sf.sensor = sensor;
+                sf.frame_id = group.frame_id;
+                sf.pixels = std::move(*img);
+                group.sensors[static_cast<std::size_t>(sensor)] = std::move(sf);
+            }
+            groups.push_back(std::move(group));
+        }
+    }
+    if (groups.empty()) {
+        std::println(stderr, "no <pose>/scan/gNNN_sS.pgm captures under {}", root.string());
+        return 1;
+    }
+    pipeline::StereoFrontend fe(rig);
+    fe.set_left_sensor(0);
+    for (int f = 0; f < 3; ++f) (void)fe.process(groups[static_cast<std::size_t>(f) % groups.size()]);  // warm-up
+    gpu::profile::reset();
+    TimingStats wall(groups.size()), cpu(groups.size()), stereo(groups.size()), markers(groups.size());
+    double candidates = 0, found = 0, valid = 0;
+    for (const auto& g : groups) {
+        Stopwatch sw;
+        const double c0 = thread_cpu_ms();
+        auto d = fe.process(g);
+        wall.add(sw.elapsed_ms());
+        cpu.add(thread_cpu_ms() - c0);
+        if (!d) continue;
+        stereo.add(d->stereo_ms);
+        markers.add(d->marker_ms);
+        candidates += d->marker_candidates;
+        found += static_cast<double>(d->markers.size());
+        const auto* dev = d->frame.device.get();
+        const float* p = dev->points_xyzw();
+        std::size_t n = 0;
+        for (std::size_t i = 0; i < static_cast<std::size_t>(dev->width() * dev->height()); ++i) n += p[4 * i + 2] > 0;
+        valid += static_cast<double>(n) / (dev->width() * dev->height());
+    }
+    const double k = static_cast<double>(groups.size());
+    std::println("== frontend on real IR ({} frames from {}) ==", groups.size(), root.string());
+    std::println("{:28} median {:7.2f} ms  p95 {:7.2f} ms", "wall", wall.median(), wall.percentile(0.95));
+    std::println("{:28} median {:7.2f} ms  p95 {:7.2f} ms", "calling-thread CPU", cpu.median(), cpu.percentile(0.95));
+    std::println("{:28} median {:7.2f} ms  (markers after it {:.2f} ms)", "stereo", stereo.median(), markers.median());
+    std::println("{:28} {:.1f} candidates, {:.1f} stereo markers per frame; valid depth {:.1f}%", "markers", candidates / k, found / k, 100 * valid / k);
+    if (gpu::profile::enabled()) std::print("{}", gpu::profile::report(static_cast<int>(groups.size())));
+    return 0;
+}
+
 // The scanner's calibration: EXStar's cache when installed, else the copy in tests/fixtures.
 static RigCalibration bench_rig() {
     if (auto cal = calib::load_ccf_directory("/Applications/EXStar.app/Contents/Resources/res/Einscan-E10/200x150")) return cal->rig();
@@ -171,6 +326,8 @@ int main(int argc, char** argv) {
         bench_pipeline(bench_rig());
         return 0;
     }
+    if (argc > 2 && std::string_view(argv[1]) == "frontend") return bench_frontend(argv[2]);
+    if (argc > 2 && std::string_view(argv[1]) == "session") return bench_session(argv[2], argc > 3 ? std::atoi(argv[3]) : 1 << 30);
     const auto rig = bench_rig();
     const SE3 T_lr = rig.T_right_left.inverse();
     synth::Scene scene;
