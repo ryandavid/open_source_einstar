@@ -134,7 +134,7 @@ Result<std::unique_ptr<MetalStereo>> MetalStereo::create(std::shared_ptr<gpu::Co
                            std::pair{"ccl_init", &im->ccl_init}, std::pair{"ccl_merge", &im->ccl_merge},
                            std::pair{"ccl_count", &im->ccl_count}, std::pair{"ccl_filter", &im->ccl_filter},
                            std::pair{"disparity_points", &im->pts_kernel}, std::pair{"point_normals", &im->nrm_kernel},
-                           std::pair{"rectify_full", &im->rectify_full}, std::pair{"refine_detail", &im->detail},
+                           std::pair{"rectify_full", &im->rectify_full},
                            std::pair{"occlusion_claim", &im->occl_claim}, std::pair{"occlusion_apply", &im->occl_apply},
                            std::pair{"spike_filter", &im->spike},
                            std::pair{"blob_init", &im->blob_init}, std::pair{"blob_merge", &im->blob_merge},
@@ -150,6 +150,11 @@ Result<std::unique_ptr<MetalStereo>> MetalStereo::create(std::shared_ptr<gpu::Co
         auto p = im->ctx->compute_pipeline(*lib, "refine_slanted", constants);
         if (!p) return std::unexpected(p.error());
         im->refine = std::move(*p);
+        const auto detail_candidates = static_cast<std::uint32_t>(2 * std::lround(params.detail.search / params.detail.step) + 1);
+        const std::pair<int, std::uint32_t> detail_constants[] = {{1, detail_candidates}};
+        auto d = im->ctx->compute_pipeline(*lib, "refine_detail", detail_constants);
+        if (!d) return std::unexpected(d.error());
+        im->detail = std::move(*d);
     }
 
     const int levels = params.pyramid_levels;

@@ -509,6 +509,8 @@ kernel void refine_slanted(device const uchar* left [[buffer(0)]], device const 
 
 // ---- detail refinement on the full-resolution images (mirrors depth::refine_detail) ----
 struct DetailArgs { uint w; uint h; uint fw; uint fh; int radius; int K; float step; float min_zncc; uint subpixel; uint enabled; };
+// 2 * K + 1, specialised at pipeline creation like kRefineCandidates (accumulators in registers).
+constant uint kDetailCandidates [[function_constant(1)]];
 constant int kMaxDetailCandidates = 17;
 
 inline float detail_grad(float l, float c, float r) {
@@ -533,7 +535,7 @@ kernel void refine_detail(device const uchar* left [[buffer(0)]], device const u
     const float gx = detail_grad(first[i - 1], d, first[i + 1]), gy = detail_grad(first[i - a.w], d, first[i + a.w]);
     const float cx = 2.0f * float(x) + 0.5f, cy = 2.0f * float(y) + 0.5f;
     const float D0 = 2.0f * d;
-    const int nc = 2 * a.K + 1;
+    const int nc = int(kDetailCandidates);
     float sa = 0, saa = 0, sb[kMaxDetailCandidates], sbb[kMaxDetailCandidates], sab[kMaxDetailCandidates];
     uint dead = 0;
     for (int k = 0; k < nc; ++k) { sb[k] = 0; sbb[k] = 0; sab[k] = 0; }
@@ -810,21 +812,31 @@ kernel void blob_stats(device const uchar* img [[buffer(0)]], device atomic_int*
     const uint i = gid.y * a.w + gid.x;
     if (img[i] <= a.threshold) return;
     const int r = ccl_find(L, int(i));
-    atomic_fetch_add_explicit(&count[r], 1u, memory_order_relaxed);
-    atomic_fetch_min_explicit(&bx0[r], gid.x, memory_order_relaxed);
-    atomic_fetch_min_explicit(&by0[r], gid.y, memory_order_relaxed);
-    atomic_fetch_max_explicit(&bx1[r], gid.x, memory_order_relaxed);
-    atomic_fetch_max_explicit(&by1[r], gid.y, memory_order_relaxed);
-    atomic_fetch_max_explicit(&peak[r], uint(img[i]), memory_order_relaxed);
     // Moments relative to the root pixel, exact in integers: blobs that can pass the size gates span at
     // most max_diameter pixels, so the sums stay far below 2^31 (larger blobs may wrap; they are
     // rejected by their box first). Integer atomics are native everywhere; float adds are not.
     const int dx = int(gid.x) - int(uint(r) % a.w), dy = int(gid.y) - int(uint(r) / a.w);
-    atomic_fetch_add_explicit(&mom[5 * uint(r) + 0], dx, memory_order_relaxed);
-    atomic_fetch_add_explicit(&mom[5 * uint(r) + 1], dy, memory_order_relaxed);
-    atomic_fetch_add_explicit(&mom[5 * uint(r) + 2], dx * dx, memory_order_relaxed);
-    atomic_fetch_add_explicit(&mom[5 * uint(r) + 3], dx * dy, memory_order_relaxed);
-    atomic_fetch_add_explicit(&mom[5 * uint(r) + 4], dy * dy, memory_order_relaxed);
+    uint n = 1, x0 = gid.x, y0 = gid.y, x1 = gid.x, y1 = gid.y, pk = uint(img[i]);
+    int m0 = dx, m1 = dy, m2 = dx * dx, m3 = dx * dy, m4 = dy * dy;
+    // Inside a large bright region (a white surface under the ring light) every pixel updates the same
+    // root: reduce over the SIMD group first, so one lane makes the updates (the same exact sums).
+    if (simd_all(r == simd_broadcast_first(r))) {
+        n = simd_sum(n);
+        x0 = simd_min(x0), y0 = simd_min(y0), x1 = simd_max(x1), y1 = simd_max(y1), pk = simd_max(pk);
+        m0 = simd_sum(m0), m1 = simd_sum(m1), m2 = simd_sum(m2), m3 = simd_sum(m3), m4 = simd_sum(m4);
+        if (!simd_is_first()) return;
+    }
+    atomic_fetch_add_explicit(&count[r], n, memory_order_relaxed);
+    atomic_fetch_min_explicit(&bx0[r], x0, memory_order_relaxed);
+    atomic_fetch_min_explicit(&by0[r], y0, memory_order_relaxed);
+    atomic_fetch_max_explicit(&bx1[r], x1, memory_order_relaxed);
+    atomic_fetch_max_explicit(&by1[r], y1, memory_order_relaxed);
+    atomic_fetch_max_explicit(&peak[r], pk, memory_order_relaxed);
+    atomic_fetch_add_explicit(&mom[5 * uint(r) + 0], m0, memory_order_relaxed);
+    atomic_fetch_add_explicit(&mom[5 * uint(r) + 1], m1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&mom[5 * uint(r) + 2], m2, memory_order_relaxed);
+    atomic_fetch_add_explicit(&mom[5 * uint(r) + 3], m3, memory_order_relaxed);
+    atomic_fetch_add_explicit(&mom[5 * uint(r) + 4], m4, memory_order_relaxed);
 }
 
 inline float sample_img(device const uchar* img, constant BlobArgs& a, float x, float y) {
